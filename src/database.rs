@@ -79,6 +79,19 @@ impl Database {
             self.max_query_len
         );
 
+        // SIMD backends run the inter-sequence kernel. The resolver only selects one for a
+        // SIMD-eligible database, so this dispatch is safe to take unconditionally here.
+        if self.backend != Backend::Scalar {
+            return crate::inter::scan_dispatch(
+                self.backend,
+                &self.sequences,
+                &self.scoring,
+                self.mode,
+                self.search_type,
+                query,
+            );
+        }
+
         // Reduce to the best (score, end) per sequence, then take a scalar argmax over the
         // database index. Iterating ascending and replacing only on a strictly greater score
         // keeps the smallest index on a tie.
@@ -276,7 +289,22 @@ impl DatabaseBuilder {
             Some(choice) => choice,
             None => backend::choice_from_env()?.unwrap_or(BackendChoice::Auto),
         };
-        let backend = backend::resolve(choice)?;
+        let resolved = backend::resolve(choice)?;
+
+        // A SIMD backend is only *usable* for a SIMD-eligible database (i8 width, small alphabet).
+        // If one was auto-selected but the database is ineligible, fall back to scalar; if it was
+        // explicitly forced, that is an error rather than a silent fallback.
+        let applicable = crate::inter::kernel_applies(width, scoring.alphabet_len());
+        let backend = if resolved == Backend::Scalar || applicable {
+            resolved
+        } else {
+            match choice {
+                BackendChoice::Force(_) => {
+                    return Err(Error::BackendUnavailable { backend: resolved });
+                }
+                BackendChoice::Auto => Backend::Scalar,
+            }
+        };
 
         Ok(Database {
             sequences,
@@ -432,7 +460,8 @@ mod tests {
         assert_eq!(db.search_type(), SearchType::ScoreEnd);
         assert_eq!(db.max_query_len(), 16);
         assert_eq!(db.max_target_len(), 4);
-        assert_eq!(db.backend(), Backend::Scalar);
+        // Under Auto the backend is CPU-dependent (SSE4.1 where available); just require it valid.
+        assert!(db.backend().is_available());
         assert_eq!(db.score_width(), ScoreWidth::I8);
     }
 
@@ -450,30 +479,56 @@ mod tests {
     }
 
     #[test]
-    fn forcing_an_unavailable_backend_fails_to_build() {
+    fn forcing_a_backend_tracks_availability() {
+        // The database (i8 width, alphabet 4) is SIMD-eligible, so forcing a backend succeeds iff
+        // that backend is available on this CPU; otherwise it is a clean BackendUnavailable.
         for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
-            let err = Database::builder()
+            let result = Database::builder()
                 .sequences(&[vec![0u8]])
                 .scoring(dna_scoring())
                 .mode(Mode::Sw)
                 .max_query_len(8)
                 .backend(BackendChoice::Force(b))
-                .build()
-                .unwrap_err();
-            assert_eq!(err, Error::BackendUnavailable { backend: b });
+                .build();
+            if b.is_available() {
+                assert_eq!(result.unwrap().backend(), b);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    Error::BackendUnavailable { backend: b }
+                );
+            }
         }
     }
 
     #[test]
-    fn explicit_backend_choice_takes_precedence_over_env() {
-        // An explicit builder choice is consulted before the environment, so this test is immune
-        // to whatever HYALITE_BACKEND happens to be set to in the runner.
+    fn forcing_simd_on_an_ineligible_database_errors() {
+        // A wide-score database (long global alignment) needs i16, so no SIMD kernel applies.
+        // Forcing one must fail loudly rather than silently falling back.
+        let scoring = Scoring::new(2, vec![100, -100, -100, 100], 2, 1).unwrap();
+        let long = vec![0u8; 200];
+        let result = Database::builder()
+            .sequences(&[long])
+            .scoring(scoring)
+            .mode(Mode::Nw)
+            .max_query_len(200)
+            .backend(BackendChoice::Force(Backend::Sse41))
+            .build();
+        // On a CPU without SSE4.1 the resolver rejects it before the eligibility check; either way
+        // the outcome is a build error, never a silent scalar fallback.
+        assert!(matches!(result, Err(Error::BackendUnavailable { .. })));
+    }
+
+    #[test]
+    fn explicit_scalar_choice_overrides_auto_detection() {
+        // Forcing scalar yields scalar even on a machine where Auto would pick a SIMD backend —
+        // the explicit builder choice wins over detection (and, in turn, over the env var).
         let db = Database::builder()
             .sequences(&[vec![0u8]])
             .scoring(dna_scoring())
             .mode(Mode::Sw)
             .max_query_len(8)
-            .backend(BackendChoice::Auto)
+            .backend(BackendChoice::Force(Backend::Scalar))
             .build()
             .unwrap();
         assert_eq!(db.backend(), Backend::Scalar);

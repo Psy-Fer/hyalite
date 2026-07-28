@@ -47,14 +47,31 @@ impl Backend {
         }
     }
 
-    /// Whether this backend is implemented and usable on the current build/CPU.
+    /// Whether this backend is implemented and usable on the current build/CPU. Gated on both the
+    /// target architecture and runtime CPU-feature detection.
     ///
-    /// In M0 only [`Backend::Scalar`] is available. When a SIMD kernel is implemented this will
-    /// additionally gate on the target architecture and runtime CPU-feature detection.
+    /// Availability is *not* the whole story for a given database: even an available SIMD backend
+    /// is only *used* when the database is SIMD-eligible (i8 width, small alphabet). That extra
+    /// gate lives in `DatabaseBuilder::build`.
     #[must_use]
     pub fn is_available(self) -> bool {
-        matches!(self, Backend::Scalar)
+        match self {
+            Backend::Scalar => true,
+            Backend::Sse41 => sse41_detected(),
+            // AVX2 lands in M2c, NEON in M3.
+            Backend::Avx2 | Backend::Neon => false,
+        }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sse41_detected() -> bool {
+    std::is_x86_feature_detected!("sse4.1")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sse41_detected() -> bool {
+    false
 }
 
 impl fmt::Display for Backend {
@@ -96,10 +113,14 @@ impl BackendChoice {
     }
 }
 
-/// The fastest available backend. In M0 that is always [`Backend::Scalar`]; SIMD tiers are added
-/// here (in descending preference, gated on CPU features) at M2.
+/// The fastest available backend, in descending preference. AVX2 (M2c) will slot in ahead of
+/// SSE4.1 here once implemented.
 fn detect_best() -> Backend {
-    Backend::Scalar
+    if Backend::Sse41.is_available() {
+        Backend::Sse41
+    } else {
+        Backend::Scalar
+    }
 }
 
 /// Resolve a [`BackendChoice`] to a concrete, available [`Backend`].
@@ -142,11 +163,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_scalar_is_available_in_m0() {
+    fn availability_matches_arch_and_cpu() {
+        // Scalar is always available; AVX2/NEON are not implemented yet; SSE4.1 tracks the CPU.
         assert!(Backend::Scalar.is_available());
-        for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
-            assert!(!b.is_available(), "{b} should be unavailable in M0");
-        }
+        assert!(!Backend::Avx2.is_available(), "AVX2 lands in M2c");
+        assert!(!Backend::Neon.is_available(), "NEON lands in M3");
+        assert_eq!(Backend::Sse41.is_available(), sse41_detected());
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(!Backend::Sse41.is_available());
     }
 
     #[test]
@@ -197,12 +221,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_is_scalar_in_m0() {
-        assert_eq!(resolve(BackendChoice::Auto).unwrap(), Backend::Scalar);
+    fn resolve_auto_picks_an_available_backend() {
+        let b = resolve(BackendChoice::Auto).unwrap();
+        assert!(b.is_available());
+        // Auto prefers SSE4.1 when the CPU supports it, else scalar.
+        assert_eq!(b, detect_best());
     }
 
     #[test]
-    fn resolve_forcing_scalar_succeeds() {
+    fn resolve_forcing_scalar_always_succeeds() {
         assert_eq!(
             resolve(BackendChoice::Force(Backend::Scalar)).unwrap(),
             Backend::Scalar
@@ -210,10 +237,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_forcing_unavailable_backend_errors() {
+    fn resolve_forcing_a_backend_tracks_its_availability() {
         for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
-            let err = resolve(BackendChoice::Force(b)).unwrap_err();
-            assert_eq!(err, Error::BackendUnavailable { backend: b });
+            let got = resolve(BackendChoice::Force(b));
+            if b.is_available() {
+                assert_eq!(got.unwrap(), b);
+            } else {
+                assert_eq!(got.unwrap_err(), Error::BackendUnavailable { backend: b });
+            }
         }
     }
 }

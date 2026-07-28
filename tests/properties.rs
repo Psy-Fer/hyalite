@@ -12,7 +12,10 @@
 mod common;
 
 use common::{ALL_MODES, brute, reference_scan};
-use hyalite::{BestHit, Database, Mode, ScoreWidth, Scoring, Scratch, SearchType, align_pair};
+use hyalite::{
+    Backend, BackendChoice, BestHit, Database, Mode, ScoreWidth, Scoring, Scratch, SearchType,
+    align_pair,
+};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -217,6 +220,60 @@ proptest! {
                 let got = db.scan(&mut scratch, &q);
                 let want = reference_scan(&db_seqs, &scoring, mode, st, &q);
                 prop_assert_eq!(got, want, "mode {}, {}", mode, st);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-backend determinism: forced Scalar vs forced SSE4.1 must be bit-identical
+// ---------------------------------------------------------------------------
+
+fn scan_forced(
+    backend: Backend,
+    seqs: &[Vec<u8>],
+    scoring: &Scoring,
+    mode: Mode,
+    st: SearchType,
+    query: &[u8],
+) -> BestHit {
+    let db = Database::builder()
+        .sequences(seqs)
+        .scoring(scoring.clone())
+        .mode(mode)
+        .search_type(st)
+        .max_query_len(12)
+        .backend(BackendChoice::Force(backend))
+        .build()
+        .unwrap();
+    let mut scratch = Scratch::new(&db);
+    db.scan(&mut scratch, query)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// The determinism contract, now testable: for every SIMD-eligible database, forcing SSE4.1
+    /// yields the exact same `BestHit` (score, db_index, and end positions) as forcing scalar —
+    /// across all modes and both search types. Skipped entirely on CPUs without SSE4.1.
+    #[test]
+    fn scan_identical_scalar_vs_sse41((s, db_seqs, q) in scheme_db_query()) {
+        if !Backend::Sse41.is_available() {
+            return Ok(()); // no SIMD backend on this CPU; nothing to compare
+        }
+        let scoring = s.scoring();
+        let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
+
+        for mode in ALL_MODES {
+            // Only i8-width, small-alphabet databases route through the SIMD kernel.
+            let width = scoring.required_width(mode, 12, max_t).unwrap();
+            if width != ScoreWidth::I8 || scoring.alphabet_len() > 16 {
+                continue;
+            }
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let scalar = scan_forced(Backend::Scalar, &db_seqs, &scoring, mode, st, &q);
+                let sse41 = scan_forced(Backend::Sse41, &db_seqs, &scoring, mode, st, &q);
+                prop_assert_eq!(sse41, scalar, "{} {} disagree scalar vs sse4.1", mode, st);
             }
         }
     }

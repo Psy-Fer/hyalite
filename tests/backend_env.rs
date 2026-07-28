@@ -43,21 +43,23 @@ fn hyalite_backend_env_var_is_honored_with_correct_precedence() {
     let clear = || unsafe { std::env::remove_var(BACKEND_ENV_VAR) };
 
     clear();
-    assert_eq!(
-        build_using_env().unwrap().backend(),
-        Backend::Scalar,
-        "unset env should auto-resolve to scalar"
+    assert!(
+        build_using_env().unwrap().backend().is_available(),
+        "unset env should auto-resolve to an available backend"
     );
 
     set("scalar");
     assert_eq!(
         build_using_env().unwrap().backend(),
         Backend::Scalar,
-        "HYALITE_BACKEND=scalar should build"
+        "HYALITE_BACKEND=scalar should build scalar"
     );
 
     set("auto");
-    assert_eq!(build_using_env().unwrap().backend(), Backend::Scalar);
+    assert!(
+        build_using_env().unwrap().backend().is_available(),
+        "auto should resolve to an available backend"
+    );
 
     // A forced-but-unavailable backend via env is a build error today (until M2 implements it).
     set("avx2");

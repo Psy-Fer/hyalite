@@ -16,8 +16,9 @@
 //! impl [`ScalarLanes`]; the SIMD impls (SSE4.1, AVX2) are added in later milestones and must pass
 //! the same differential tests.
 
-// M2a: the kernel is exercised only by this module's differential tests; it is wired into
-// `Database::scan` dispatch in M2b, at which point this allow is removed.
+// The generic kernel is used in production via the SSE4.1 backend on x86-64. Two things are still
+// unused in some builds: `ScalarLanes` (a test-only reference lane), and — on non-x86-64 targets —
+// the whole kernel, until the NEON backend lands (M3). Silence both here rather than scatter cfgs.
 #![allow(dead_code)]
 
 use crate::hit::BestHit;
@@ -137,6 +138,10 @@ fn build_profile(query: &[u8], scoring: &Scoring) -> Vec<i8> {
 
 /// Compute the per-lane best score for one batch of `batch.len()` (`<= L::LANES`) targets.
 /// Writes `batch.len()` scores into `out`. Score-only; end positions are recovered elsewhere.
+// `#[inline(always)]` so this hot column loop — and, transitively, `L`'s intrinsic ops — inlines
+// into the `#[target_feature]` SIMD shim, where it gets the enabled feature's codegen (the
+// dispatch shape §5 of `handover.md` prescribes).
+#[inline(always)]
 #[allow(clippy::too_many_arguments)] // an inter-sequence DP inherently takes many parameters
 fn scan_batch<L: Lanes>(
     query: &[u8],
@@ -270,6 +275,7 @@ fn scan_batch<L: Lanes>(
 /// responsible for that gate. Returns the same [`BestHit`] the scalar path would: highest score,
 /// smallest `db_index` on a tie, and — for `ScoreEnd` — the winner's end positions via a single
 /// scalar re-alignment.
+#[inline]
 pub(crate) fn scan_batched<L: Lanes>(
     sequences: &[Vec<u8>],
     scoring: &Scoring,
@@ -330,6 +336,119 @@ pub(crate) fn scan_batched<L: Lanes>(
         db_index: best_index,
         query_end,
         target_end,
+    }
+}
+
+/// Run the inter-sequence scan on the resolved SIMD `backend`. The backend resolver guarantees
+/// this is only reached for a backend that is available on this CPU *and* applicable to the
+/// database (i8 width, alphabet ≤ 16), so the arms are exhaustive in practice.
+pub(crate) fn scan_dispatch(
+    backend: crate::Backend,
+    sequences: &[Vec<u8>],
+    scoring: &Scoring,
+    mode: Mode,
+    search_type: SearchType,
+    query: &[u8],
+) -> BestHit {
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        crate::Backend::Sse41 => sse41::run(sequences, scoring, mode, search_type, query),
+        other => unreachable!("no inter-sequence kernel for backend {other}"),
+    }
+}
+
+/// SSE4.1 lane backend: 16 `i8` lanes per `__m128i`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod sse41 {
+    // Intrinsics require `unsafe`; the crate is otherwise `deny(unsafe_code)`.
+    #![allow(unsafe_code)]
+
+    use super::{Lanes, scan_batched};
+    use crate::hit::BestHit;
+    use crate::mode::Mode;
+    use crate::scoring::Scoring;
+    use crate::search::SearchType;
+    use core::arch::x86_64::*;
+
+    /// 16-lane SSE4.1 backend. Ops are `#[inline(always)]` so they fold into the
+    /// `#[target_feature]` shim below and get SSE4.1 codegen with no per-op call.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Sse41;
+
+    impl Lanes for Sse41 {
+        const LANES: usize = 16;
+        type V = __m128i;
+
+        #[inline(always)]
+        fn splat(v: i8) -> __m128i {
+            unsafe { _mm_set1_epi8(v) }
+        }
+        #[inline(always)]
+        fn add_sat(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_adds_epi8(a, b) }
+        }
+        #[inline(always)]
+        fn sub_sat(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_subs_epi8(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_max_epi8(a, b) } // SSE4.1
+        }
+        #[inline(always)]
+        fn select(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+            // blendv picks `a` where mask's high bit is set (our masks are 0x00 / 0xFF). SSE4.1.
+            unsafe { _mm_blendv_epi8(b, a, mask) }
+        }
+        #[inline(always)]
+        fn load(src: &[i8]) -> __m128i {
+            debug_assert!(src.len() >= 16);
+            unsafe { _mm_loadu_si128(src.as_ptr().cast()) }
+        }
+        #[inline(always)]
+        fn store(v: __m128i, dst: &mut [i8]) {
+            debug_assert!(dst.len() >= 16);
+            unsafe { _mm_storeu_si128(dst.as_mut_ptr().cast(), v) }
+        }
+        #[inline(always)]
+        fn shuffle_lookup(table: &[i8], indices: &[u8]) -> __m128i {
+            debug_assert!(table.len() <= 16 && indices.len() >= 16);
+            unsafe {
+                // Pad the substitution table to 16 bytes, then byte-shuffle by the lane residues.
+                // Residues are `< alphabet_len <= 16`, so their high bit is clear and PSHUFB does a
+                // plain table lookup (no lane zeroing). PSHUFB is SSSE3, implied by SSE4.1.
+                let mut padded = [0i8; 16];
+                padded[..table.len()].copy_from_slice(table);
+                let t = _mm_loadu_si128(padded.as_ptr().cast());
+                let idx = _mm_loadu_si128(indices.as_ptr().cast());
+                _mm_shuffle_epi8(t, idx)
+            }
+        }
+    }
+
+    /// Feature-enabled shim: everything inlined here is compiled with SSE4.1.
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn scan_ff(
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+    ) -> BestHit {
+        scan_batched::<Sse41>(sequences, scoring, mode, search_type, query)
+    }
+
+    /// Safe entry point. Only called for a resolved `Sse41` backend, which the resolver returns
+    /// exclusively when `sse4.1` is detected — so the feature precondition of [`scan_ff`] holds.
+    pub(crate) fn run(
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+    ) -> BestHit {
+        debug_assert!(std::is_x86_feature_detected!("sse4.1"));
+        unsafe { scan_ff(sequences, scoring, mode, search_type, query) }
     }
 }
 
