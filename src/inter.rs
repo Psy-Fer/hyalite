@@ -12,9 +12,10 @@
 //! ([`crate::kernel::align_core`]), which is bit-identical to the oracle by construction (see
 //! `DETERMINISM.md`, "end positions").
 //!
-//! The kernel is generic over a [`Lanes`] backend. This module provides the safe scalar reference
-//! impl [`ScalarLanes`]; the SIMD impls (SSE4.1, AVX2) are added in later milestones and must pass
-//! the same differential tests.
+//! The kernel is generic over a [`Lanes`] backend: [`sse41::Sse41`] and [`avx2::Avx2`] on x86-64,
+//! [`neon::Neon`] on aarch64, and a test-only `ScalarLanes` reference that the differential tests
+//! check every SIMD backend against. Query-independent packing lives in [`PackedDb`] (built once);
+//! per-scan working memory lives in [`SimdScratch`], so the hot path allocates nothing.
 
 // The generic kernel is live in production via SSE4.1/AVX2 (x86-64) and NEON (aarch64). On an
 // exotic target with no SIMD backend it would be unused; CI only builds x86-64 and aarch64, so we
@@ -129,205 +130,329 @@ pub(crate) fn kernel_applies(width: crate::ScoreWidth, alphabet_len: usize) -> b
     width == crate::ScoreWidth::I8 && alphabet_len <= MAX_SHUFFLE_ALPHABET
 }
 
-/// Build the per-query-position substitution profile: `profile[i * al + s] = score(query[i], s)`
-/// as `i8`. Valid only for an `I8`-width database, where every entry fits.
-fn build_profile(query: &[u8], scoring: &Scoring) -> Vec<i8> {
-    let al = scoring.alphabet_len();
-    let mut profile = vec![0i8; query.len() * al];
-    for (i, &q) in query.iter().enumerate() {
-        for s in 0..al {
-            profile[i * al + s] = scoring.score(q as usize, s) as i8;
-        }
-    }
-    profile
+/// The kernel data layout for the substitution scores, reported by
+/// [`Database::layout`](crate::Database::layout).
+///
+/// `#[non_exhaustive]`: `Precomputed` (a query-letter × column score table for small fixed
+/// databases) is added in a later milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Layout {
+    /// General layout: a per-column byte-shuffle gather of substitution scores from the query
+    /// profile. The standard Rognes inner loop.
+    Gathered,
 }
 
-/// Compute the per-lane best score for one batch of `batch.len()` (`<= L::LANES`) targets.
-/// Writes `batch.len()` scores into `out`. Score-only; end positions are recovered elsewhere.
-// `#[inline(always)]` so this hot column loop — and, transitively, `L`'s intrinsic ops — inlines
-// into the `#[target_feature]` SIMD shim, where it gets the enabled feature's codegen (the
-// dispatch shape §5 of `handover.md` prescribes).
+impl core::fmt::Display for Layout {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Layout::Gathered => f.write_str("gathered"),
+        }
+    }
+}
+
+/// One batch of up to `lanes` database sequences, packed for the inter-sequence kernel. Built
+/// once at [`Database`](crate::Database) construction — query-independent, so no scan rebuilds it.
+#[derive(Debug, Clone)]
+struct PackedBatch {
+    /// Number of real sequences in this batch (`<= lanes`); trailing lanes are padding.
+    real: usize,
+    /// Padded column count (the longest sequence in the batch).
+    w: usize,
+    /// Target residues, `residues[(j-1) * lanes + k]` for column `j` (1-based), lane `k`.
+    residues: Vec<u8>,
+    /// `mask_le[j * lanes + k]` = `0xFF` iff `j <= len_k`, else `0`. `(w + 1) * lanes` bytes.
+    mask_le: Vec<i8>,
+    /// `mask_eq[j * lanes + k]` = `0xFF` iff `j == len_k`, else `0`. `(w + 1) * lanes` bytes.
+    mask_eq: Vec<i8>,
+}
+
+/// The whole database packed for a fixed lane count. Immutable and query-independent.
+#[derive(Debug, Clone)]
+pub(crate) struct PackedDb {
+    lanes: usize,
+    layout: Layout,
+    batches: Vec<PackedBatch>,
+}
+
+impl PackedDb {
+    /// Build the `Gathered` packing for `lanes`-wide SIMD.
+    pub(crate) fn build(sequences: &[Vec<u8>], lanes: usize) -> Self {
+        let mut batches = Vec::new();
+        for chunk in sequences.chunks(lanes) {
+            let real = chunk.len();
+            let w = chunk.iter().map(Vec::len).max().unwrap_or(0);
+
+            let mut lens = vec![0usize; lanes];
+            let mut residues = vec![0u8; w * lanes];
+            for (k, s) in chunk.iter().enumerate() {
+                lens[k] = s.len();
+                for (j0, &r) in s.iter().enumerate() {
+                    residues[j0 * lanes + k] = r;
+                }
+            }
+
+            let mut mask_le = vec![0i8; (w + 1) * lanes];
+            let mut mask_eq = vec![0i8; (w + 1) * lanes];
+            for j in 0..=w {
+                for k in 0..lanes {
+                    mask_le[j * lanes + k] = if j <= lens[k] { -1 } else { 0 };
+                    mask_eq[j * lanes + k] = if j == lens[k] { -1 } else { 0 };
+                }
+            }
+
+            batches.push(PackedBatch {
+                real,
+                w,
+                residues,
+                mask_le,
+                mask_eq,
+            });
+        }
+        PackedDb {
+            lanes,
+            layout: Layout::Gathered,
+            batches,
+        }
+    }
+
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+}
+
+/// Reusable, query-dependent working memory for the SIMD scan. Held in
+/// [`Scratch`](crate::Scratch) so the hot path allocates nothing.
+#[derive(Debug)]
+pub(crate) struct SimdScratch {
+    /// Substitution profile `profile[i * al + s]`, rebuilt per scan into the reused allocation.
+    profile: Vec<i8>,
+    /// Two `H` rows, ping-ponged: `2 * (max_target_len + 1) * lanes` bytes.
+    h: Vec<i8>,
+    /// The down-carried `F` column: `(max_target_len + 1) * lanes` bytes.
+    f: Vec<i8>,
+    /// One batch of per-lane scores.
+    lane_scores: Vec<i8>,
+}
+
+impl SimdScratch {
+    pub(crate) fn new(
+        max_query_len: usize,
+        alphabet_len: usize,
+        max_target_len: usize,
+        lanes: usize,
+    ) -> Self {
+        let row = (max_target_len + 1) * lanes;
+        SimdScratch {
+            profile: Vec::with_capacity(max_query_len * alphabet_len),
+            h: vec![0i8; 2 * row],
+            f: vec![0i8; row],
+            lane_scores: vec![0i8; lanes],
+        }
+    }
+
+    /// Empty buffers for a scalar-backend database, which never runs the SIMD kernel.
+    pub(crate) fn empty() -> Self {
+        SimdScratch {
+            profile: Vec::new(),
+            h: Vec::new(),
+            f: Vec::new(),
+            lane_scores: Vec::new(),
+        }
+    }
+}
+
+/// Per-batch column loop over prebuilt packing and reused byte buffers. Writes `batch.real`
+/// scores into `out`. Score-only; end positions are recovered elsewhere.
+// `#[inline(always)]` so this hot loop — and `L`'s intrinsic ops — folds into the
+// `#[target_feature]` SIMD shim (dispatch shape §5 of `handover.md`).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)] // an inter-sequence DP inherently takes many parameters
 fn scan_batch<L: Lanes>(
-    query: &[u8],
     profile: &[i8],
     al: usize,
-    batch: &[&[u8]],
+    qlen: usize,
+    batch: &PackedBatch,
     go: i8,
     ge: i8,
     flags: &Flags,
+    h: &mut [i8],
+    f: &mut [i8],
     out: &mut [i8],
 ) {
     let lanes = L::LANES;
-    let qlen = query.len();
-
-    // Per-lane target lengths (0 for unused lanes) and the batch's padded column count `w`.
-    let mut lens = vec![0usize; lanes];
-    for (k, t) in batch.iter().enumerate() {
-        lens[k] = t.len();
-    }
-    let w = lens.iter().copied().max().unwrap_or(0);
-
-    // Per-column target residues, `residues[(j-1) * lanes + k]` = target k's residue at column j
-    // (1-based), padded with 0 where the lane is shorter.
-    let mut residues = vec![0u8; w * lanes];
-    for (k, t) in batch.iter().enumerate() {
-        for (j0, &r) in t.iter().enumerate() {
-            residues[j0 * lanes + k] = r;
-        }
-    }
-
-    // Column masks: `mask_le[j]` lane = all-ones iff `j <= len_k`; `mask_eq[j]` iff `j == len_k`.
-    let mut scratch = vec![0i8; lanes];
-    let make_mask = |pred: &dyn Fn(usize) -> bool, scratch: &mut [i8]| {
-        for (k, slot) in scratch.iter_mut().enumerate() {
-            *slot = if pred(k) { -1 } else { 0 };
-        }
-        L::load(scratch)
-    };
-    let mask_le: Vec<L::V> = (0..=w)
-        .map(|j| make_mask(&|k| j <= lens[k], &mut scratch))
-        .collect();
-    let mask_eq: Vec<L::V> = (0..=w)
-        .map(|j| make_mask(&|k| j == lens[k], &mut scratch))
-        .collect();
+    let w = batch.w;
+    let cols = (w + 1) * lanes;
 
     let go_v = L::splat(go);
     let ge_v = L::splat(ge);
     let zero = L::splat(0);
     let neg = L::splat(NEG8);
 
-    // Row 0 (H[0][*]) and the down-carried F column (F[0][*] = −∞).
-    let mut h_prev: Vec<L::V> = (0..=w)
-        .map(|j| {
-            if flags.top_row_free {
-                zero
-            } else {
-                L::splat(-gap_penalty(go as i32, ge as i32, j) as i8)
-            }
-        })
-        .collect();
-    let mut h_cur: Vec<L::V> = vec![zero; w + 1];
-    let mut f: Vec<L::V> = vec![neg; w + 1];
+    // Two H rows ping-ponged via mutable-reference swap (no copy). `prev` holds row i-1, `cur`
+    // is written for row i.
+    let half = h.len() / 2;
+    let (row_a, row_b) = h.split_at_mut(half);
+    let mut prev: &mut [i8] = &mut row_a[..cols];
+    let mut cur: &mut [i8] = &mut row_b[..cols];
 
-    // Answer accumulators updated during the sweep (need every row): SW's running max and OV's
-    // best last-column cell. Both are floored at 0 by their modes.
+    // Row 0 into `prev`; the F column to −∞.
+    for j in 0..=w {
+        let border = if flags.top_row_free {
+            zero
+        } else {
+            L::splat(-gap_penalty(go as i32, ge as i32, j) as i8)
+        };
+        L::store(border, &mut prev[j * lanes..]);
+        L::store(neg, &mut f[j * lanes..]);
+    }
+
+    // SW running max and OV best-last-column, accumulated over every row.
     let mut sw_ans = zero;
     let mut ov_lastcol = zero;
 
     for i in 1..=qlen {
-        h_cur[0] = if flags.left_col_free {
+        let border = if flags.left_col_free {
             zero
         } else {
             L::splat(-gap_penalty(go as i32, ge as i32, i) as i8)
         };
+        L::store(border, &mut cur[0..lanes]);
         let profile_row = &profile[(i - 1) * al..(i - 1) * al + al];
         let mut e = neg; // E[i][0]
         for j in 1..=w {
-            e = L::max(L::sub_sat(h_cur[j - 1], go_v), L::sub_sat(e, ge_v));
-            f[j] = L::max(L::sub_sat(h_prev[j], go_v), L::sub_sat(f[j], ge_v));
-            let sub = L::shuffle_lookup(profile_row, &residues[(j - 1) * lanes..j * lanes]);
-            let diag = L::add_sat(h_prev[j - 1], sub);
-            let mut cell = L::max(diag, L::max(e, f[j]));
+            let col = j * lanes;
+            let prevcol = (j - 1) * lanes;
+            e = L::max(
+                L::sub_sat(L::load(&cur[prevcol..]), go_v),
+                L::sub_sat(e, ge_v),
+            );
+            let f_j = L::max(
+                L::sub_sat(L::load(&prev[col..]), go_v),
+                L::sub_sat(L::load(&f[col..]), ge_v),
+            );
+            L::store(f_j, &mut f[col..]);
+            let sub = L::shuffle_lookup(profile_row, &batch.residues[prevcol..col]);
+            let diag = L::add_sat(L::load(&prev[prevcol..]), sub);
+            let mut cell = L::max(diag, L::max(e, f_j));
             if flags.local {
                 cell = L::max(cell, zero);
-                sw_ans = L::select(mask_le[j], L::max(sw_ans, cell), sw_ans);
+                sw_ans = L::select(L::load(&batch.mask_le[col..]), L::max(sw_ans, cell), sw_ans);
             }
             if flags.answer_last_col {
-                ov_lastcol = L::select(mask_eq[j], L::max(ov_lastcol, cell), ov_lastcol);
+                ov_lastcol = L::select(
+                    L::load(&batch.mask_eq[col..]),
+                    L::max(ov_lastcol, cell),
+                    ov_lastcol,
+                );
             }
-            h_cur[j] = cell;
+            L::store(cell, &mut cur[col..]);
         }
-        std::mem::swap(&mut h_prev, &mut h_cur);
+        std::mem::swap(&mut prev, &mut cur);
     }
 
-    // After the sweep `h_prev` holds the last query row (row 0 if the query was empty).
-    let last_row = &h_prev;
+    // `prev` now holds the last query row (row 0 if the query was empty).
+    let last_row = &*prev;
+    let load_row = |j: usize| L::load(&last_row[j * lanes..]);
 
     let ans = if flags.local {
         sw_ans
     } else if flags.answer_last_row && flags.answer_last_col {
         // OV: best of the last row (j <= len_k) and the accumulated last column.
-        let mut lastrow = last_row[0];
+        let mut lastrow = load_row(0);
         for j in 1..=w {
-            lastrow = L::select(mask_le[j], L::max(lastrow, last_row[j]), lastrow);
+            lastrow = L::select(
+                L::load(&batch.mask_le[j * lanes..]),
+                L::max(lastrow, load_row(j)),
+                lastrow,
+            );
         }
         L::max(lastrow, ov_lastcol)
     } else if flags.answer_last_row {
-        // HW: best of the last row over j <= len_k (including the free-or-penalised j = 0 border).
-        let mut hw = last_row[0];
+        // HW: best of the last row over j <= len_k (including the j = 0 border).
+        let mut hw = load_row(0);
         for j in 1..=w {
-            hw = L::select(mask_le[j], L::max(hw, last_row[j]), hw);
+            hw = L::select(
+                L::load(&batch.mask_le[j * lanes..]),
+                L::max(hw, load_row(j)),
+                hw,
+            );
         }
         hw
     } else {
         // NW: exactly H[qlen][len_k] per lane.
-        let mut nw = last_row[0]; // covers len_k == 0
+        let mut nw = load_row(0); // covers len_k == 0
         for j in 1..=w {
-            nw = L::select(mask_eq[j], last_row[j], nw);
+            nw = L::select(L::load(&batch.mask_eq[j * lanes..]), load_row(j), nw);
         }
         nw
     };
 
-    let mut ans_arr = vec![0i8; lanes];
+    // Store the answer vector, then copy out the real lanes (`32` covers the widest backend).
+    let mut ans_arr = [0i8; 32];
     L::store(ans, &mut ans_arr);
-    out.copy_from_slice(&ans_arr[..batch.len()]);
+    out.copy_from_slice(&ans_arr[..batch.real]);
 }
 
 /// Scan `query` against every sequence using the inter-sequence kernel with lane backend `L`.
 ///
-/// Requires an `I8`-width, `alphabet_len <= 16` database (see [`kernel_applies`]); the caller is
-/// responsible for that gate. Returns the same [`BestHit`] the scalar path would: highest score,
-/// smallest `db_index` on a tie, and — for `ScoreEnd` — the winner's end positions via a single
-/// scalar re-alignment.
+/// Requires an `I8`-width, `alphabet_len <= 16` database (see [`kernel_applies`]); the caller
+/// gates that. Returns the same [`BestHit`] the scalar path would: highest score, smallest
+/// `db_index` on a tie, and — for `ScoreEnd` — the winner's ends via one scalar re-alignment.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_batched<L: Lanes>(
+    packed: &PackedDb,
     sequences: &[Vec<u8>],
     scoring: &Scoring,
     mode: Mode,
     search_type: SearchType,
     query: &[u8],
+    sc: &mut SimdScratch,
+    dp: &mut kernel::DpBuffers,
 ) -> BestHit {
     let al = scoring.alphabet_len();
+    let qlen = query.len();
     let flags = Flags::for_mode(mode);
-    let profile = build_profile(query, scoring);
     let (go, ge) = (scoring.gap_open() as i8, scoring.gap_ext() as i8);
 
-    // Per-sequence scores, then a scalar argmax over the database index (smallest index on tie).
+    // Rebuild the query profile into the reused allocation.
+    sc.profile.clear();
+    sc.profile.resize(qlen * al, 0);
+    for (i, &q) in query.iter().enumerate() {
+        for s in 0..al {
+            sc.profile[i * al + s] = scoring.score(q as usize, s) as i8;
+        }
+    }
+
     let mut best_score = i8::MIN;
     let mut best_index = 0usize;
-    let mut lane_scores = vec![0i8; L::LANES];
-    let refs: Vec<&[u8]> = sequences.iter().map(Vec::as_slice).collect();
-
-    for (batch_start, batch) in refs
-        .chunks(L::LANES)
-        .enumerate()
-        .map(|(b, c)| (b * L::LANES, c))
-    {
+    for (b, batch) in packed.batches.iter().enumerate() {
         scan_batch::<L>(
-            query,
-            &profile,
+            &sc.profile,
             al,
+            qlen,
             batch,
             go,
             ge,
             &flags,
-            &mut lane_scores[..batch.len()],
+            &mut sc.h,
+            &mut sc.f,
+            &mut sc.lane_scores[..batch.real],
         );
-        for (k, &s) in lane_scores[..batch.len()].iter().enumerate() {
+        let start = b * packed.lanes;
+        for k in 0..batch.real {
+            let s = sc.lane_scores[k];
             if s > best_score {
                 best_score = s;
-                best_index = batch_start + k;
+                best_index = start + k;
             }
         }
     }
 
     let (query_end, target_end) = if search_type.tracks_end() {
         // Recover the winner's ends with one scalar alignment — bit-identical to the oracle.
-        let mut buf = kernel::DpBuffers::new();
-        let (score, qe, te) =
-            kernel::align_core(query, &sequences[best_index], scoring, mode, &mut buf);
+        let (score, qe, te) = kernel::align_core(query, &sequences[best_index], scoring, mode, dp);
         debug_assert_eq!(
             score, best_score as i32,
             "inter-sequence score disagrees with scalar re-alignment for the winner"
@@ -345,24 +470,33 @@ pub(crate) fn scan_batched<L: Lanes>(
     }
 }
 
-/// Run the inter-sequence scan on the resolved SIMD `backend`. The backend resolver guarantees
-/// this is only reached for a backend that is available on this CPU *and* applicable to the
-/// database (i8 width, alphabet ≤ 16), so the arms are exhaustive in practice.
+/// Run the inter-sequence scan on the resolved SIMD `backend`. The resolver only selects one for a
+/// CPU that supports it and a database it applies to, so the arms are exhaustive in practice.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_dispatch(
     backend: crate::Backend,
+    packed: &PackedDb,
     sequences: &[Vec<u8>],
     scoring: &Scoring,
     mode: Mode,
     search_type: SearchType,
     query: &[u8],
+    sc: &mut SimdScratch,
+    dp: &mut kernel::DpBuffers,
 ) -> BestHit {
     match backend {
         #[cfg(target_arch = "x86_64")]
-        crate::Backend::Avx2 => avx2::run(sequences, scoring, mode, search_type, query),
+        crate::Backend::Avx2 => {
+            avx2::run(packed, sequences, scoring, mode, search_type, query, sc, dp)
+        }
         #[cfg(target_arch = "x86_64")]
-        crate::Backend::Sse41 => sse41::run(sequences, scoring, mode, search_type, query),
+        crate::Backend::Sse41 => {
+            sse41::run(packed, sequences, scoring, mode, search_type, query, sc, dp)
+        }
         #[cfg(target_arch = "aarch64")]
-        crate::Backend::Neon => neon::run(sequences, scoring, mode, search_type, query),
+        crate::Backend::Neon => {
+            neon::run(packed, sequences, scoring, mode, search_type, query, sc, dp)
+        }
         other => unreachable!("no inter-sequence kernel for backend {other}"),
     }
 }
@@ -373,8 +507,9 @@ pub(crate) mod sse41 {
     // Intrinsics require `unsafe`; the crate is otherwise `deny(unsafe_code)`.
     #![allow(unsafe_code)]
 
-    use super::{Lanes, scan_batched};
+    use super::{Lanes, PackedDb, SimdScratch, scan_batched};
     use crate::hit::BestHit;
+    use crate::kernel::DpBuffers;
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::search::SearchType;
@@ -438,27 +573,35 @@ pub(crate) mod sse41 {
 
     /// Feature-enabled shim: everything inlined here is compiled with SSE4.1.
     #[target_feature(enable = "sse4.1")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn scan_ff(
+        packed: &PackedDb,
         sequences: &[Vec<u8>],
         scoring: &Scoring,
         mode: Mode,
         search_type: SearchType,
         query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
     ) -> BestHit {
-        scan_batched::<Sse41>(sequences, scoring, mode, search_type, query)
+        scan_batched::<Sse41>(packed, sequences, scoring, mode, search_type, query, sc, dp)
     }
 
     /// Safe entry point. Only called for a resolved `Sse41` backend, which the resolver returns
     /// exclusively when `sse4.1` is detected — so the feature precondition of [`scan_ff`] holds.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run(
+        packed: &PackedDb,
         sequences: &[Vec<u8>],
         scoring: &Scoring,
         mode: Mode,
         search_type: SearchType,
         query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
     ) -> BestHit {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { scan_ff(sequences, scoring, mode, search_type, query) }
+        unsafe { scan_ff(packed, sequences, scoring, mode, search_type, query, sc, dp) }
     }
 }
 
@@ -467,8 +610,9 @@ pub(crate) mod sse41 {
 pub(crate) mod avx2 {
     #![allow(unsafe_code)]
 
-    use super::{Lanes, scan_batched};
+    use super::{Lanes, PackedDb, SimdScratch, scan_batched};
     use crate::hit::BestHit;
+    use crate::kernel::DpBuffers;
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::search::SearchType;
@@ -531,27 +675,35 @@ pub(crate) mod avx2 {
     }
 
     #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn scan_ff(
+        packed: &PackedDb,
         sequences: &[Vec<u8>],
         scoring: &Scoring,
         mode: Mode,
         search_type: SearchType,
         query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
     ) -> BestHit {
-        scan_batched::<Avx2>(sequences, scoring, mode, search_type, query)
+        scan_batched::<Avx2>(packed, sequences, scoring, mode, search_type, query, sc, dp)
     }
 
     /// Safe entry point; only called for a resolved `Avx2` backend, which the resolver returns
     /// only when `avx2` is detected.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run(
+        packed: &PackedDb,
         sequences: &[Vec<u8>],
         scoring: &Scoring,
         mode: Mode,
         search_type: SearchType,
         query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
     ) -> BestHit {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { scan_ff(sequences, scoring, mode, search_type, query) }
+        unsafe { scan_ff(packed, sequences, scoring, mode, search_type, query, sc, dp) }
     }
 }
 
@@ -561,8 +713,9 @@ pub(crate) mod avx2 {
 pub(crate) mod neon {
     #![allow(unsafe_code)]
 
-    use super::{Lanes, scan_batched};
+    use super::{Lanes, PackedDb, SimdScratch, scan_batched};
     use crate::hit::BestHit;
+    use crate::kernel::DpBuffers;
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::search::SearchType;
@@ -623,14 +776,18 @@ pub(crate) mod neon {
     }
 
     /// Safe entry point. NEON is always available on aarch64, so no feature guard is needed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run(
+        packed: &PackedDb,
         sequences: &[Vec<u8>],
         scoring: &Scoring,
         mode: Mode,
         search_type: SearchType,
         query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
     ) -> BestHit {
-        scan_batched::<Neon>(sequences, scoring, mode, search_type, query)
+        scan_batched::<Neon>(packed, sequences, scoring, mode, search_type, query, sc, dp)
     }
 }
 
@@ -658,6 +815,22 @@ mod tests {
             .unwrap();
         let mut scratch = Scratch::new(&db);
         db.scan(&mut scratch, query)
+    }
+
+    /// Run the inter-sequence kernel with an `N`-lane scalar reference backend, driving the same
+    /// packed-database + reusable-scratch path production uses.
+    fn inter_scan<const N: usize>(
+        seqs: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        st: SearchType,
+        query: &[u8],
+    ) -> BestHit {
+        let max_t = seqs.iter().map(Vec::len).max().unwrap_or(0);
+        let packed = PackedDb::build(seqs, N);
+        let mut sc = SimdScratch::new(query.len(), scoring.alphabet_len(), max_t, N);
+        let mut dp = kernel::DpBuffers::new();
+        scan_batched::<ScalarLanes<N>>(&packed, seqs, scoring, mode, st, query, &mut sc, &mut dp)
     }
 
     const MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
@@ -701,9 +874,9 @@ mod tests {
             for mode in MODES {
                 for st in [SearchType::Score, SearchType::ScoreEnd] {
                     let want = scalar_scan(&seqs, &scoring, mode, st, &q);
-                    let got1 = scan_batched::<ScalarLanes<1>>(&seqs, &scoring, mode, st, &q);
-                    let got4 = scan_batched::<ScalarLanes<4>>(&seqs, &scoring, mode, st, &q);
-                    let got8 = scan_batched::<ScalarLanes<8>>(&seqs, &scoring, mode, st, &q);
+                    let got1 = inter_scan::<1>(&seqs, &scoring, mode, st, &q);
+                    let got4 = inter_scan::<4>(&seqs, &scoring, mode, st, &q);
+                    let got8 = inter_scan::<8>(&seqs, &scoring, mode, st, &q);
                     prop_assert_eq!(got1, want, "1 lane, {} {}", mode, st);
                     prop_assert_eq!(got4, want, "4 lanes, {} {}", mode, st);
                     prop_assert_eq!(got8, want, "8 lanes, {} {}", mode, st);

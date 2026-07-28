@@ -47,6 +47,17 @@ impl Backend {
         }
     }
 
+    /// The SIMD lane count (number of `i8` lanes) for this backend, or `None` for the scalar
+    /// backend, which does not use the inter-sequence lane kernel.
+    #[must_use]
+    pub(crate) fn simd_lanes(self) -> Option<usize> {
+        match self {
+            Backend::Scalar => None,
+            Backend::Sse41 | Backend::Neon => Some(16),
+            Backend::Avx2 => Some(32),
+        }
+    }
+
     /// Whether this backend is implemented and usable on the current build/CPU. Gated on both the
     /// target architecture and runtime CPU-feature detection.
     ///

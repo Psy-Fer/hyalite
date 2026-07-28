@@ -33,6 +33,7 @@
 use crate::backend::{self, Backend, BackendChoice};
 use crate::error::{Error, Result};
 use crate::hit::BestHit;
+use crate::inter::{self, Layout, PackedDb, SimdScratch};
 use crate::kernel::{DpBuffers, align_core};
 use crate::mode::Mode;
 use crate::scoring::Scoring;
@@ -51,6 +52,8 @@ pub struct Database {
     max_target_len: usize,
     width: ScoreWidth,
     backend: Backend,
+    /// The database packed for the inter-sequence kernel; `Some` only for a SIMD backend.
+    packed: Option<PackedDb>,
 }
 
 impl Database {
@@ -79,16 +82,20 @@ impl Database {
             self.max_query_len
         );
 
-        // SIMD backends run the inter-sequence kernel. The resolver only selects one for a
-        // SIMD-eligible database, so this dispatch is safe to take unconditionally here.
-        if self.backend != Backend::Scalar {
-            return crate::inter::scan_dispatch(
+        // SIMD backends run the inter-sequence kernel over the prebuilt packing, reusing the
+        // scratch buffers. The resolver only selects a SIMD backend for an eligible database, so
+        // `packed` is `Some` whenever the backend is non-scalar.
+        if let Some(packed) = &self.packed {
+            return inter::scan_dispatch(
                 self.backend,
+                packed,
                 &self.sequences,
                 &self.scoring,
                 self.mode,
                 self.search_type,
                 query,
+                &mut scratch.simd,
+                &mut scratch.buf,
             );
         }
 
@@ -155,11 +162,17 @@ impl Database {
         self.width
     }
 
-    /// The resolved compute backend. Always [`Backend::Scalar`] in M0, but reflects the
-    /// [`BackendChoice`] and `HYALITE_BACKEND` override once SIMD backends exist.
+    /// The resolved compute backend. Reflects the [`BackendChoice`] and `HYALITE_BACKEND` override,
+    /// falling back to the fastest one this CPU supports.
     #[must_use]
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The kernel data layout, or `None` for the scalar backend (which does not pack the database).
+    #[must_use]
+    pub fn layout(&self) -> Option<Layout> {
+        self.packed.as_ref().map(PackedDb::layout)
     }
 
     /// The maximum query length this database was built for.
@@ -306,6 +319,11 @@ impl DatabaseBuilder {
             }
         };
 
+        // Pack the database once for the resolved SIMD backend's lane count (query-independent).
+        let packed = backend
+            .simd_lanes()
+            .map(|lanes| PackedDb::build(&sequences, lanes));
+
         Ok(Database {
             sequences,
             scoring,
@@ -315,6 +333,7 @@ impl DatabaseBuilder {
             max_target_len,
             width,
             backend,
+            packed,
         })
     }
 }
@@ -324,15 +343,29 @@ impl DatabaseBuilder {
 /// scan calls but should match the database it was sized for.
 #[derive(Debug)]
 pub struct Scratch {
+    /// Full-matrix scalar DP buffers: used by the scalar scan, and by the SIMD scan to recover the
+    /// winner's end positions.
     buf: DpBuffers,
+    /// SIMD inter-sequence working memory (empty for a scalar-backend database).
+    simd: SimdScratch,
 }
 
 impl Scratch {
     /// Allocate scratch pre-sized for `db`, so no scan reallocates.
     #[must_use]
     pub fn new(db: &Database) -> Self {
+        let simd = match db.backend().simd_lanes() {
+            Some(lanes) => SimdScratch::new(
+                db.max_query_len(),
+                db.scoring().alphabet_len(),
+                db.max_target_len(),
+                lanes,
+            ),
+            None => SimdScratch::empty(),
+        };
         Scratch {
             buf: DpBuffers::with_capacity(db.max_query_len(), db.max_target_len()),
+            simd,
         }
     }
 }
@@ -517,6 +550,37 @@ mod tests {
         // On a CPU without SSE4.1 the resolver rejects it before the eligibility check; either way
         // the outcome is a build error, never a silent scalar fallback.
         assert!(matches!(result, Err(Error::BackendUnavailable { .. })));
+    }
+
+    #[test]
+    fn layout_is_reported_for_simd_and_absent_for_scalar() {
+        let scalar = Database::builder()
+            .sequences(&[vec![0u8, 1, 2, 3]])
+            .scoring(dna_scoring())
+            .mode(Mode::Sw)
+            .max_query_len(8)
+            .backend(BackendChoice::Force(Backend::Scalar))
+            .build()
+            .unwrap();
+        assert_eq!(
+            scalar.layout(),
+            None,
+            "scalar backend does not pack the database"
+        );
+
+        for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
+            if b.is_available() {
+                let db = Database::builder()
+                    .sequences(&[vec![0u8, 1, 2, 3], vec![2u8, 2]])
+                    .scoring(dna_scoring())
+                    .mode(Mode::Ov)
+                    .max_query_len(8)
+                    .backend(BackendChoice::Force(b))
+                    .build()
+                    .unwrap();
+                assert_eq!(db.layout(), Some(Layout::Gathered), "{b} layout");
+            }
+        }
     }
 
     #[test]
