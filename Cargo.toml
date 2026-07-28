@@ -1,0 +1,15 @@
+[package]
+name = "hyalite"
+version = "0.1.0"
+edition = "2024"
+description = "Massive optimal sequence alignment (local/SW, infix, overlap, global) with SIMD (opal)"
+license = "MIT"
+repository = "https://github.com/Psy-Fer/hyalite"
+homepage = "https://github.com/Psy-Fer/hyalite"
+documentation = "https://docs.rs/hyalite"
+readme = "README.md"
+authors = ["James Ferguson <j.ferguson@garvan.org.au>"]
+keywords = ["bioinformatics", "alignment", "genomics"]
+categories = ["science", "algorithms"]
+
+[dependencies]
