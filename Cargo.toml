@@ -13,3 +13,7 @@ keywords = ["bioinformatics", "alignment", "genomics"]
 categories = ["science", "algorithms"]
 
 [dependencies]
+
+[dev-dependencies]
+# Property-based / differential testing. Dev-only — the core stays dependency-free.
+proptest = "1"
