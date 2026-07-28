@@ -117,15 +117,49 @@ impl Best {
     }
 }
 
+/// Reusable working memory for the scalar DP. Held per worker thread inside
+/// [`Scratch`](crate::Scratch) and reused across every target in a scan, so the hot path
+/// allocates nothing once the buffers are sized. Sizing to a smaller problem than the capacity
+/// never reallocates.
+#[derive(Debug)]
+pub(crate) struct DpBuffers {
+    /// The full `(m + 1) * (n + 1)` `H` matrix, row-major.
+    h: Vec<i32>,
+    /// One column of the `F` (target-gap) matrix, carried down the rows.
+    f: Vec<i32>,
+}
+
+impl DpBuffers {
+    /// Empty buffers, grown on first use. Suitable for one-shot [`align_pair`].
+    pub(crate) fn new() -> Self {
+        DpBuffers {
+            h: Vec::new(),
+            f: Vec::new(),
+        }
+    }
+
+    /// Buffers pre-sized for queries up to `max_query_len` against targets up to
+    /// `max_target_len`, so no scan reallocates.
+    pub(crate) fn with_capacity(max_query_len: usize, max_target_len: usize) -> Self {
+        let cols = max_target_len + 1;
+        DpBuffers {
+            h: Vec::with_capacity((max_query_len + 1) * cols),
+            f: Vec::with_capacity(cols),
+        }
+    }
+}
+
 /// Run the scalar DP for one query/target pair, returning `(score, query_end, target_end)`.
 ///
 /// Callers must have validated that every symbol is `< scoring.alphabet_len()`; this routine
-/// indexes the scoring matrix directly.
-fn align_scalar(
+/// indexes the scoring matrix directly. `buf` is resized (reusing capacity) and fully
+/// overwritten, so its prior contents are irrelevant.
+pub(crate) fn align_core(
     query: &[u8],
     target: &[u8],
     scoring: &Scoring,
     mode: Mode,
+    buf: &mut DpBuffers,
 ) -> (i32, Option<usize>, Option<usize>) {
     let m = query.len();
     let n = target.len();
@@ -134,8 +168,11 @@ fn align_scalar(
     let cols = n + 1;
     let idx = |i: usize, j: usize| i * cols + j;
 
-    // H[i][j]: best score aligning query[..i] with target[..j].
-    let mut h = vec![0i32; (m + 1) * cols];
+    // H[i][j]: best score aligning query[..i] with target[..j]. Reset to a clean zero matrix,
+    // reusing the existing allocation whenever capacity allows.
+    let h = &mut buf.h;
+    h.clear();
+    h.resize((m + 1) * cols, 0);
     // Border initialisation. Only H borders, E[i][0], and F[0][j] are ever read by the
     // recurrence; E/F border sentinels are folded in below.
     for j in 1..=n {
@@ -154,7 +191,9 @@ fn align_scalar(
     }
 
     // F[i][j] carried down the columns; F[0][j] = NEG (no target-gap can end at row 0).
-    let mut f = vec![NEG; cols];
+    let f = &mut buf.f;
+    f.clear();
+    f.resize(cols, NEG);
 
     for i in 1..=m {
         let mut e = NEG; // E[i][0]: no query-gap can end at column 0.
@@ -233,7 +272,8 @@ pub fn align_pair(
     // Prove i32 suffices for these lengths before running the DP.
     scoring.required_width(mode, query.len(), target.len())?;
 
-    let (score, query_end, target_end) = align_scalar(query, target, scoring, mode);
+    let mut buf = DpBuffers::new();
+    let (score, query_end, target_end) = align_core(query, target, scoring, mode, &mut buf);
 
     let (query_end, target_end) = if search_type.tracks_end() {
         (query_end, target_end)

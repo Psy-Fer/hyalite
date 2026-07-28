@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)] // lifted per-module when the SIMD backends land (M2+).
 
+mod backend;
+mod database;
 mod error;
 mod hit;
 mod kernel;
@@ -32,6 +34,8 @@ mod scoring;
 mod search;
 mod width;
 
+pub use backend::Backend;
+pub use database::{Database, DatabaseBuilder, Scratch};
 pub use error::{Error, Result};
 pub use hit::BestHit;
 pub use kernel::align_pair;

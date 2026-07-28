@@ -60,6 +60,15 @@ pub enum Error {
         /// The alphabet length it must be below.
         alphabet_len: usize,
     },
+
+    /// A required builder field was not set before `build()`.
+    IncompleteBuilder {
+        /// The name of the missing field.
+        field: &'static str,
+    },
+
+    /// A database was built with no sequences to search against.
+    EmptyDatabase,
 }
 
 impl fmt::Display for Error {
@@ -97,6 +106,12 @@ impl fmt::Display for Error {
                 "encoded symbol {symbol} is out of range for alphabet_len {alphabet_len} \
                  (must be in 0..{alphabet_len})"
             ),
+            Error::IncompleteBuilder { field } => {
+                write!(f, "database builder is missing required field: {field}")
+            }
+            Error::EmptyDatabase => {
+                write!(f, "database must contain at least one sequence")
+            }
         }
     }
 }
