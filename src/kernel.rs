@@ -347,4 +347,125 @@ mod tests {
         .unwrap();
         assert_eq!((hit.query_end, hit.target_end), (Some(3), Some(3)));
     }
+
+    // --- G1: the width proof bounds *every* cell, not just the final score (see DETERMINISM.md) ---
+
+    /// Re-run the exact scalar recurrence and return the largest magnitude over all **real**
+    /// (non-sentinel) `H`/`E`/`F` cells. Cells at or below `NEG/2` are −∞ sentinels and are
+    /// excluded — in a narrow backend they map to the width's reserved `MIN` sentinel and never
+    /// carry a real score. Deliberately in lock-step with `align_core`: this measures the very
+    /// cells the kernel produces.
+    fn max_real_cell_magnitude(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i64 {
+        fn note(max_mag: &mut i64, v: i32, sentinel_floor: i64) {
+            let v = v as i64;
+            if v > sentinel_floor {
+                *max_mag = (*max_mag).max(v.abs());
+            }
+        }
+
+        let m = query.len();
+        let n = target.len();
+        let flags = Flags::for_mode(mode);
+        let (gap_open, gap_ext) = (scoring.gap_open(), scoring.gap_ext());
+        let cols = n + 1;
+        let idx = |i: usize, j: usize| i * cols + j;
+        let sentinel_floor = (NEG / 2) as i64;
+        let mut max_mag = 0i64;
+
+        let mut h = vec![0i32; (m + 1) * cols];
+        for j in 1..=n {
+            h[idx(0, j)] = if flags.top_row_free {
+                0
+            } else {
+                -gap_penalty(gap_open, gap_ext, j)
+            };
+        }
+        for i in 1..=m {
+            h[idx(i, 0)] = if flags.left_col_free {
+                0
+            } else {
+                -gap_penalty(gap_open, gap_ext, i)
+            };
+        }
+        for i in 0..=m {
+            note(&mut max_mag, h[idx(i, 0)], sentinel_floor);
+        }
+        for j in 0..=n {
+            note(&mut max_mag, h[idx(0, j)], sentinel_floor);
+        }
+
+        let mut f = vec![NEG; cols];
+        for i in 1..=m {
+            let mut e = NEG;
+            for j in 1..=n {
+                e = (h[idx(i, j - 1)] - gap_open).max(e - gap_ext);
+                f[j] = (h[idx(i - 1, j)] - gap_open).max(f[j] - gap_ext);
+                let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
+                let diag = h[idx(i - 1, j - 1)] + sub;
+                let mut cell = diag.max(e).max(f[j]);
+                if flags.local {
+                    cell = cell.max(0);
+                }
+                h[idx(i, j)] = cell;
+                note(&mut max_mag, e, sentinel_floor);
+                note(&mut max_mag, f[j], sentinel_floor);
+                note(&mut max_mag, cell, sentinel_floor);
+            }
+        }
+        max_mag
+    }
+
+    #[test]
+    fn intermediate_cell_bound_holds_for_gap_dominated_global_alignment() {
+        // A concrete case where E/F (not the diagonal) carry the extreme values: a global
+        // alignment of two dissimilar sequences with a heavy mismatch and gap regime. The most
+        // negative cell must still fit the proven width.
+        let scoring = Scoring::new(2, vec![1, -8, -8, 1], 6, 2).unwrap();
+        let q = vec![0u8; 20];
+        let t = vec![1u8; 20];
+        let width = scoring.required_width(Mode::Nw, q.len(), t.len()).unwrap();
+        let max_mag = max_real_cell_magnitude(&q, &t, &scoring, Mode::Nw);
+        assert!(
+            max_mag <= width.max_abs(),
+            "max cell magnitude {max_mag} exceeds {width} range ({})",
+            width.max_abs()
+        );
+    }
+
+    use proptest::prelude::*;
+
+    fn scheme_and_pair() -> impl Strategy<Value = (usize, Vec<i32>, i32, i32, Vec<u8>, Vec<u8>)> {
+        (2usize..=4)
+            .prop_flat_map(|al| {
+                let mat = prop::collection::vec(-8i32..=8, al * al);
+                let gaps = (0i32..=10).prop_flat_map(|go| (Just(go), 0i32..=go));
+                let q = prop::collection::vec(0u8..al as u8, 0..=30);
+                let t = prop::collection::vec(0u8..al as u8, 0..=30);
+                (Just(al), mat, gaps, q, t)
+            })
+            .prop_map(|(al, mat, (go, ge), q, t)| (al, mat, go, ge, q, t))
+    }
+
+    proptest! {
+        /// G1: for every mode, the largest magnitude among *all real `H`/`E`/`F` cells* fits the
+        /// width the proof selected — not merely the final score. This is exactly what lets a
+        /// saturating i8/i16 backend be bit-identical to the wide scalar oracle. Input ranges are
+        /// bounded so the reachable magnitude stays far above `NEG/2`, keeping real cells cleanly
+        /// separable from sentinels.
+        #[test]
+        fn intermediate_cells_fit_the_proven_width(
+            (al, mat, go, ge, q, t) in scheme_and_pair()
+        ) {
+            let scoring = Scoring::new(al, mat, go, ge).unwrap();
+            for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov] {
+                let width = scoring.required_width(mode, q.len(), t.len()).unwrap();
+                let max_mag = max_real_cell_magnitude(&q, &t, &scoring, mode);
+                prop_assert!(
+                    max_mag <= width.max_abs(),
+                    "mode {}: max intermediate cell magnitude {} exceeds {} range ({})",
+                    mode, max_mag, width, width.max_abs()
+                );
+            }
+        }
+    }
 }

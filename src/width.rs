@@ -71,6 +71,12 @@ impl core::fmt::Display for ScoreWidth {
 
 /// A conservative bound on the reachable score magnitude `|score|` for the given inputs.
 ///
+/// This bounds not only the final score but **every** intermediate `H`/`E`/`F` cell: each cell is
+/// itself the score of an optimal partial alignment (a path of at most `m + n` steps), so it is
+/// subject to the same two contributions below. That is what lets a saturating narrow-width
+/// backend stay bit-identical to the wide scalar oracle — no *real* cell ever saturates. The
+/// `intermediate_cells_fit_the_proven_width` test checks this directly; see `DETERMINISM.md` §2.
+///
 /// Computed in `i128` so intermediate products cannot wrap. Two contributions:
 ///
 /// - **Positive reach:** an optimal path has at most `min(m, n)` aligned pairs, each worth at

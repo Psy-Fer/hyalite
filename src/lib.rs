@@ -13,8 +13,12 @@
 //! > selected backend affects performance only, never results.
 //!
 //! Holding this is why scores use a single, once-defined signed-integer arithmetic model with
-//! a documented saturation boundary (see [`width`]), and why tie-breaks are resolved by a
+//! a documented saturation boundary (see [`ScoreWidth`]), and why tie-breaks are resolved by a
 //! scalar argmax over database index rather than a lane-order-dependent horizontal max.
+//!
+//! The full specification every backend must implement against — the arithmetic model, the
+//! score-width proof's coverage of intermediate cells, the tie-break rules, and what is and is
+//! not promised — lives in `DETERMINISM.md` at the repository root.
 //!
 //! # Status
 //!
