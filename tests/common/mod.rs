@@ -156,6 +156,59 @@ pub fn brute(mode: Mode, q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge
     }
 }
 
+/// Encode an ASCII DNA string to alphabet indices `A,C,G,T,N -> 0,1,2,3,4`, skipping whitespace.
+/// Panics on any other character.
+pub fn encode_dna(seq: &str) -> Vec<u8> {
+    seq.bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(|b| match b.to_ascii_uppercase() {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            b'N' => 4,
+            other => panic!("unexpected base {:?} in sequence", other as char),
+        })
+        .collect()
+}
+
+/// Minimal FASTA parser: returns `(id, encoded_sequence)` per record. `id` is the first
+/// whitespace-delimited token of the header.
+pub fn parse_fasta(text: &str) -> Vec<(String, Vec<u8>)> {
+    let mut records = Vec::new();
+    let mut id: Option<String> = None;
+    let mut seq = String::new();
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix('>') {
+            if let Some(prev) = id.take() {
+                records.push((prev, encode_dna(&seq)));
+                seq.clear();
+            }
+            id = Some(header.split_whitespace().next().unwrap_or("").to_string());
+        } else {
+            seq.push_str(line.trim());
+        }
+    }
+    if let Some(prev) = id.take() {
+        records.push((prev, encode_dna(&seq)));
+    }
+    records
+}
+
+/// STAR CellRanger4 scoring, transcribed from STAR source: alphabet `A,C,G,T,N`; match +1,
+/// mismatch -2, any-vs-N -2, N-vs-N 0; `gap_open = 2`, `gap_ext = 2`. See `tests/data/PROVENANCE.md`.
+pub fn cr4_scoring() -> Scoring {
+    #[rustfmt::skip]
+    let matrix = vec![
+         1, -2, -2, -2, -2,
+        -2,  1, -2, -2, -2,
+        -2, -2,  1, -2, -2,
+        -2, -2, -2,  1, -2,
+        -2, -2, -2, -2,  0,
+    ];
+    Scoring::new(5, matrix, 2, 2).unwrap()
+}
+
 /// The expected database-scan result: best `align_pair` over `seqs`, smallest index on ties.
 pub fn reference_scan(
     seqs: &[Vec<u8>],
