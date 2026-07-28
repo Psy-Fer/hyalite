@@ -26,12 +26,15 @@
 //! and `ScoreEnd` [search types](SearchType). SIMD backends, traceback, and the striped
 //! `align_pair` path land in later milestones — see `handover.md`.
 
-#![forbid(unsafe_code)] // lifted per-module when the SIMD backends land (M2+).
+// `deny` rather than `forbid` so the SIMD backend modules (M2b+) can locally `allow(unsafe_code)`
+// for intrinsics; everything else stays unsafe-free.
+#![deny(unsafe_code)]
 
 mod backend;
 mod database;
 mod error;
 mod hit;
+mod inter;
 mod kernel;
 mod mode;
 mod scoring;

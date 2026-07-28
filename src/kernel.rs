@@ -37,22 +37,23 @@ use crate::search::SearchType;
 /// so repeated `- gap` subtractions cannot underflow.
 const NEG: i32 = i32::MIN / 4;
 
-/// Per-mode control flags derived from [`Mode`].
-struct Flags {
+/// Per-mode control flags derived from [`Mode`]. Shared with the inter-sequence kernel
+/// ([`crate::inter`]) so both kernels derive the mode's border/answer geometry identically.
+pub(crate) struct Flags {
     /// Top row starts at 0 (leading query gap is free).
-    top_row_free: bool,
+    pub(crate) top_row_free: bool,
     /// Left column starts at 0 (leading target gap is free).
-    left_col_free: bool,
+    pub(crate) left_col_free: bool,
     /// The last row is part of the answer region (trailing query gap is free).
-    answer_last_row: bool,
+    pub(crate) answer_last_row: bool,
     /// The last column is part of the answer region (trailing target gap is free).
-    answer_last_col: bool,
+    pub(crate) answer_last_col: bool,
     /// Local mode: clamp every cell at 0 and take the answer over the whole matrix.
-    local: bool,
+    pub(crate) local: bool,
 }
 
 impl Flags {
-    fn for_mode(mode: Mode) -> Self {
+    pub(crate) fn for_mode(mode: Mode) -> Self {
         match mode {
             Mode::Nw => Flags {
                 top_row_free: false,
@@ -89,7 +90,7 @@ impl Flags {
 /// The penalty for a gap of length `len` under Opal's convention: `gap_open + (len - 1) *
 /// gap_ext`, or 0 for an empty gap. Computed in `i64` so the intermediate cannot overflow; the
 /// width proof guarantees the result fits `i32`.
-fn gap_penalty(gap_open: i32, gap_ext: i32, len: usize) -> i32 {
+pub(crate) fn gap_penalty(gap_open: i32, gap_ext: i32, len: usize) -> i32 {
     if len == 0 {
         0
     } else {
