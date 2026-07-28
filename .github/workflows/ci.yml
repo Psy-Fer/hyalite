@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      # `-- -D warnings` denies lints in *our* crate only; dependencies are built (not linted)
+      # by clippy, so their warnings can't fail the build.
+      - name: clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }}, backend=${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Run the whole suite on both x86-64 and aarch64. NEON is mandatory on aarch64, so the
+        # ARM runner is load-bearing once the SIMD backends land.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        # The determinism contract requires every backend to be exercised against the scalar
+        # oracle. In M0/M1 only `scalar` exists, so this is a single entry. At M2, add the SIMD
+        # backends gated by architecture via `include`, e.g.:
+        #   - { os: ubuntu-latest,     backend: sse4.1 }
+        #   - { os: ubuntu-latest,     backend: avx2 }
+        #   - { os: ubuntu-24.04-arm,  backend: neon }
+        backend: [scalar]
+    env:
+      # Force the backend so a mismatch (e.g. the CPU lacks the forced ISA) fails loudly rather
+      # than silently falling back. `HYALITE_BACKEND` is read at Database::build.
+      HYALITE_BACKEND: ${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Plain `cargo test` also runs doctests (which `--all-targets` would skip).
+      - name: test
+        run: cargo test --all-features --locked
