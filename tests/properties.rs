@@ -253,12 +253,17 @@ fn scan_forced(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
-    /// The determinism contract, now testable: for every SIMD-eligible database, forcing SSE4.1
-    /// yields the exact same `BestHit` (score, db_index, and end positions) as forcing scalar —
-    /// across all modes and both search types. Skipped entirely on CPUs without SSE4.1.
+    /// The determinism contract, now testable: for every SIMD-eligible database, each available
+    /// SIMD backend (SSE4.1, AVX2) yields the exact same `BestHit` (score, db_index, end
+    /// positions) as scalar — across all modes and both search types. Unavailable backends on this
+    /// CPU are skipped.
     #[test]
-    fn scan_identical_scalar_vs_sse41((s, db_seqs, q) in scheme_db_query()) {
-        if !Backend::Sse41.is_available() {
+    fn scan_identical_across_simd_backends((s, db_seqs, q) in scheme_db_query()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
             return Ok(()); // no SIMD backend on this CPU; nothing to compare
         }
         let scoring = s.scoring();
@@ -272,8 +277,10 @@ proptest! {
             }
             for st in [SearchType::Score, SearchType::ScoreEnd] {
                 let scalar = scan_forced(Backend::Scalar, &db_seqs, &scoring, mode, st, &q);
-                let sse41 = scan_forced(Backend::Sse41, &db_seqs, &scoring, mode, st, &q);
-                prop_assert_eq!(sse41, scalar, "{} {} disagree scalar vs sse4.1", mode, st);
+                for &b in &simd {
+                    let got = scan_forced(b, &db_seqs, &scoring, mode, st, &q);
+                    prop_assert_eq!(got, scalar, "{} disagrees with scalar for {} {}", b, mode, st);
+                }
             }
         }
     }

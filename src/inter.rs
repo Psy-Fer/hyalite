@@ -352,6 +352,8 @@ pub(crate) fn scan_dispatch(
 ) -> BestHit {
     match backend {
         #[cfg(target_arch = "x86_64")]
+        crate::Backend::Avx2 => avx2::run(sequences, scoring, mode, search_type, query),
+        #[cfg(target_arch = "x86_64")]
         crate::Backend::Sse41 => sse41::run(sequences, scoring, mode, search_type, query),
         other => unreachable!("no inter-sequence kernel for backend {other}"),
     }
@@ -448,6 +450,99 @@ pub(crate) mod sse41 {
         query: &[u8],
     ) -> BestHit {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
+        unsafe { scan_ff(sequences, scoring, mode, search_type, query) }
+    }
+}
+
+/// AVX2 lane backend: 32 `i8` lanes per `__m256i`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod avx2 {
+    #![allow(unsafe_code)]
+
+    use super::{Lanes, scan_batched};
+    use crate::hit::BestHit;
+    use crate::mode::Mode;
+    use crate::scoring::Scoring;
+    use crate::search::SearchType;
+    use core::arch::x86_64::*;
+
+    /// 32-lane AVX2 backend. Ops are `#[inline(always)]` so they fold into the `#[target_feature]`
+    /// shim below.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Avx2;
+
+    impl Lanes for Avx2 {
+        const LANES: usize = 32;
+        type V = __m256i;
+
+        #[inline(always)]
+        fn splat(v: i8) -> __m256i {
+            unsafe { _mm256_set1_epi8(v) }
+        }
+        #[inline(always)]
+        fn add_sat(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_adds_epi8(a, b) }
+        }
+        #[inline(always)]
+        fn sub_sat(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_subs_epi8(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_max_epi8(a, b) }
+        }
+        #[inline(always)]
+        fn select(mask: __m256i, a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_blendv_epi8(b, a, mask) }
+        }
+        #[inline(always)]
+        fn load(src: &[i8]) -> __m256i {
+            debug_assert!(src.len() >= 32);
+            unsafe { _mm256_loadu_si256(src.as_ptr().cast()) }
+        }
+        #[inline(always)]
+        fn store(v: __m256i, dst: &mut [i8]) {
+            debug_assert!(dst.len() >= 32);
+            unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast(), v) }
+        }
+        #[inline(always)]
+        fn shuffle_lookup(table: &[i8], indices: &[u8]) -> __m256i {
+            debug_assert!(table.len() <= 16 && indices.len() >= 32);
+            unsafe {
+                // `_mm256_shuffle_epi8` shuffles *within each 128-bit half* independently, so the
+                // 16-byte table is broadcast to both halves; residues `< 16` then index the right
+                // copy in either half. Same PSHUFB lookup as SSE4.1, twice.
+                let mut padded = [0i8; 16];
+                padded[..table.len()].copy_from_slice(table);
+                let t128 = _mm_loadu_si128(padded.as_ptr().cast());
+                let t = _mm256_broadcastsi128_si256(t128);
+                let idx = _mm256_loadu_si256(indices.as_ptr().cast());
+                _mm256_shuffle_epi8(t, idx)
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn scan_ff(
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+    ) -> BestHit {
+        scan_batched::<Avx2>(sequences, scoring, mode, search_type, query)
+    }
+
+    /// Safe entry point; only called for a resolved `Avx2` backend, which the resolver returns
+    /// only when `avx2` is detected.
+    pub(crate) fn run(
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+    ) -> BestHit {
+        debug_assert!(std::is_x86_feature_detected!("avx2"));
         unsafe { scan_ff(sequences, scoring, mode, search_type, query) }
     }
 }

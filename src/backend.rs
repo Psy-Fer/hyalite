@@ -58,8 +58,9 @@ impl Backend {
         match self {
             Backend::Scalar => true,
             Backend::Sse41 => sse41_detected(),
-            // AVX2 lands in M2c, NEON in M3.
-            Backend::Avx2 | Backend::Neon => false,
+            Backend::Avx2 => avx2_detected(),
+            // NEON lands in M3.
+            Backend::Neon => false,
         }
     }
 }
@@ -71,6 +72,16 @@ fn sse41_detected() -> bool {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn sse41_detected() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx2_detected() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn avx2_detected() -> bool {
     false
 }
 
@@ -113,10 +124,11 @@ impl BackendChoice {
     }
 }
 
-/// The fastest available backend, in descending preference. AVX2 (M2c) will slot in ahead of
-/// SSE4.1 here once implemented.
+/// The fastest available backend, in descending preference: AVX2, then SSE4.1, then scalar.
 fn detect_best() -> Backend {
-    if Backend::Sse41.is_available() {
+    if Backend::Avx2.is_available() {
+        Backend::Avx2
+    } else if Backend::Sse41.is_available() {
         Backend::Sse41
     } else {
         Backend::Scalar
@@ -164,13 +176,16 @@ mod tests {
 
     #[test]
     fn availability_matches_arch_and_cpu() {
-        // Scalar is always available; AVX2/NEON are not implemented yet; SSE4.1 tracks the CPU.
+        // Scalar is always available; NEON is not implemented yet; x86 SIMD tracks the CPU.
         assert!(Backend::Scalar.is_available());
-        assert!(!Backend::Avx2.is_available(), "AVX2 lands in M2c");
         assert!(!Backend::Neon.is_available(), "NEON lands in M3");
         assert_eq!(Backend::Sse41.is_available(), sse41_detected());
+        assert_eq!(Backend::Avx2.is_available(), avx2_detected());
         #[cfg(not(target_arch = "x86_64"))]
-        assert!(!Backend::Sse41.is_available());
+        {
+            assert!(!Backend::Sse41.is_available());
+            assert!(!Backend::Avx2.is_available());
+        }
     }
 
     #[test]

@@ -61,12 +61,13 @@ fn hyalite_backend_env_var_is_honored_with_correct_precedence() {
         "auto should resolve to an available backend"
     );
 
-    // A forced-but-unavailable backend via env is a build error today (until M2 implements it).
-    set("avx2");
+    // Forcing an unavailable backend via env is a build error. NEON is unavailable on every
+    // target until M3, so it is a stable "forced-but-unavailable" case regardless of CPU.
+    set("neon");
     assert_eq!(
         build_using_env().unwrap_err(),
         Error::BackendUnavailable {
-            backend: Backend::Avx2
+            backend: Backend::Neon
         }
     );
 
@@ -77,8 +78,8 @@ fn hyalite_backend_env_var_is_honored_with_correct_precedence() {
         Error::InvalidBackendName { .. }
     ));
 
-    // An explicit builder choice must take precedence over the env var, even a bogus one above.
-    set("avx2");
+    // An explicit builder choice must take precedence over the env var, even an unavailable one.
+    set("neon");
     assert_eq!(
         build_forcing(BackendChoice::Force(Backend::Scalar))
             .unwrap()
