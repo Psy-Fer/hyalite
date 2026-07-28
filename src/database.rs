@@ -30,7 +30,7 @@
 //! assert_eq!(hit.db_index, 0);
 //! ```
 
-use crate::backend::Backend;
+use crate::backend::{self, Backend, BackendChoice};
 use crate::error::{Error, Result};
 use crate::hit::BestHit;
 use crate::kernel::{DpBuffers, align_core};
@@ -50,6 +50,7 @@ pub struct Database {
     max_query_len: usize,
     max_target_len: usize,
     width: ScoreWidth,
+    backend: Backend,
 }
 
 impl Database {
@@ -141,10 +142,11 @@ impl Database {
         self.width
     }
 
-    /// The resolved compute backend. Always [`Backend::Scalar`] in M0.
+    /// The resolved compute backend. Always [`Backend::Scalar`] in M0, but reflects the
+    /// [`BackendChoice`] and `HYALITE_BACKEND` override once SIMD backends exist.
     #[must_use]
     pub fn backend(&self) -> Backend {
-        Backend::Scalar
+        self.backend
     }
 
     /// The maximum query length this database was built for.
@@ -170,6 +172,7 @@ pub struct DatabaseBuilder {
     mode: Option<Mode>,
     search_type: Option<SearchType>,
     max_query_len: Option<usize>,
+    backend_choice: Option<BackendChoice>,
 }
 
 impl DatabaseBuilder {
@@ -213,6 +216,15 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Override backend selection. Takes precedence over the `HYALITE_BACKEND` environment
+    /// variable, which in turn takes precedence over automatic detection. Forcing a backend that
+    /// is not available makes [`build`](Self::build) fail with [`Error::BackendUnavailable`].
+    #[must_use]
+    pub fn backend(mut self, choice: BackendChoice) -> Self {
+        self.backend_choice = Some(choice);
+        self
+    }
+
     /// Validate everything and build the [`Database`].
     ///
     /// # Errors
@@ -221,6 +233,8 @@ impl DatabaseBuilder {
     /// - [`Error::EmptyDatabase`] if no sequences were provided.
     /// - [`Error::SymbolOutOfRange`] if any sequence contains a symbol `>= alphabet_len`.
     /// - [`Error::ScoreRangeTooWide`] if scores could overflow `i32` for the declared lengths.
+    /// - [`Error::InvalidBackendName`] if `HYALITE_BACKEND` is set to an unrecognised value.
+    /// - [`Error::BackendUnavailable`] if a forced backend is not available.
     pub fn build(self) -> Result<Database> {
         let sequences = self
             .sequences
@@ -257,6 +271,13 @@ impl DatabaseBuilder {
         // Prove i32 suffices for any query up to max_query_len against these targets.
         let width = scoring.required_width(mode, max_query_len, max_target_len)?;
 
+        // Resolve the backend: an explicit builder choice wins, else HYALITE_BACKEND, else auto.
+        let choice = match self.backend_choice {
+            Some(choice) => choice,
+            None => backend::choice_from_env()?.unwrap_or(BackendChoice::Auto),
+        };
+        let backend = backend::resolve(choice)?;
+
         Ok(Database {
             sequences,
             scoring,
@@ -265,6 +286,7 @@ impl DatabaseBuilder {
             max_query_len,
             max_target_len,
             width,
+            backend,
         })
     }
 }
@@ -412,6 +434,49 @@ mod tests {
         assert_eq!(db.max_target_len(), 4);
         assert_eq!(db.backend(), Backend::Scalar);
         assert_eq!(db.score_width(), ScoreWidth::I8);
+    }
+
+    #[test]
+    fn forcing_scalar_backend_builds_and_reports_scalar() {
+        let db = Database::builder()
+            .sequences(&[vec![0u8]])
+            .scoring(dna_scoring())
+            .mode(Mode::Sw)
+            .max_query_len(8)
+            .backend(BackendChoice::Force(Backend::Scalar))
+            .build()
+            .unwrap();
+        assert_eq!(db.backend(), Backend::Scalar);
+    }
+
+    #[test]
+    fn forcing_an_unavailable_backend_fails_to_build() {
+        for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
+            let err = Database::builder()
+                .sequences(&[vec![0u8]])
+                .scoring(dna_scoring())
+                .mode(Mode::Sw)
+                .max_query_len(8)
+                .backend(BackendChoice::Force(b))
+                .build()
+                .unwrap_err();
+            assert_eq!(err, Error::BackendUnavailable { backend: b });
+        }
+    }
+
+    #[test]
+    fn explicit_backend_choice_takes_precedence_over_env() {
+        // An explicit builder choice is consulted before the environment, so this test is immune
+        // to whatever HYALITE_BACKEND happens to be set to in the runner.
+        let db = Database::builder()
+            .sequences(&[vec![0u8]])
+            .scoring(dna_scoring())
+            .mode(Mode::Sw)
+            .max_query_len(8)
+            .backend(BackendChoice::Auto)
+            .build()
+            .unwrap();
+        assert_eq!(db.backend(), Backend::Scalar);
     }
 
     #[test]

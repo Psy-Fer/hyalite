@@ -69,6 +69,19 @@ pub enum Error {
 
     /// A database was built with no sequences to search against.
     EmptyDatabase,
+
+    /// A backend was forced (via the builder or `HYALITE_BACKEND`) that is not available on this
+    /// build/CPU. In M0 only the scalar backend is available.
+    BackendUnavailable {
+        /// The backend that was requested but is unavailable.
+        backend: crate::backend::Backend,
+    },
+
+    /// A backend name (from the builder or `HYALITE_BACKEND`) could not be parsed.
+    InvalidBackendName {
+        /// The unrecognised name.
+        name: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -112,6 +125,14 @@ impl fmt::Display for Error {
             Error::EmptyDatabase => {
                 write!(f, "database must contain at least one sequence")
             }
+            Error::BackendUnavailable { backend } => {
+                write!(f, "backend {backend} is not available on this build/CPU")
+            }
+            Error::InvalidBackendName { name } => write!(
+                f,
+                "unrecognised backend name {name:?}; expected one of: \
+                 auto, scalar, sse4.1, avx2, neon"
+            ),
         }
     }
 }

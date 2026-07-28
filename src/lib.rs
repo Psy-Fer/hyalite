@@ -34,7 +34,7 @@ mod scoring;
 mod search;
 mod width;
 
-pub use backend::Backend;
+pub use backend::{BACKEND_ENV_VAR, Backend, BackendChoice};
 pub use database::{Database, DatabaseBuilder, Scratch};
 pub use error::{Error, Result};
 pub use hit::BestHit;
