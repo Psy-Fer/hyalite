@@ -25,12 +25,16 @@
 #![forbid(unsafe_code)] // lifted per-module when the SIMD backends land (M2+).
 
 mod error;
+mod hit;
+mod kernel;
 mod mode;
 mod scoring;
 mod search;
 mod width;
 
 pub use error::{Error, Result};
+pub use hit::BestHit;
+pub use kernel::align_pair;
 pub use mode::Mode;
 pub use scoring::Scoring;
 pub use search::SearchType;

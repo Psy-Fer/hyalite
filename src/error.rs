@@ -51,6 +51,15 @@ pub enum Error {
         /// The conservative bound on `|score|` computed by the width proof.
         bound: i64,
     },
+
+    /// A sequence contained an encoded symbol `>= alphabet_len`. Inputs must be pre-encoded
+    /// alphabet indices in `0..alphabet_len`.
+    SymbolOutOfRange {
+        /// The offending symbol value.
+        symbol: usize,
+        /// The alphabet length it must be below.
+        alphabet_len: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -79,6 +88,14 @@ impl fmt::Display for Error {
                 f,
                 "reachable score magnitude bound ({bound}) exceeds the i32 range; \
                  reduce sequence lengths or penalty magnitudes"
+            ),
+            Error::SymbolOutOfRange {
+                symbol,
+                alphabet_len,
+            } => write!(
+                f,
+                "encoded symbol {symbol} is out of range for alphabet_len {alphabet_len} \
+                 (must be in 0..{alphabet_len})"
             ),
         }
     }
