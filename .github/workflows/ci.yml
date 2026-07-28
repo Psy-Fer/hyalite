@@ -39,12 +39,12 @@ jobs:
         # Run the whole suite on both x86-64 and aarch64. NEON is mandatory on aarch64, so the
         # ARM runner is load-bearing once the SIMD backends land.
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        # The determinism contract requires every backend to be exercised against the scalar
-        # oracle. In M0/M1 only `scalar` exists, so this is a single entry. At M2, add the SIMD
-        # backends gated by architecture via `include`, e.g.:
-        #   - { os: ubuntu-latest,     backend: sse4.1 }
-        #   - { os: ubuntu-latest,     backend: avx2 }
-        #   - { os: ubuntu-24.04-arm,  backend: neon }
+        # Force scalar for the whole suite. We deliberately do NOT add a matrix entry per SIMD
+        # backend: forcing (say) HYALITE_BACKEND=avx2 globally would make every test that builds a
+        # non-i8-eligible database fail with the (correct) BackendUnavailable error. Cross-backend
+        # determinism is instead covered directly by the `scan_identical_across_simd_backends`
+        # proptest, which forces each *available* SIMD backend only on eligible databases. The
+        # aarch64 runner exercises NEON, and the x86-64 runner SSE4.1/AVX2, through that test.
         backend: [scalar]
     env:
       # Force the backend so a mismatch (e.g. the CPU lacks the forced ISA) fails loudly rather

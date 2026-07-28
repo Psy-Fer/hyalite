@@ -59,8 +59,7 @@ impl Backend {
             Backend::Scalar => true,
             Backend::Sse41 => sse41_detected(),
             Backend::Avx2 => avx2_detected(),
-            // NEON lands in M3.
-            Backend::Neon => false,
+            Backend::Neon => neon_available(),
         }
     }
 }
@@ -82,6 +81,17 @@ fn avx2_detected() -> bool {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn avx2_detected() -> bool {
+    false
+}
+
+// NEON is mandatory on aarch64 — always present, no runtime detection needed (handover §5).
+#[cfg(target_arch = "aarch64")]
+fn neon_available() -> bool {
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn neon_available() -> bool {
     false
 }
 
@@ -124,12 +134,15 @@ impl BackendChoice {
     }
 }
 
-/// The fastest available backend, in descending preference: AVX2, then SSE4.1, then scalar.
+/// The fastest available backend, in descending preference: AVX2, SSE4.1 (x86-64), NEON
+/// (aarch64), then scalar.
 fn detect_best() -> Backend {
     if Backend::Avx2.is_available() {
         Backend::Avx2
     } else if Backend::Sse41.is_available() {
         Backend::Sse41
+    } else if Backend::Neon.is_available() {
+        Backend::Neon
     } else {
         Backend::Scalar
     }
@@ -176,16 +189,18 @@ mod tests {
 
     #[test]
     fn availability_matches_arch_and_cpu() {
-        // Scalar is always available; NEON is not implemented yet; x86 SIMD tracks the CPU.
+        // Scalar is always available; x86 SIMD tracks the CPU; NEON is baseline on aarch64.
         assert!(Backend::Scalar.is_available());
-        assert!(!Backend::Neon.is_available(), "NEON lands in M3");
         assert_eq!(Backend::Sse41.is_available(), sse41_detected());
         assert_eq!(Backend::Avx2.is_available(), avx2_detected());
+        assert_eq!(Backend::Neon.is_available(), neon_available());
         #[cfg(not(target_arch = "x86_64"))]
         {
             assert!(!Backend::Sse41.is_available());
             assert!(!Backend::Avx2.is_available());
         }
+        #[cfg(not(target_arch = "aarch64"))]
+        assert!(!Backend::Neon.is_available());
     }
 
     #[test]

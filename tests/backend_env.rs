@@ -61,13 +61,18 @@ fn hyalite_backend_env_var_is_honored_with_correct_precedence() {
         "auto should resolve to an available backend"
     );
 
-    // Forcing an unavailable backend via env is a build error. NEON is unavailable on every
-    // target until M3, so it is a stable "forced-but-unavailable" case regardless of CPU.
-    set("neon");
+    // Forcing an unavailable backend via env is a build error. Pick one that is unavailable on
+    // this target: SSE4.1 does not exist on aarch64; NEON does not exist off aarch64.
+    #[cfg(target_arch = "aarch64")]
+    let (bad_name, bad_backend) = ("sse4.1", Backend::Sse41);
+    #[cfg(not(target_arch = "aarch64"))]
+    let (bad_name, bad_backend) = ("neon", Backend::Neon);
+
+    set(bad_name);
     assert_eq!(
         build_using_env().unwrap_err(),
         Error::BackendUnavailable {
-            backend: Backend::Neon
+            backend: bad_backend
         }
     );
 
@@ -79,7 +84,7 @@ fn hyalite_backend_env_var_is_honored_with_correct_precedence() {
     ));
 
     // An explicit builder choice must take precedence over the env var, even an unavailable one.
-    set("neon");
+    set(bad_name);
     assert_eq!(
         build_forcing(BackendChoice::Force(Backend::Scalar))
             .unwrap()

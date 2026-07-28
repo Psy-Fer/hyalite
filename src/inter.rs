@@ -16,10 +16,13 @@
 //! impl [`ScalarLanes`]; the SIMD impls (SSE4.1, AVX2) are added in later milestones and must pass
 //! the same differential tests.
 
-// The generic kernel is used in production via the SSE4.1 backend on x86-64. Two things are still
-// unused in some builds: `ScalarLanes` (a test-only reference lane), and — on non-x86-64 targets —
-// the whole kernel, until the NEON backend lands (M3). Silence both here rather than scatter cfgs.
-#![allow(dead_code)]
+// The generic kernel is live in production via SSE4.1/AVX2 (x86-64) and NEON (aarch64). On an
+// exotic target with no SIMD backend it would be unused; CI only builds x86-64 and aarch64, so we
+// only silence dead code there. `ScalarLanes` is a test-only reference lane (gated `cfg(test)`).
+#![cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 
 use crate::hit::BestHit;
 use crate::kernel::{self, Flags, gap_penalty};
@@ -61,11 +64,14 @@ pub(crate) trait Lanes {
     fn shuffle_lookup(table: &[i8], indices: &[u8]) -> Self::V;
 }
 
-/// The safe scalar reference lane backend, `N` lanes wide, backed by `[i8; N]`. Exercised at
-/// several widths in tests to confirm lane-count independence before any SIMD exists.
+/// The safe scalar reference lane backend, `N` lanes wide, backed by `[i8; N]`. Test-only: it is
+/// the differential oracle for the SIMD lanes and exercises lane-count independence at several
+/// widths. Production always uses a real SIMD backend or the pairwise scalar kernel.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct ScalarLanes<const N: usize>;
 
+#[cfg(test)]
 impl<const N: usize> Lanes for ScalarLanes<N> {
     const LANES: usize = N;
     type V = [i8; N];
@@ -355,6 +361,8 @@ pub(crate) fn scan_dispatch(
         crate::Backend::Avx2 => avx2::run(sequences, scoring, mode, search_type, query),
         #[cfg(target_arch = "x86_64")]
         crate::Backend::Sse41 => sse41::run(sequences, scoring, mode, search_type, query),
+        #[cfg(target_arch = "aarch64")]
+        crate::Backend::Neon => neon::run(sequences, scoring, mode, search_type, query),
         other => unreachable!("no inter-sequence kernel for backend {other}"),
     }
 }
@@ -544,6 +552,85 @@ pub(crate) mod avx2 {
     ) -> BestHit {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
         unsafe { scan_ff(sequences, scoring, mode, search_type, query) }
+    }
+}
+
+/// NEON lane backend: 16 `i8` lanes per `int8x16_t`. NEON is baseline on aarch64, so there is no
+/// runtime detection and no `#[target_feature]` shim — the intrinsics are always available.
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod neon {
+    #![allow(unsafe_code)]
+
+    use super::{Lanes, scan_batched};
+    use crate::hit::BestHit;
+    use crate::mode::Mode;
+    use crate::scoring::Scoring;
+    use crate::search::SearchType;
+    use core::arch::aarch64::*;
+
+    /// 16-lane NEON backend.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Neon;
+
+    impl Lanes for Neon {
+        const LANES: usize = 16;
+        type V = int8x16_t;
+
+        #[inline(always)]
+        fn splat(v: i8) -> int8x16_t {
+            unsafe { vdupq_n_s8(v) }
+        }
+        #[inline(always)]
+        fn add_sat(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+            unsafe { vqaddq_s8(a, b) }
+        }
+        #[inline(always)]
+        fn sub_sat(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+            unsafe { vqsubq_s8(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+            unsafe { vmaxq_s8(a, b) }
+        }
+        #[inline(always)]
+        fn select(mask: int8x16_t, a: int8x16_t, b: int8x16_t) -> int8x16_t {
+            // `vbslq_s8(m, a, b)`: per bit, `m` set selects `a` else `b`. Our masks are 0x00/0xFF.
+            unsafe { vbslq_s8(vreinterpretq_u8_s8(mask), a, b) }
+        }
+        #[inline(always)]
+        fn load(src: &[i8]) -> int8x16_t {
+            debug_assert!(src.len() >= 16);
+            unsafe { vld1q_s8(src.as_ptr()) }
+        }
+        #[inline(always)]
+        fn store(v: int8x16_t, dst: &mut [i8]) {
+            debug_assert!(dst.len() >= 16);
+            unsafe { vst1q_s8(dst.as_mut_ptr(), v) }
+        }
+        #[inline(always)]
+        fn shuffle_lookup(table: &[i8], indices: &[u8]) -> int8x16_t {
+            debug_assert!(table.len() <= 16 && indices.len() >= 16);
+            unsafe {
+                // Table lookup: `vqtbl1q_s8` returns `table[idx[k]]`, or 0 where `idx[k] >= 16`.
+                // Residues are `< alphabet_len <= 16`, so every lane is a plain lookup.
+                let mut padded = [0i8; 16];
+                padded[..table.len()].copy_from_slice(table);
+                let t = vld1q_s8(padded.as_ptr());
+                let idx = vld1q_u8(indices.as_ptr());
+                vqtbl1q_s8(t, idx)
+            }
+        }
+    }
+
+    /// Safe entry point. NEON is always available on aarch64, so no feature guard is needed.
+    pub(crate) fn run(
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+    ) -> BestHit {
+        scan_batched::<Neon>(sequences, scoring, mode, search_type, query)
     }
 }
 
