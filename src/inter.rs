@@ -141,7 +141,7 @@ pub enum Layout {
     Gathered,
     /// Small-fixed-database layout: a precomputed query-letter × database-column score table, so
     /// each cell's substitution vector is a direct load with no gather. Chosen automatically when
-    /// the table is small enough to stay cache-resident (see [`Database::builder`]).
+    /// the table is small enough to stay cache-resident (see [`Database::builder`](crate::Database::builder)).
     Precomputed,
 }
 

@@ -39,8 +39,8 @@ impl Scoring {
     ///
     /// `matrix[q * alphabet_len + t]` is the score for aligning query symbol `q` with target
     /// symbol `t` (both are pre-encoded alphabet indices in `0..alphabet_len`). `gap_open` and
-    /// `gap_ext` are non-negative penalty magnitudes; see the [module docs](self) for the gap
-    /// length convention.
+    /// `gap_ext` are non-negative penalty magnitudes; a gap of length `n` costs
+    /// `gap_open + (n - 1) * gap_ext` (Opal's convention).
     ///
     /// # Errors
     ///
@@ -127,7 +127,7 @@ impl Scoring {
     }
 
     /// Prove the narrowest [`ScoreWidth`] whose range cannot overflow for `mode` over sequences
-    /// bounded by `max_query_len` and `max_target_len`. See [`crate::width`].
+    /// bounded by `max_query_len` and `max_target_len`. See [`ScoreWidth`].
     ///
     /// # Errors
     ///

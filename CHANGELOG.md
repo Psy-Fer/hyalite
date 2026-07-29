@@ -6,7 +6,10 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ## [Unreleased]
 
-The v0.1 foundation. Not yet published to crates.io.
+## [0.1.0] - 2026-07-29
+
+The v0.1 foundation: exact SIMD-accelerated pairwise and database sequence alignment with a
+bit-identical-across-backends guarantee.
 
 ### Added
 
