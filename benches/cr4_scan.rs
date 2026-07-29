@@ -6,11 +6,9 @@
 //! kernel does not apply to — are skipped, so the reported set depends on the machine. All
 //! configurations compute identical results (see `DETERMINISM.md`); this only measures speed.
 //!
-//! Mode note: the benchmark uses local (`SW`) alignment because it is i8-width at these read
-//! lengths, so the SIMD kernel applies. CR4's actual overlap (`OV`) mode currently proves to
-//! *i16* at 91 nt reads under the conservative width bound and so falls back to scalar — a known
-//! limitation tracked in `TODO.md`. The kernel's per-cell cost is mode-independent, so `SW`
-//! throughput here is a faithful proxy for what `OV` will achieve once the bound is tightened.
+//! Uses overlap (`OV`) mode, exactly as STAR's CellRanger4 clipper does. The mode-aware width
+//! bound proves this workload to i8 (overlap's free end gaps cap the negative reach), so the SIMD
+//! kernel applies.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use hyalite::{
@@ -121,7 +119,7 @@ fn bench(c: &mut Criterion) {
         let Ok(db) = Database::builder()
             .sequences(&db_seqs)
             .scoring(scoring.clone())
-            .mode(Mode::Sw)
+            .mode(Mode::Ov)
             .search_type(SearchType::ScoreEnd)
             .max_query_len(max_query_len)
             .backend(BackendChoice::Force(*backend))

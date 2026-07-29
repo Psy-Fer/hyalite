@@ -65,14 +65,26 @@ load-bearing point for cross-backend determinism: the proof must bound **every i
 saturated at a narrow width while the scalar oracle kept the true value would diverge.
 
 It does bound them, and here is why: each cell `H[i][j]`, `E[i][j]`, `F[i][j]` is itself the score
-of an optimal *partial* alignment of `query[..i]` against `target[..j]` (ending, for `E`/`F`, in a
-gap). Any such alignment is a path of at most `m + n` steps, so it is subject to the exact same
+of an optimal *partial* alignment (ending, for `E`/`F`, in a gap), so it is subject to the same
 `magnitude_bound` used for the final score:
 
-- **Positive reach:** at most `min(m, n)` aligned pairs, each `≤ max(0, max_entry)`; gaps only
-  subtract. So every cell `≤ min(m, n) · max(0, max_entry)`.
-- **Negative reach** (non-local modes; `SW` clamps at 0): a path of `≤ m + n` steps, bounded
-  (over-generously) by `(m + n) · max(0, −min_entry) + gap_open + (m + n − 1) · gap_ext`.
+- **Positive reach** (all modes): at most `min(m, n)` aligned pairs, each `≤ max(0, max_entry)`;
+  gaps only subtract. So every cell `≤ min(m, n) · max(0, max_entry)`.
+- **Negative reach is mode-specific.** A *free* end gap lets any path restart at a `0` border,
+  which caps how negative a cell can get — so the bound must not assume a full-span charged gap for
+  modes that don't have one:
+  - `SW` (local, cells clamped at 0): mismatches vanish; a gap opening from a `≥ 0` cell reaches
+    `-gap_open`. → `gap_open`.
+  - `OV` (both ends free): every cell is reachable by a pure diagonal from a `0` border in `≤
+    min(m, n)` steps, so `|H| ≤ min(m, n) · |min_entry|`; `E`/`F` add one `gap_open`.
+    → `min(m, n) · max(0, −min_entry) + gap_open`.
+  - `NW` / `HW` (a penalised border): a path can accumulate a full mismatch run *and* a full-span
+    gap → `(m + n) · max(0, −min_entry) + gap_open + (m + n − 1) · gap_ext` (over-counts; safe).
+
+Getting these bounds *tight* matters: too loose and a workload over-provisions to a wider integer
+and loses SIMD (e.g. the CR4 overlap scan would fall back to scalar under a global-style bound);
+too tight and a real cell saturates and diverges. The `intermediate_cells_fit_the_proven_width`
+test enforces the second direction — **any future change to a bound must keep it green.**
 
 Therefore no *real* cell reaches `W::MIN`; only sentinels sit at or below it. This is verified by
 two tests: `width_proof_contains_actual_score` (the final score fits `W`) and

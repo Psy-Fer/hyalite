@@ -69,23 +69,28 @@ impl core::fmt::Display for ScoreWidth {
     }
 }
 
-/// A conservative bound on the reachable score magnitude `|score|` for the given inputs.
+/// A safe bound on the reachable score magnitude `|score|` for the given inputs.
 ///
-/// This bounds not only the final score but **every** intermediate `H`/`E`/`F` cell: each cell is
-/// itself the score of an optimal partial alignment (a path of at most `m + n` steps), so it is
-/// subject to the same two contributions below. That is what lets a saturating narrow-width
-/// backend stay bit-identical to the wide scalar oracle — no *real* cell ever saturates. The
-/// `intermediate_cells_fit_the_proven_width` test checks this directly; see `DETERMINISM.md` §2.
+/// This bounds not only the final score but **every** intermediate `H`/`E`/`F` cell — that is what
+/// lets a saturating narrow-width backend stay bit-identical to the wide scalar oracle (no *real*
+/// cell ever saturates). The `intermediate_cells_fit_the_proven_width` test checks this directly;
+/// see `DETERMINISM.md` §2. Computed in `i128` so intermediate products cannot wrap.
 ///
-/// Computed in `i128` so intermediate products cannot wrap. Two contributions:
+/// **Positive reach** (all modes): an optimal path has at most `min(m, n)` aligned pairs, each
+/// worth at most `max(0, max_entry)`; gaps only subtract. So `score <= min(m, n) * max(0, max_entry)`.
 ///
-/// - **Positive reach:** an optimal path has at most `min(m, n)` aligned pairs, each worth at
-///   most `max(0, max_entry)`; gaps only subtract. So `score <= min(m, n) * max(0, max_entry)`.
-/// - **Negative reach** (non-local modes only; `SW` clamps at zero): a path to any cell has at
-///   most `m + n` steps. Bounding *both* a full run of worst-case mismatches
-///   `(m + n) * max(0, -min_entry)` *and* a single gap spanning the whole path
-///   `gap_open + (m + n - 1) * gap_ext` over-counts (a path cannot be all substitutions and all
-///   gaps at once), so their sum is a safe over-estimate.
+/// **Negative reach** is mode-specific, because a *free* end gap lets a path restart at a `0`
+/// border and so caps how negative a cell can get:
+///
+/// - **`SW`** (local, cells clamped at `0`): mismatch negatives vanish, but a gap opening from a
+///   `>= 0` cell drives `E`/`F` down to `-gap_open`. → `gap_open`.
+/// - **`OV`** (both ends free): every cell is reachable by a pure diagonal from a `0` border in at
+///   most `min(m, n)` steps, so `|H| <= min(m, n) * |min_entry|`; `E`/`F` add one gap opening.
+///   → `min(m, n) * max(0, -min_entry) + gap_open`.
+/// - **`NW` / `HW`** (a penalised border — the whole query/target overhang can be a charged gap):
+///   bound a full worst-case mismatch run `(m + n) * max(0, -min_entry)` *and* a full-span gap
+///   `gap_open + (m + n - 1) * gap_ext`. This over-counts (a path cannot be all substitutions and
+///   all gaps at once), so it is a safe over-estimate.
 fn magnitude_bound(
     mode: Mode,
     min_entry: i32,
@@ -97,15 +102,20 @@ fn magnitude_bound(
 ) -> i128 {
     let m = max_query_len as i128;
     let n = max_target_len as i128;
+    let min_ij = m.min(n);
+    let max_pos = (max_entry as i128).max(0); // max(0, max_entry)
+    let max_neg = (-(min_entry as i128)).max(0); // max(0, -min_entry) = |min_entry| when negative
+    let go = gap_open as i128;
+    let ge = gap_ext as i128;
 
-    let positive = m.min(n) * (max_entry as i128).max(0);
+    let positive = min_ij * max_pos;
 
-    let negative = if mode.is_local() {
-        0
-    } else {
-        let mismatch = (m + n) * (-(min_entry as i128)).max(0);
-        let gap_run = gap_open as i128 + (m + n - 1).max(0) * gap_ext as i128;
-        mismatch + gap_run
+    // Exhaustive match (allowed within the defining crate despite `#[non_exhaustive]`): a new mode
+    // must consciously choose its negative-reach bound rather than silently inherit one.
+    let negative = match mode {
+        Mode::Sw => go,
+        Mode::Ov => min_ij * max_neg + go,
+        Mode::Nw | Mode::Hw => (m + n) * max_neg + go + (m + n - 1).max(0) * ge,
     };
 
     positive.max(negative)
@@ -190,25 +200,46 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_ignores_negative_reach() {
-        // Enormous gap/mismatch penalties but tiny positive reach: SW must still pick i8,
-        // because local cells clamp at zero. The non-local modes must escalate on the same
-        // inputs. This is the SW-clamps-at-zero invariant, tested from both sides.
-        let m = 8;
-        let n = 8;
-        let (min_e, max_e, go, ge) = (-100, 1, 10_000, 5_000);
+    fn local_mode_ignores_mismatch_negatives_but_not_gap_open() {
+        // SW clamps cells at 0, so an enormous *mismatch* penalty is irrelevant: with a tiny gap
+        // it stays i8 (positive reach min(m,n)*max_e = 8). The non-local modes escalate on the
+        // same mismatch. But SW's E/F reach -gap_open, so a huge *gap_open* does force SW wider.
+        let (m, n) = (8, 8);
         assert_eq!(
-            required_width(Mode::Sw, min_e, max_e, go, ge, m, n).unwrap(),
+            required_width(Mode::Sw, -100, 1, 2, 1, m, n).unwrap(),
             ScoreWidth::I8,
-            "SW positive reach is only min(m,n)*max_e = 8"
+            "SW ignores the -100 mismatch; positive reach is only 8, gap_open 2"
         );
         for mode in [Mode::Nw, Mode::Hw, Mode::Ov] {
-            let w = required_width(mode, min_e, max_e, go, ge, m, n).unwrap();
             assert!(
-                w > ScoreWidth::I8,
-                "{mode} must escalate past i8 given large penalties, got {w}"
+                required_width(mode, -100, 1, 2, 1, m, n).unwrap() > ScoreWidth::I8,
+                "{mode} must escalate on the -100 mismatch"
             );
         }
+        // A gap_open beyond the i8 range drives SW's E/F below -127, so it must widen.
+        assert_eq!(
+            required_width(Mode::Sw, -1, 1, 200, 1, m, n).unwrap(),
+            ScoreWidth::I16,
+            "SW must widen for gap_open 200 (E/F reach -200)"
+        );
+    }
+
+    #[test]
+    fn overlap_bound_is_tight_enough_for_cr4_but_global_is_not() {
+        // The CR4 workload: overlap mode, 91 nt reads vs ~33 nt adapters, mismatch -2, gap 2.
+        // Overlap's free ends cap the negative reach at min(91,33)*2 + 2 = 68, so it stays i8 and
+        // the SIMD kernel applies. The same inputs in global (NW) accumulate a full-span gap and
+        // so need i16 — correctly, since NW scores of dissimilar long sequences are very negative.
+        assert_eq!(
+            required_width(Mode::Ov, -2, 1, 2, 2, 91, 33).unwrap(),
+            ScoreWidth::I8,
+            "CR4 overlap must stay i8"
+        );
+        assert_eq!(
+            required_width(Mode::Nw, -2, 1, 2, 2, 91, 33).unwrap(),
+            ScoreWidth::I16,
+            "the same lengths in global mode need i16"
+        );
     }
 
     #[test]

@@ -417,6 +417,27 @@ mod tests {
     }
 
     #[test]
+    fn overlap_intermediate_cells_fit_i8_at_cr4_scale() {
+        // With the tightened overlap width bound, a 40 nt vs 30 nt CR4-scored overlap proves to i8.
+        // Verify against the real DP that every H/E/F cell actually fits i8 — otherwise a
+        // saturating SIMD backend would diverge from the scalar oracle.
+        let scoring = Scoring::new(2, vec![1, -2, -2, 1], 2, 2).unwrap();
+        let q = [0u8, 1].repeat(20); // 40
+        let t = [1u8, 0].repeat(15); // 30, phase-shifted for many mismatches
+        let width = scoring.required_width(Mode::Ov, q.len(), t.len()).unwrap();
+        assert_eq!(
+            width,
+            crate::ScoreWidth::I8,
+            "CR4-scale overlap should prove to i8"
+        );
+        let mag = max_real_cell_magnitude(&q, &t, &scoring, Mode::Ov);
+        assert!(
+            mag <= width.max_abs(),
+            "overlap cell magnitude {mag} exceeds i8 range"
+        );
+    }
+
+    #[test]
     fn intermediate_cell_bound_holds_for_gap_dominated_global_alignment() {
         // A concrete case where E/F (not the diagonal) carry the extreme values: a global
         // alignment of two dissimilar sequences with a heavy mismatch and gap regime. The most
