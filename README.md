@@ -1,5 +1,11 @@
 # hyalite
 
+[![Crates.io](https://img.shields.io/crates/v/hyalite.svg)](https://crates.io/crates/hyalite)
+[![Docs.rs](https://img.shields.io/docsrs/hyalite)](https://docs.rs/hyalite)
+[![CI](https://github.com/Psy-Fer/hyalite/actions/workflows/ci.yml/badge.svg)](https://github.com/Psy-Fer/hyalite/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://releases.rs/docs/1.85.0/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Exact, SIMD-accelerated pairwise and database sequence alignment in pure Rust.** Smith-Waterman
 (local), Needleman-Wunsch (global), semi-global, and overlap modes with affine gaps, runtime CPU
 dispatch, and a **bit-identical-across-backends** guarantee.

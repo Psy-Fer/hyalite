@@ -2,6 +2,7 @@
 name = "hyalite"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Exact, SIMD-accelerated sequence alignment (Smith-Waterman, Needleman-Wunsch, semi-global, overlap) with runtime CPU dispatch"
 license = "MIT"
 repository = "https://github.com/Psy-Fer/hyalite"
