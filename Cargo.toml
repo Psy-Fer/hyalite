@@ -2,14 +2,14 @@
 name = "hyalite"
 version = "0.1.0"
 edition = "2024"
-description = "Massive optimal sequence alignment (local/SW, infix, overlap, global) with SIMD (opal)"
+description = "Exact, SIMD-accelerated sequence alignment (Smith-Waterman, Needleman-Wunsch, semi-global, overlap) with runtime CPU dispatch"
 license = "MIT"
 repository = "https://github.com/Psy-Fer/hyalite"
 homepage = "https://github.com/Psy-Fer/hyalite"
 documentation = "https://docs.rs/hyalite"
 readme = "README.md"
 authors = ["James Ferguson <j.ferguson@garvan.org.au>"]
-keywords = ["bioinformatics", "alignment", "genomics"]
+keywords = ["bioinformatics", "alignment", "genomics", "simd", "smith-waterman"]
 categories = ["science", "algorithms"]
 
 [dependencies]
