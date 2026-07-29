@@ -65,6 +65,36 @@ pub(crate) trait Lanes {
     fn shuffle_lookup(table: &[i8], indices: &[u8]) -> Self::V;
 }
 
+/// Answer-position tracking for `ScoreEnd`, split from [`Lanes`] so a backend can add it separately
+/// (the score-only path needs only [`Lanes`]). Positions live in a parallel `i16` domain because
+/// answer-cell coordinates can exceed the `i8` score range.
+pub(crate) trait LanesEnds: Lanes {
+    /// A vector of `LANES` `i16` values (answer-cell coordinates).
+    type PosV: Copy;
+
+    /// Broadcast one `i16` to every position lane.
+    fn pos_splat(v: i16) -> Self::PosV;
+    /// Store `LANES` `i16` values to the start of `dst`.
+    fn pos_store(v: Self::PosV, dst: &mut [i16]);
+
+    /// Lexicographic answer update, per lane, for lanes where `active` (an `0x00`/`0xFF` mask) is
+    /// set: replace `(best_score, best_col, best_row)` with `(cell, col, row)` when
+    /// `cell > best_score`, or when `cell == best_score` and `(col, row)` is lexicographically less
+    /// than `(best_col, best_row)`. `col`/`row` are broadcast scalars. Returns the updated triple.
+    ///
+    /// This is exactly the scalar tie-break (smallest target end, then query end) reproduced across
+    /// lanes, so the reported end is independent of lane order.
+    fn update_answer(
+        active: Self::V,
+        best_score: Self::V,
+        best_col: Self::PosV,
+        best_row: Self::PosV,
+        cell: Self::V,
+        col: i16,
+        row: i16,
+    ) -> (Self::V, Self::PosV, Self::PosV);
+}
+
 /// The safe scalar reference lane backend, `N` lanes wide, backed by `[i8; N]`. Test-only: it is
 /// the differential oracle for the SIMD lanes and exercises lane-count independence at several
 /// widths. Production always uses a real SIMD backend or the pairwise scalar kernel.
@@ -122,6 +152,44 @@ impl<const N: usize> Lanes for ScalarLanes<N> {
             o[k] = table[indices[k] as usize];
         }
         o
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> LanesEnds for ScalarLanes<N> {
+    type PosV = [i16; N];
+
+    fn pos_splat(v: i16) -> [i16; N] {
+        [v; N]
+    }
+    fn pos_store(v: [i16; N], dst: &mut [i16]) {
+        dst[..N].copy_from_slice(&v);
+    }
+    fn update_answer(
+        active: [i8; N],
+        best_score: [i8; N],
+        best_col: [i16; N],
+        best_row: [i16; N],
+        cell: [i8; N],
+        col: i16,
+        row: i16,
+    ) -> ([i8; N], [i16; N], [i16; N]) {
+        let mut s = best_score;
+        let mut c = best_col;
+        let mut r = best_row;
+        for k in 0..N {
+            if active[k] == 0 {
+                continue;
+            }
+            let cv = cell[k];
+            let better = cv > s[k] || (cv == s[k] && (col < c[k] || (col == c[k] && row < r[k])));
+            if better {
+                s[k] = cv;
+                c[k] = col;
+                r[k] = row;
+            }
+        }
+        (s, c, r)
     }
 }
 
@@ -339,6 +407,10 @@ pub(crate) struct SimdScratch {
     lane_scores: Vec<i8>,
     /// Per-database-sequence scores (used by the per-target `scan_all`): `sequence_count` bytes.
     scores: Vec<i8>,
+    /// Per-database-sequence answer columns (`target_end + 1`), filled by `fill_ends`.
+    cols: Vec<i16>,
+    /// Per-database-sequence answer rows (`query_end + 1`), filled by `fill_ends`.
+    rows: Vec<i16>,
 }
 
 impl SimdScratch {
@@ -349,6 +421,8 @@ impl SimdScratch {
             f: vec![0i8; row],
             lane_scores: vec![0i8; lanes],
             scores: vec![0i8; sequence_count],
+            cols: vec![0i16; sequence_count],
+            rows: vec![0i16; sequence_count],
         }
     }
 
@@ -359,6 +433,8 @@ impl SimdScratch {
             f: Vec::new(),
             lane_scores: Vec::new(),
             scores: Vec::new(),
+            cols: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
@@ -508,6 +584,172 @@ fn scan_batch<L: Lanes>(
     out.copy_from_slice(&ans_arr[..batch.real]);
 }
 
+/// Like [`scan_batch`], but also tracks each lane's answer-cell coordinates for `ScoreEnd`.
+/// Writes per-lane `(score, col, row)` where `col = target_end + 1` and `row = query_end + 1` (both
+/// grid coordinates; `0` means "no aligned position"). The tie-break — smallest target end, then
+/// query end — is applied in-vector by [`Lanes::update_answer`], matching the scalar oracle.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn scan_batch_ends<L: LanesEnds>(
+    query: &[u8],
+    letter_profile: &[i8],
+    al: usize,
+    batch: &PackedBatch,
+    go: i8,
+    ge: i8,
+    flags: &Flags,
+    h: &mut [i8],
+    f: &mut [i8],
+    out_score: &mut [i8],
+    out_col: &mut [i16],
+    out_row: &mut [i16],
+) {
+    let lanes = L::LANES;
+    let qlen = query.len();
+    let w = batch.w;
+    let cols = (w + 1) * lanes;
+
+    let go_v = L::splat(go);
+    let ge_v = L::splat(ge);
+    let zero = L::splat(0);
+    let neg = L::splat(NEG8);
+    let all = L::splat(-1); // every lane active
+
+    let half = h.len() / 2;
+    let (row_a, row_b) = h.split_at_mut(half);
+    let mut prev: &mut [i8] = &mut row_a[..cols];
+    let mut cur: &mut [i8] = &mut row_b[..cols];
+
+    for j in 0..=w {
+        let border = if flags.top_row_free {
+            zero
+        } else {
+            L::splat(-gap_penalty(go as i32, ge as i32, j) as i8)
+        };
+        L::store(border, &mut prev[j * lanes..]);
+        L::store(neg, &mut f[j * lanes..]);
+    }
+
+    // Answer accumulator (score, col, row), seeded to −∞ at the origin.
+    let mut a_s = neg;
+    let mut a_c = L::pos_splat(0);
+    let mut a_r = L::pos_splat(0);
+    // Local mode's empty alignment: a `0` at grid (0, 0) — the lexicographically smallest cell.
+    if flags.local {
+        (a_s, a_c, a_r) = L::update_answer(all, a_s, a_c, a_r, zero, 0, 0);
+    }
+    // OV also considers the last column at row 0 (grid row 0 = smallest query end): `H[0][len_k]`,
+    // read from the seeded top row before the sweep overwrites it.
+    if flags.answer_last_col {
+        for j in 0..=w {
+            (a_s, a_c, a_r) = L::update_answer(
+                L::load(&batch.mask_eq[j * lanes..]),
+                a_s,
+                a_c,
+                a_r,
+                L::load(&prev[j * lanes..]),
+                j as i16,
+                0,
+            );
+        }
+    }
+
+    for i in 1..=qlen {
+        let border = if flags.left_col_free {
+            zero
+        } else {
+            L::splat(-gap_penalty(go as i32, ge as i32, i) as i8)
+        };
+        L::store(border, &mut cur[0..lanes]);
+        let qi = query[i - 1] as usize;
+        let mut e = neg;
+        for j in 1..=w {
+            let col = j * lanes;
+            let prevcol = (j - 1) * lanes;
+            e = L::max(
+                L::sub_sat(L::load(&cur[prevcol..]), go_v),
+                L::sub_sat(e, ge_v),
+            );
+            let f_j = L::max(
+                L::sub_sat(L::load(&prev[col..]), go_v),
+                L::sub_sat(L::load(&f[col..]), ge_v),
+            );
+            L::store(f_j, &mut f[col..]);
+            let sub = match &batch.sub {
+                SubScores::Gathered { residues } => L::shuffle_lookup(
+                    &letter_profile[qi * al..qi * al + al],
+                    &residues[prevcol..col],
+                ),
+                SubScores::Precomputed { table } => L::load(&table[(qi * w + (j - 1)) * lanes..]),
+            };
+            let diag = L::add_sat(L::load(&prev[prevcol..]), sub);
+            let mut cell = L::max(diag, L::max(e, f_j));
+            if flags.local {
+                cell = L::max(cell, zero);
+                // SW: every cell (within each lane's real columns) is a candidate.
+                (a_s, a_c, a_r) = L::update_answer(
+                    L::load(&batch.mask_le[col..]),
+                    a_s,
+                    a_c,
+                    a_r,
+                    cell,
+                    j as i16,
+                    i as i16,
+                );
+            }
+            if flags.answer_last_col {
+                // OV last column: the cell at each lane's own final column `len_k`.
+                (a_s, a_c, a_r) = L::update_answer(
+                    L::load(&batch.mask_eq[col..]),
+                    a_s,
+                    a_c,
+                    a_r,
+                    cell,
+                    j as i16,
+                    i as i16,
+                );
+            }
+            L::store(cell, &mut cur[col..]);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+
+    // Post-sweep border cells at the final query row `qlen` (`prev` holds it; row 0 if empty).
+    // HW/OV consider the whole last row (`j <= len_k`); NW considers only the corner (`j == len_k`).
+    if !flags.local {
+        let last_mask = |j: usize| -> &[i8] {
+            let col = j * lanes;
+            if flags.answer_last_row {
+                &batch.mask_le[col..]
+            } else {
+                &batch.mask_eq[col..]
+            }
+        };
+        for j in 0..=w {
+            let cell = L::load(&prev[j * lanes..]);
+            (a_s, a_c, a_r) = L::update_answer(
+                L::load(last_mask(j)),
+                a_s,
+                a_c,
+                a_r,
+                cell,
+                j as i16,
+                qlen as i16,
+            );
+        }
+    }
+
+    let mut score_arr = [0i8; 32];
+    let mut col_arr = [0i16; 32];
+    let mut row_arr = [0i16; 32];
+    L::store(a_s, &mut score_arr);
+    L::pos_store(a_c, &mut col_arr);
+    L::pos_store(a_r, &mut row_arr);
+    out_score.copy_from_slice(&score_arr[..batch.real]);
+    out_col.copy_from_slice(&col_arr[..batch.real]);
+    out_row.copy_from_slice(&row_arr[..batch.real]);
+}
+
 /// Scan `query` against every sequence using the inter-sequence kernel with lane backend `L`.
 ///
 /// Requires an `I8`-width, `alphabet_len <= 16` database (see [`kernel_applies`]); the caller
@@ -655,6 +897,39 @@ pub(crate) fn fill_scores(
         #[cfg(target_arch = "aarch64")]
         crate::Backend::Neon => neon::run_scores(packed, query, go, ge, &flags, sc),
         other => unreachable!("no inter-sequence kernel for backend {other}"),
+    }
+}
+
+/// Fill `sc.scores`/`sc.cols`/`sc.rows` with each database sequence's score and answer-cell
+/// coordinates (per-target `ScoreEnd`). The end tie-break is applied in-vector. Stage 1 exercises
+/// this only through the `ScalarLanes` reference; the SIMD dispatch is wired in a later stage.
+#[inline(always)]
+#[allow(dead_code)] // wired into the SIMD dispatch (and Database) in stage 2/3
+fn fill_ends_lanes<L: LanesEnds>(
+    packed: &PackedDb,
+    query: &[u8],
+    go: i8,
+    ge: i8,
+    flags: &Flags,
+    sc: &mut SimdScratch,
+) {
+    for (b, batch) in packed.batches.iter().enumerate() {
+        let start = b * packed.lanes;
+        let end = start + batch.real;
+        scan_batch_ends::<L>(
+            query,
+            &packed.letter_profile,
+            packed.alphabet_len,
+            batch,
+            go,
+            ge,
+            flags,
+            &mut sc.h,
+            &mut sc.f,
+            &mut sc.scores[start..end],
+            &mut sc.cols[start..end],
+            &mut sc.rows[start..end],
+        );
     }
 }
 
@@ -1158,6 +1433,75 @@ mod tests {
                         prop_assert_eq!(s1[i], want, "1 lane {} {} seq {}", mode, layout, i);
                         prop_assert_eq!(s4[i], want, "4 lanes {} {} seq {}", mode, layout, i);
                         prop_assert_eq!(s8[i], want, "8 lanes {} {} seq {}", mode, layout, i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-target `(score, query_end, target_end)` via the in-vector `ScoreEnd` kernel with the
+    /// `N`-lane reference backend.
+    fn per_target_ends<const N: usize>(
+        seqs: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        query: &[u8],
+        layout: Layout,
+    ) -> Vec<BestHit> {
+        let max_t = seqs.iter().map(Vec::len).max().unwrap_or(0);
+        let packed = PackedDb::build(seqs, N, layout, scoring);
+        let mut sc = SimdScratch::new(seqs.len(), max_t, N);
+        fill_ends_lanes::<ScalarLanes<N>>(
+            &packed,
+            query,
+            scoring.gap_open() as i8,
+            scoring.gap_ext() as i8,
+            &Flags::for_mode(mode),
+            &mut sc,
+        );
+        (0..seqs.len())
+            .map(|i| BestHit {
+                score: sc.scores[i] as i32,
+                db_index: i,
+                query_end: (sc.rows[i] as usize).checked_sub(1),
+                target_end: (sc.cols[i] as usize).checked_sub(1),
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        /// In-vector `ScoreEnd`: per-target score AND end positions match `align_pair` for every
+        /// sequence — including the exact tie-break — across lane counts and layouts. This validates
+        /// the end-tracking algorithm on the safe reference before any SIMD impl.
+        #[test]
+        fn fill_ends_matches_per_sequence((scoring, seqs, q) in scenario()) {
+            let max_t = seqs.iter().map(Vec::len).max().unwrap_or(0);
+            for mode in MODES {
+                prop_assume!(
+                    kernel_applies(
+                        scoring.required_width(mode, q.len(), max_t).unwrap(),
+                        scoring.alphabet_len()
+                    )
+                );
+                // Positions must fit i16 for the in-vector tracker.
+                prop_assume!(q.len() <= i16::MAX as usize && max_t <= i16::MAX as usize);
+            }
+
+            for mode in MODES {
+                for layout in [Layout::Gathered, Layout::Precomputed] {
+                    let e1 = per_target_ends::<1>(&seqs, &scoring, mode, &q, layout);
+                    let e4 = per_target_ends::<4>(&seqs, &scoring, mode, &q, layout);
+                    let e8 = per_target_ends::<8>(&seqs, &scoring, mode, &q, layout);
+                    for (i, seq) in seqs.iter().enumerate() {
+                        let want = BestHit {
+                            db_index: i,
+                            ..crate::align_pair(&q, seq, &scoring, mode, SearchType::ScoreEnd).unwrap()
+                        };
+                        prop_assert_eq!(e1[i], want, "1 lane {} {} seq {}", mode, layout, i);
+                        prop_assert_eq!(e4[i], want, "4 lanes {} {} seq {}", mode, layout, i);
+                        prop_assert_eq!(e8[i], want, "8 lanes {} {} seq {}", mode, layout, i);
                     }
                 }
             }

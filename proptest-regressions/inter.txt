@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 521477d5fc0d7128c71b12607423d46e595a823c351d184d0139bc75757d5cef # shrinks to (scoring, seqs, q) = (Scoring { alphabet_len: 2, matrix: [0, 0, 0, 0], gap_open: 0, gap_ext: 0, min_entry: 0, max_entry: 0 }, [[]], [0])
