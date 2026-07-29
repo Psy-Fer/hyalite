@@ -297,6 +297,73 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Per-target scan_all
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// `scan_all` returns one hit per database sequence (in order), each bit-identical to
+    /// `align_pair` for that sequence, on every backend × layout and both search types. And
+    /// `scan` equals the smallest-index best of `scan_all`.
+    #[test]
+    fn scan_all_matches_per_sequence_and_scan((s, db_seqs, q) in scheme_db_query()) {
+        let scoring = s.scoring();
+        let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
+
+        for mode in ALL_MODES {
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                // Independent per-sequence reference and its smallest-index best.
+                let want: Vec<BestHit> = db_seqs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, seq)| BestHit {
+                        db_index: i,
+                        ..align_pair(&q, seq, &scoring, mode, st).unwrap()
+                    })
+                    .collect();
+                let want_best = want
+                    .iter()
+                    .copied()
+                    .reduce(|a, c| if c.score > a.score { c } else { a })
+                    .unwrap();
+
+                let eligible = matches!(scoring.required_width(mode, 12, max_t), Ok(ScoreWidth::I8))
+                    && scoring.alphabet_len() <= 16;
+                let mut configs = vec![(Backend::Scalar, LayoutChoice::Auto)];
+                if eligible {
+                    for b in [Backend::Sse41, Backend::Avx2] {
+                        if b.is_available() {
+                            configs.push((b, LayoutChoice::Force(Layout::Gathered)));
+                            configs.push((b, LayoutChoice::Force(Layout::Precomputed)));
+                        }
+                    }
+                }
+
+                for (b, layout) in configs {
+                    let db = Database::builder()
+                        .sequences(&db_seqs)
+                        .scoring(scoring.clone())
+                        .mode(mode)
+                        .search_type(st)
+                        .max_query_len(12)
+                        .backend(BackendChoice::Force(b))
+                        .layout(layout)
+                        .build()
+                        .unwrap();
+                    let mut scratch = Scratch::new(&db);
+                    let mut out = Vec::new();
+                    db.scan_all(&mut scratch, &q, &mut out);
+                    prop_assert_eq!(&out, &want, "scan_all {} {} {}", b, mode, st);
+                    let hit = db.scan(&mut scratch, &q);
+                    prop_assert_eq!(hit, want_best, "scan vs best-of-scan_all {} {} {}", b, mode, st);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adversarial robustness (stable stand-in for cargo-fuzz)
 // ---------------------------------------------------------------------------
 

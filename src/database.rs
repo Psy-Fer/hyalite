@@ -131,6 +131,78 @@ impl Database {
         }
     }
 
+    /// Scan `query` against every sequence and write **one [`BestHit`] per database sequence**
+    /// into `out`, in database order (`out[i].db_index == i`). `out` is cleared first and reused,
+    /// so repeated calls allocate nothing once it has grown.
+    ///
+    /// This is the per-target counterpart to [`scan`](Self::scan): where `scan` returns only the
+    /// single best hit, `scan_all` returns them all. Same determinism guarantee — each entry is
+    /// bit-identical across backends.
+    ///
+    /// For [`SearchType::Score`] the per-sequence scores are computed by the resolved backend
+    /// (SIMD-accelerated for an eligible database) and end positions are `None`. For
+    /// [`SearchType::ScoreEnd`] the end positions are currently recovered by the scalar kernel per
+    /// sequence (bit-identical, but not yet SIMD-accelerated); in-vector end tracking is a planned
+    /// optimisation that will not change this API.
+    ///
+    /// Same caller contract as [`scan`](Self::scan): `query` is pre-encoded, `<= max_query_len`.
+    pub fn scan_all(&self, scratch: &mut Scratch, query: &[u8], out: &mut Vec<BestHit>) {
+        debug_assert!(
+            query.len() <= self.max_query_len,
+            "query length {} exceeds declared max_query_len {}",
+            query.len(),
+            self.max_query_len
+        );
+
+        out.clear();
+        out.reserve(self.sequences.len());
+
+        // `ScoreEnd` needs per-target end positions, which require the scalar DP (in-vector
+        // tracking is a future optimisation). `Score` uses the SIMD per-target kernel when a SIMD
+        // backend is resolved.
+        if self.search_type.tracks_end() {
+            for (index, seq) in self.sequences.iter().enumerate() {
+                let (score, query_end, target_end) =
+                    align_core(query, seq, &self.scoring, self.mode, &mut scratch.buf);
+                out.push(BestHit {
+                    score,
+                    db_index: index,
+                    query_end,
+                    target_end,
+                });
+            }
+        } else if let Some(packed) = &self.packed {
+            inter::fill_scores(
+                self.backend,
+                packed,
+                self.mode,
+                self.scoring.gap_open(),
+                self.scoring.gap_ext(),
+                query,
+                &mut scratch.simd,
+            );
+            for (index, &score) in scratch.simd.scores().iter().enumerate() {
+                out.push(BestHit {
+                    score: score as i32,
+                    db_index: index,
+                    query_end: None,
+                    target_end: None,
+                });
+            }
+        } else {
+            for (index, seq) in self.sequences.iter().enumerate() {
+                let (score, _, _) =
+                    align_core(query, seq, &self.scoring, self.mode, &mut scratch.buf);
+                out.push(BestHit {
+                    score,
+                    db_index: index,
+                    query_end: None,
+                    target_end: None,
+                });
+            }
+        }
+    }
+
     /// The number of sequences in the database (always `>= 1`).
     #[must_use]
     pub fn sequence_count(&self) -> usize {
@@ -369,7 +441,7 @@ impl Scratch {
     #[must_use]
     pub fn new(db: &Database) -> Self {
         let simd = match db.backend().simd_lanes() {
-            Some(lanes) => SimdScratch::new(db.max_target_len(), lanes),
+            Some(lanes) => SimdScratch::new(db.sequence_count(), db.max_target_len(), lanes),
             None => SimdScratch::empty(),
         };
         Scratch {

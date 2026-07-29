@@ -6,6 +6,14 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Database::scan_all`: the per-target counterpart to `scan`, writing one `BestHit` per database
+  sequence (in `db_index` order) into a caller-provided `Vec<BestHit>` (cleared and reused, so no
+  per-call allocation). Per-target scores are SIMD-accelerated via a new `fill_scores` kernel path;
+  for `SearchType::ScoreEnd`, per-sequence end positions are currently recovered by the scalar
+  kernel (in-vector end tracking is a planned optimisation that will not change this API).
+
 ## [0.1.0] - 2026-07-29
 
 The v0.1 foundation: exact SIMD-accelerated pairwise and database sequence alignment with a
