@@ -33,7 +33,7 @@
 use crate::backend::{self, Backend, BackendChoice};
 use crate::error::{Error, Result};
 use crate::hit::BestHit;
-use crate::inter::{self, Layout, PackedDb, SimdScratch};
+use crate::inter::{self, Layout, LayoutChoice, PackedDb, SimdScratch};
 use crate::kernel::{DpBuffers, align_core};
 use crate::mode::Mode;
 use crate::scoring::Scoring;
@@ -199,6 +199,7 @@ pub struct DatabaseBuilder {
     search_type: Option<SearchType>,
     max_query_len: Option<usize>,
     backend_choice: Option<BackendChoice>,
+    layout_choice: Option<LayoutChoice>,
 }
 
 impl DatabaseBuilder {
@@ -248,6 +249,16 @@ impl DatabaseBuilder {
     #[must_use]
     pub fn backend(mut self, choice: BackendChoice) -> Self {
         self.backend_choice = Some(choice);
+        self
+    }
+
+    /// Override the SIMD kernel [`Layout`]. Defaults to [`LayoutChoice::Auto`], which picks
+    /// [`Layout::Precomputed`] for a database small enough to keep its score table cache-resident
+    /// and [`Layout::Gathered`] otherwise. Ignored by the scalar backend. Layout affects
+    /// performance only, never results.
+    #[must_use]
+    pub fn layout(mut self, choice: LayoutChoice) -> Self {
+        self.layout_choice = Some(choice);
         self
     }
 
@@ -319,10 +330,13 @@ impl DatabaseBuilder {
             }
         };
 
-        // Pack the database once for the resolved SIMD backend's lane count (query-independent).
-        let packed = backend
-            .simd_lanes()
-            .map(|lanes| PackedDb::build(&sequences, lanes));
+        // Pack the database once for the resolved SIMD backend's lane count (query-independent),
+        // in the auto-selected or forced layout.
+        let layout_choice = self.layout_choice.unwrap_or_default();
+        let packed = backend.simd_lanes().map(|lanes| {
+            let layout = inter::choose_layout(&sequences, lanes, alphabet_len, layout_choice);
+            PackedDb::build(&sequences, lanes, layout, &scoring)
+        });
 
         Ok(Database {
             sequences,
@@ -355,12 +369,7 @@ impl Scratch {
     #[must_use]
     pub fn new(db: &Database) -> Self {
         let simd = match db.backend().simd_lanes() {
-            Some(lanes) => SimdScratch::new(
-                db.max_query_len(),
-                db.scoring().alphabet_len(),
-                db.max_target_len(),
-                lanes,
-            ),
+            Some(lanes) => SimdScratch::new(db.max_target_len(), lanes),
             None => SimdScratch::empty(),
         };
         Scratch {
@@ -553,7 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_is_reported_for_simd_and_absent_for_scalar() {
+    fn layout_is_reported_and_overridable() {
+        use crate::LayoutChoice;
+
         let scalar = Database::builder()
             .sequences(&[vec![0u8, 1, 2, 3]])
             .scoring(dna_scoring())
@@ -568,17 +579,33 @@ mod tests {
             "scalar backend does not pack the database"
         );
 
+        let build = |b: Backend, choice: Option<LayoutChoice>| {
+            let mut builder = Database::builder()
+                .sequences(&[vec![0u8, 1, 2, 3], vec![2u8, 2]])
+                .scoring(dna_scoring())
+                .mode(Mode::Ov)
+                .max_query_len(8)
+                .backend(BackendChoice::Force(b));
+            if let Some(c) = choice {
+                builder = builder.layout(c);
+            }
+            builder.build().unwrap()
+        };
+
         for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
-            if b.is_available() {
-                let db = Database::builder()
-                    .sequences(&[vec![0u8, 1, 2, 3], vec![2u8, 2]])
-                    .scoring(dna_scoring())
-                    .mode(Mode::Ov)
-                    .max_query_len(8)
-                    .backend(BackendChoice::Force(b))
-                    .build()
-                    .unwrap();
-                assert_eq!(db.layout(), Some(Layout::Gathered), "{b} layout");
+            if !b.is_available() {
+                continue;
+            }
+            // A tiny database auto-selects Precomputed (its score table is cache-resident).
+            assert_eq!(
+                build(b, None).layout(),
+                Some(Layout::Precomputed),
+                "{b} auto"
+            );
+            // Both layouts are forceable and reported back.
+            for layout in [Layout::Gathered, Layout::Precomputed] {
+                let db = build(b, Some(LayoutChoice::Force(layout)));
+                assert_eq!(db.layout(), Some(layout), "{b} forced {layout}");
             }
         }
     }

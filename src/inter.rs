@@ -131,24 +131,85 @@ pub(crate) fn kernel_applies(width: crate::ScoreWidth, alphabet_len: usize) -> b
 }
 
 /// The kernel data layout for the substitution scores, reported by
-/// [`Database::layout`](crate::Database::layout).
-///
-/// `#[non_exhaustive]`: `Precomputed` (a query-letter × column score table for small fixed
-/// databases) is added in a later milestone.
+/// [`Database::layout`](crate::Database::layout). Like the backend and score width, the layout is
+/// a **performance choice only** — it never changes results (see `DETERMINISM.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Layout {
-    /// General layout: a per-column byte-shuffle gather of substitution scores from the query
-    /// profile. The standard Rognes inner loop.
+    /// General layout: a per-column byte-shuffle gather of substitution scores from a per-letter
+    /// query profile. The standard Rognes inner loop; works for any database.
     Gathered,
+    /// Small-fixed-database layout: a precomputed query-letter × database-column score table, so
+    /// each cell's substitution vector is a direct load with no gather. Chosen automatically when
+    /// the table is small enough to stay cache-resident (see [`Database::builder`]).
+    Precomputed,
 }
 
 impl core::fmt::Display for Layout {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Layout::Gathered => f.write_str("gathered"),
+            Layout::Precomputed => f.write_str("precomputed"),
         }
     }
+}
+
+/// How a [`Database`](crate::Database) chooses its kernel [`Layout`]: automatically from the
+/// database size, or forced (for benchmarking or pinning behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LayoutChoice {
+    /// Pick [`Layout::Precomputed`] when the score table stays cache-resident, else
+    /// [`Layout::Gathered`].
+    #[default]
+    Auto,
+    /// Force a specific layout.
+    Force(Layout),
+}
+
+/// Precomputed-table budget: `Auto` picks [`Layout::Precomputed`] when the estimated table size
+/// (`sum over batches of alphabet_len × width × lanes` bytes) is at most this. 256 KiB stays
+/// comfortably within L2; the CR4 adapter table is ~10 KiB. Overridable via the builder.
+const PRECOMPUTED_MAX_BYTES: usize = 256 * 1024;
+
+/// Estimated `Precomputed` table size in bytes for this database and lane count.
+fn precomputed_table_bytes(sequences: &[Vec<u8>], lanes: usize, alphabet_len: usize) -> usize {
+    sequences
+        .chunks(lanes)
+        .map(|chunk| {
+            let w = chunk.iter().map(Vec::len).max().unwrap_or(0);
+            alphabet_len.saturating_mul(w).saturating_mul(lanes)
+        })
+        .sum()
+}
+
+/// Resolve the layout for a database, honouring an explicit choice or auto-selecting by size.
+pub(crate) fn choose_layout(
+    sequences: &[Vec<u8>],
+    lanes: usize,
+    alphabet_len: usize,
+    choice: LayoutChoice,
+) -> Layout {
+    match choice {
+        LayoutChoice::Force(layout) => layout,
+        LayoutChoice::Auto => {
+            if precomputed_table_bytes(sequences, lanes, alphabet_len) <= PRECOMPUTED_MAX_BYTES {
+                Layout::Precomputed
+            } else {
+                Layout::Gathered
+            }
+        }
+    }
+}
+
+/// Per-batch substitution-score data, in the chosen [`Layout`].
+#[derive(Debug, Clone)]
+enum SubScores {
+    /// `residues[(j-1) * lanes + k]` = target `k`'s residue at column `j`; the kernel shuffles the
+    /// per-letter query profile by it.
+    Gathered { residues: Vec<u8> },
+    /// `table[(q * w + (j-1)) * lanes + k]` = `score(q, target_k[j])`, baked at build time; the
+    /// kernel loads it directly, no gather.
+    Precomputed { table: Vec<i8> },
 }
 
 /// One batch of up to `lanes` database sequences, packed for the inter-sequence kernel. Built
@@ -159,26 +220,38 @@ struct PackedBatch {
     real: usize,
     /// Padded column count (the longest sequence in the batch).
     w: usize,
-    /// Target residues, `residues[(j-1) * lanes + k]` for column `j` (1-based), lane `k`.
-    residues: Vec<u8>,
     /// `mask_le[j * lanes + k]` = `0xFF` iff `j <= len_k`, else `0`. `(w + 1) * lanes` bytes.
     mask_le: Vec<i8>,
     /// `mask_eq[j * lanes + k]` = `0xFF` iff `j == len_k`, else `0`. `(w + 1) * lanes` bytes.
     mask_eq: Vec<i8>,
+    /// Substitution scores in the chosen layout.
+    sub: SubScores,
 }
 
-/// The whole database packed for a fixed lane count. Immutable and query-independent.
+/// The whole database packed for a fixed lane count and layout. Immutable and query-independent.
 #[derive(Debug, Clone)]
 pub(crate) struct PackedDb {
     lanes: usize,
     layout: Layout,
+    alphabet_len: usize,
+    /// Per-letter query profile `letter_profile[q * al + s] = score(q, s)` — used only by the
+    /// `Gathered` layout (empty for `Precomputed`, which bakes scores into the table).
+    letter_profile: Vec<i8>,
     batches: Vec<PackedBatch>,
 }
 
 impl PackedDb {
-    /// Build the `Gathered` packing for `lanes`-wide SIMD.
-    pub(crate) fn build(sequences: &[Vec<u8>], lanes: usize) -> Self {
+    /// Pack `sequences` for `lanes`-wide SIMD in the given `layout`. `scoring` must be valid for an
+    /// `I8`-width database, so every entry fits `i8`.
+    pub(crate) fn build(
+        sequences: &[Vec<u8>],
+        lanes: usize,
+        layout: Layout,
+        scoring: &Scoring,
+    ) -> Self {
+        let al = scoring.alphabet_len();
         let mut batches = Vec::new();
+
         for chunk in sequences.chunks(lanes) {
             let real = chunk.len();
             let w = chunk.iter().map(Vec::len).max().unwrap_or(0);
@@ -201,17 +274,50 @@ impl PackedDb {
                 }
             }
 
+            let sub = match layout {
+                Layout::Gathered => SubScores::Gathered { residues },
+                Layout::Precomputed => {
+                    // table[(q * w + j0) * lanes + k] = score(q, residues[j0 * lanes + k]).
+                    let mut table = vec![0i8; al * w * lanes];
+                    for q in 0..al {
+                        for j0 in 0..w {
+                            for k in 0..lanes {
+                                let t = residues[j0 * lanes + k] as usize;
+                                table[(q * w + j0) * lanes + k] = scoring.score(q, t) as i8;
+                            }
+                        }
+                    }
+                    SubScores::Precomputed { table }
+                }
+            };
+
             batches.push(PackedBatch {
                 real,
                 w,
-                residues,
                 mask_le,
                 mask_eq,
+                sub,
             });
         }
+
+        let letter_profile = match layout {
+            Layout::Gathered => {
+                let mut lp = vec![0i8; al * al];
+                for q in 0..al {
+                    for s in 0..al {
+                        lp[q * al + s] = scoring.score(q, s) as i8;
+                    }
+                }
+                lp
+            }
+            Layout::Precomputed => Vec::new(),
+        };
+
         PackedDb {
             lanes,
-            layout: Layout::Gathered,
+            layout,
+            alphabet_len: al,
+            letter_profile,
             batches,
         }
     }
@@ -221,12 +327,10 @@ impl PackedDb {
     }
 }
 
-/// Reusable, query-dependent working memory for the SIMD scan. Held in
+/// Reusable, query-independent-sized working memory for the SIMD scan. Held in
 /// [`Scratch`](crate::Scratch) so the hot path allocates nothing.
 #[derive(Debug)]
 pub(crate) struct SimdScratch {
-    /// Substitution profile `profile[i * al + s]`, rebuilt per scan into the reused allocation.
-    profile: Vec<i8>,
     /// Two `H` rows, ping-ponged: `2 * (max_target_len + 1) * lanes` bytes.
     h: Vec<i8>,
     /// The down-carried `F` column: `(max_target_len + 1) * lanes` bytes.
@@ -236,15 +340,9 @@ pub(crate) struct SimdScratch {
 }
 
 impl SimdScratch {
-    pub(crate) fn new(
-        max_query_len: usize,
-        alphabet_len: usize,
-        max_target_len: usize,
-        lanes: usize,
-    ) -> Self {
+    pub(crate) fn new(max_target_len: usize, lanes: usize) -> Self {
         let row = (max_target_len + 1) * lanes;
         SimdScratch {
-            profile: Vec::with_capacity(max_query_len * alphabet_len),
             h: vec![0i8; 2 * row],
             f: vec![0i8; row],
             lane_scores: vec![0i8; lanes],
@@ -254,7 +352,6 @@ impl SimdScratch {
     /// Empty buffers for a scalar-backend database, which never runs the SIMD kernel.
     pub(crate) fn empty() -> Self {
         SimdScratch {
-            profile: Vec::new(),
             h: Vec::new(),
             f: Vec::new(),
             lane_scores: Vec::new(),
@@ -269,9 +366,9 @@ impl SimdScratch {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)] // an inter-sequence DP inherently takes many parameters
 fn scan_batch<L: Lanes>(
-    profile: &[i8],
+    query: &[u8],
+    letter_profile: &[i8],
     al: usize,
-    qlen: usize,
     batch: &PackedBatch,
     go: i8,
     ge: i8,
@@ -281,6 +378,7 @@ fn scan_batch<L: Lanes>(
     out: &mut [i8],
 ) {
     let lanes = L::LANES;
+    let qlen = query.len();
     let w = batch.w;
     let cols = (w + 1) * lanes;
 
@@ -318,7 +416,7 @@ fn scan_batch<L: Lanes>(
             L::splat(-gap_penalty(go as i32, ge as i32, i) as i8)
         };
         L::store(border, &mut cur[0..lanes]);
-        let profile_row = &profile[(i - 1) * al..(i - 1) * al + al];
+        let qi = query[i - 1] as usize;
         let mut e = neg; // E[i][0]
         for j in 1..=w {
             let col = j * lanes;
@@ -332,7 +430,14 @@ fn scan_batch<L: Lanes>(
                 L::sub_sat(L::load(&f[col..]), ge_v),
             );
             L::store(f_j, &mut f[col..]);
-            let sub = L::shuffle_lookup(profile_row, &batch.residues[prevcol..col]);
+            // Substitution vector = score(query[i], target_k[j]) per lane, from the chosen layout.
+            let sub = match &batch.sub {
+                SubScores::Gathered { residues } => L::shuffle_lookup(
+                    &letter_profile[qi * al..qi * al + al],
+                    &residues[prevcol..col],
+                ),
+                SubScores::Precomputed { table } => L::load(&table[(qi * w + (j - 1)) * lanes..]),
+            };
             let diag = L::add_sat(L::load(&prev[prevcol..]), sub);
             let mut cell = L::max(diag, L::max(e, f_j));
             if flags.local {
@@ -411,27 +516,16 @@ pub(crate) fn scan_batched<L: Lanes>(
     sc: &mut SimdScratch,
     dp: &mut kernel::DpBuffers,
 ) -> BestHit {
-    let al = scoring.alphabet_len();
-    let qlen = query.len();
     let flags = Flags::for_mode(mode);
     let (go, ge) = (scoring.gap_open() as i8, scoring.gap_ext() as i8);
-
-    // Rebuild the query profile into the reused allocation.
-    sc.profile.clear();
-    sc.profile.resize(qlen * al, 0);
-    for (i, &q) in query.iter().enumerate() {
-        for s in 0..al {
-            sc.profile[i * al + s] = scoring.score(q as usize, s) as i8;
-        }
-    }
 
     let mut best_score = i8::MIN;
     let mut best_index = 0usize;
     for (b, batch) in packed.batches.iter().enumerate() {
         scan_batch::<L>(
-            &sc.profile,
-            al,
-            qlen,
+            query,
+            &packed.letter_profile,
+            packed.alphabet_len,
             batch,
             go,
             ge,
@@ -817,18 +911,19 @@ mod tests {
         db.scan(&mut scratch, query)
     }
 
-    /// Run the inter-sequence kernel with an `N`-lane scalar reference backend, driving the same
-    /// packed-database + reusable-scratch path production uses.
+    /// Run the inter-sequence kernel with an `N`-lane scalar reference backend in the given
+    /// `layout`, driving the same packed-database + reusable-scratch path production uses.
     fn inter_scan<const N: usize>(
         seqs: &[Vec<u8>],
         scoring: &Scoring,
         mode: Mode,
         st: SearchType,
         query: &[u8],
+        layout: Layout,
     ) -> BestHit {
         let max_t = seqs.iter().map(Vec::len).max().unwrap_or(0);
-        let packed = PackedDb::build(seqs, N);
-        let mut sc = SimdScratch::new(query.len(), scoring.alphabet_len(), max_t, N);
+        let packed = PackedDb::build(seqs, N, layout, scoring);
+        let mut sc = SimdScratch::new(max_t, N);
         let mut dp = kernel::DpBuffers::new();
         scan_batched::<ScalarLanes<N>>(&packed, seqs, scoring, mode, st, query, &mut sc, &mut dp)
     }
@@ -856,8 +951,8 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(400))]
 
         /// The inter-sequence kernel is bit-identical to the scalar oracle across all modes, both
-        /// search types, and several lane counts — the lane-count independence the determinism
-        /// contract demands, checked before any real SIMD exists.
+        /// search types, several lane counts, and **both layouts** — the lane-count and layout
+        /// independence the determinism contract demands, checked before any real SIMD exists.
         #[test]
         fn inter_sequence_matches_scalar((scoring, seqs, q) in scenario()) {
             // Restrict to the kernel's domain: I8 width for every mode under test.
@@ -874,12 +969,14 @@ mod tests {
             for mode in MODES {
                 for st in [SearchType::Score, SearchType::ScoreEnd] {
                     let want = scalar_scan(&seqs, &scoring, mode, st, &q);
-                    let got1 = inter_scan::<1>(&seqs, &scoring, mode, st, &q);
-                    let got4 = inter_scan::<4>(&seqs, &scoring, mode, st, &q);
-                    let got8 = inter_scan::<8>(&seqs, &scoring, mode, st, &q);
-                    prop_assert_eq!(got1, want, "1 lane, {} {}", mode, st);
-                    prop_assert_eq!(got4, want, "4 lanes, {} {}", mode, st);
-                    prop_assert_eq!(got8, want, "8 lanes, {} {}", mode, st);
+                    for layout in [Layout::Gathered, Layout::Precomputed] {
+                        let got1 = inter_scan::<1>(&seqs, &scoring, mode, st, &q, layout);
+                        let got4 = inter_scan::<4>(&seqs, &scoring, mode, st, &q, layout);
+                        let got8 = inter_scan::<8>(&seqs, &scoring, mode, st, &q, layout);
+                        prop_assert_eq!(got1, want, "1 lane, {} {} {}", mode, st, layout);
+                        prop_assert_eq!(got4, want, "4 lanes, {} {} {}", mode, st, layout);
+                        prop_assert_eq!(got8, want, "8 lanes, {} {} {}", mode, st, layout);
+                    }
                 }
             }
         }

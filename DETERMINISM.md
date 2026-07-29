@@ -123,7 +123,13 @@ the determinism promise as a correctness proof against external tools.
 (inter-sequence) proves one from the declared maximum lengths. The same pair can therefore be
 computed at different widths through different entry points. This does not violate the contract:
 any width the proof accepts is *sufficient* (no real cell saturates), so all of them yield the same
-score and ends. **Width is a performance detail, never a result detail.**
+score and ends.
+
+The **kernel [`Layout`]** (`Gathered` vs `Precomputed`) is the same kind of choice: `Precomputed`
+bakes `score(q, target)` into a table while `Gathered` shuffles a per-letter profile, but both
+produce the identical substitution value per cell, so the layout — auto-selected by database size
+or forced via the builder — changes only speed. **Width, backend, and layout are performance
+details, never result details.**
 
 ## How this is enforced
 

@@ -13,8 +13,8 @@ mod common;
 
 use common::{ALL_MODES, brute, reference_scan};
 use hyalite::{
-    Backend, BackendChoice, BestHit, Database, Mode, ScoreWidth, Scoring, Scratch, SearchType,
-    align_pair,
+    Backend, BackendChoice, BestHit, Database, Layout, LayoutChoice, Mode, ScoreWidth, Scoring,
+    Scratch, SearchType, align_pair,
 };
 use proptest::prelude::*;
 
@@ -231,6 +231,7 @@ proptest! {
 
 fn scan_forced(
     backend: Backend,
+    layout: LayoutChoice,
     seqs: &[Vec<u8>],
     scoring: &Scoring,
     mode: Mode,
@@ -244,6 +245,7 @@ fn scan_forced(
         .search_type(st)
         .max_query_len(12)
         .backend(BackendChoice::Force(backend))
+        .layout(layout)
         .build()
         .unwrap();
     let mut scratch = Scratch::new(&db);
@@ -254,9 +256,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
     /// The determinism contract, now testable: for every SIMD-eligible database, each available
-    /// SIMD backend (SSE4.1, AVX2) yields the exact same `BestHit` (score, db_index, end
-    /// positions) as scalar — across all modes and both search types. Unavailable backends on this
-    /// CPU are skipped.
+    /// SIMD backend (SSE4.1, AVX2) in **either layout** (Gathered, Precomputed) yields the exact
+    /// same `BestHit` as scalar — across all modes and both search types. Skipped on CPUs with no
+    /// SIMD backend.
     #[test]
     fn scan_identical_across_simd_backends((s, db_seqs, q) in scheme_db_query()) {
         let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
@@ -276,10 +278,18 @@ proptest! {
                 continue;
             }
             for st in [SearchType::Score, SearchType::ScoreEnd] {
-                let scalar = scan_forced(Backend::Scalar, &db_seqs, &scoring, mode, st, &q);
+                let scalar = scan_forced(
+                    Backend::Scalar, LayoutChoice::Auto, &db_seqs, &scoring, mode, st, &q,
+                );
                 for &b in &simd {
-                    let got = scan_forced(b, &db_seqs, &scoring, mode, st, &q);
-                    prop_assert_eq!(got, scalar, "{} disagrees with scalar for {} {}", b, mode, st);
+                    for layout in [Layout::Gathered, Layout::Precomputed] {
+                        let got = scan_forced(
+                            b, LayoutChoice::Force(layout), &db_seqs, &scoring, mode, st, &q,
+                        );
+                        prop_assert_eq!(
+                            got, scalar, "{}/{} disagrees with scalar for {} {}", b, layout, mode, st
+                        );
+                    }
                 }
             }
         }
