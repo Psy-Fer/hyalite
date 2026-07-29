@@ -17,3 +17,9 @@ categories = ["science", "algorithms"]
 [dev-dependencies]
 # Property-based / differential testing. Dev-only — the core stays dependency-free.
 proptest = "1"
+# Benchmark harness (dev-only).
+criterion = "0.5"
+
+[[bench]]
+name = "cr4_scan"
+harness = false
