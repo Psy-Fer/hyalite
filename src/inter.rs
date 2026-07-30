@@ -496,9 +496,21 @@ fn scan_batch<L: Lanes>(
         L::store(neg, &mut f[j * lanes..]);
     }
 
-    // SW running max and OV best-last-column, accumulated over every row.
+    // SW running max and the best last-column cell, accumulated over every row. The last column is
+    // seeded with the row-0 border `H[0][len_k]` so that a *penalised* top border (`SHW`) is
+    // counted; for a free top row (`OV`) that border is `0`, matching the previous `zero` seed.
     let mut sw_ans = zero;
     let mut ov_lastcol = zero;
+    if flags.answer_last_col {
+        ov_lastcol = neg;
+        for j in 0..=w {
+            ov_lastcol = L::select(
+                L::load(&batch.mask_eq[j * lanes..]),
+                L::max(ov_lastcol, L::load(&prev[j * lanes..])),
+                ov_lastcol,
+            );
+        }
+    }
 
     for i in 1..=qlen {
         let border = if flags.left_col_free {
@@ -575,6 +587,10 @@ fn scan_batch<L: Lanes>(
             );
         }
         hw
+    } else if flags.answer_last_col {
+        // SHW: best of the last column H[i][len_k], i = 0..=qlen — seeded with row 0, accumulated
+        // over the sweep, and with the corner as the i = qlen term.
+        ov_lastcol
     } else {
         // NW: exactly H[qlen][len_k] per lane.
         let mut nw = load_row(0); // covers len_k == 0
@@ -1628,7 +1644,7 @@ mod tests {
         scan_batched::<ScalarLanes<N>>(&packed, seqs, scoring, mode, st, query, &mut sc, &mut dp)
     }
 
-    const MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+    const MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
     /// (alphabet_len<=4, small match/mismatch matrix, small gaps, seqs, query) — kept in ranges
     /// where the score width is provably `I8`.

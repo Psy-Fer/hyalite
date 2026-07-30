@@ -30,6 +30,11 @@ All notable changes to `hyalite` are documented here. The format follows
   genome-scale traceback feasible at all — a 100k×100k global alignment needs ~604 MiB via the
   checkpoint path where the full matrix would need ~112 GiB. Over-tight budgets that even the
   checkpoint path cannot meet return `TracebackBudgetExceeded`.
+- `Mode::Shw`: a fifth alignment mode (Opal issue #29, never implemented upstream) — the transpose
+  of `HW`, aligning the whole **target** within a free window of the **query** (query end-gaps free,
+  target aligned end to end; answer over the last column). Supported on every path (scalar, SIMD
+  database scan, striped `align_pair`, and traceback), bit-identical across backends, and validated
+  against an independent brute-force oracle.
 - Striped (Farrar) SIMD for `align_pair`: a `Score` alignment in any mode that provably fits `i8`
   now runs an intra-sequence striped kernel on SSE4.1 (x86-64) or NEON (aarch64), ~2.4-3.9x faster
   than the scalar path for a 2000x2000 pair (SW 3.9x, HW 3.0x, OV 2.7x, NW 2.4x). Bit-identical to

@@ -16,7 +16,7 @@ use hyalite::{
 };
 use proptest::prelude::*;
 
-const MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+const MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 const SIMD: [Backend; 3] = [Backend::Sse41, Backend::Avx2, Backend::Neon];
 
 /// Deterministic PRNG (no external dep) so failures reproduce.

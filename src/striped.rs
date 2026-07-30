@@ -503,7 +503,7 @@ mod tests {
         ]
     }
 
-    const ALL_MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+    const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
     /// The striped kernel realises the DP in `i8`; it matches the oracle exactly only where the
     /// width proof says `i8` suffices — which is precisely where `align_pair` uses it. Returns

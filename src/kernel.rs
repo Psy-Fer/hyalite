@@ -12,10 +12,11 @@
 //!
 //! | Mode | Query start/end gaps | Target start/end gaps | Answer over |
 //! |------|----------------------|-----------------------|-------------|
-//! | `NW` | penalised            | penalised             | corner `(m, n)` |
-//! | `HW` | **free**             | penalised             | last row (query fully aligned; target window free) |
-//! | `OV` | **free**             | **free**              | last row ∪ last column (overlap) |
-//! | `SW` | free (local)         | free (local)          | every cell, clamped at 0 |
+//! | `NW`  | penalised           | penalised             | corner `(m, n)` |
+//! | `HW`  | **free**            | penalised             | last row (query fully aligned; target window free) |
+//! | `SHW` | penalised           | **free**              | last column (target fully aligned; query window free) |
+//! | `OV`  | **free**            | **free**              | last row ∪ last column (overlap) |
+//! | `SW`  | free (local)        | free (local)          | every cell, clamped at 0 |
 //!
 //! These are standard textbook semantics chosen for a well-defined oracle. Exact byte-parity
 //! with Opal's / STAR's end-gap conventions is a separate concern verified against Opal test
@@ -82,6 +83,15 @@ impl Flags {
                 answer_last_row: false,
                 answer_last_col: false,
                 local: true,
+            },
+            // The transpose of `Hw`: the query's ends are free (query prefix/suffix unaligned),
+            // the target is aligned end to end. Answer over the last column `H[*][n]`.
+            Mode::Shw => Flags {
+                top_row_free: false,
+                left_col_free: true,
+                answer_last_row: false,
+                answer_last_col: true,
+                local: false,
             },
         }
     }
@@ -500,7 +510,7 @@ mod tests {
             (al, mat, go, ge, q, t) in scheme_and_pair()
         ) {
             let scoring = Scoring::new(al, mat, go, ge).unwrap();
-            for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov] {
+            for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw] {
                 let width = scoring.required_width(mode, q.len(), t.len()).unwrap();
                 let max_mag = max_real_cell_magnitude(&q, &t, &scoring, mode);
                 prop_assert!(

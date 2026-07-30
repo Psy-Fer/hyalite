@@ -115,7 +115,9 @@ fn magnitude_bound(
     let negative = match mode {
         Mode::Sw => go,
         Mode::Ov => min_ij * max_neg + go,
-        Mode::Nw | Mode::Hw => (m + n) * max_neg + go + (m + n - 1).max(0) * ge,
+        // `Shw` is the transpose of `Hw`: one penalised border (the target overhang can be a
+        // charged gap), so it takes the same wide bound as `Nw`/`Hw`.
+        Mode::Nw | Mode::Hw | Mode::Shw => (m + n) * max_neg + go + (m + n - 1).max(0) * ge,
     };
 
     positive.max(negative)
@@ -157,7 +159,7 @@ pub fn required_width(
 mod tests {
     use super::*;
 
-    const ALL_MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+    const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
     #[test]
     fn width_constants_are_sane() {

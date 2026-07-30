@@ -5,7 +5,7 @@
 
 use hyalite::{BestHit, Database, Mode, Scoring, Scratch, SearchType, align_pair};
 
-const ALL_MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
 fn dna() -> Scoring {
     Scoring::new(

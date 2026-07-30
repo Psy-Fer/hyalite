@@ -11,7 +11,7 @@ use crate::kernel::gap_penalty;
 use crate::{Error, Mode, Scoring, SearchType, align_pair};
 use proptest::prelude::*;
 
-const ALL_MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
 fn id_matrix(al: usize, m: i32, x: i32) -> Vec<i32> {
     let mut v = vec![x; al * al];
@@ -202,6 +202,20 @@ fn hw_query_is_a_free_window_of_the_target() {
     assert_eq!(ops(&a), vec![AlignOp::Match, AlignOp::Match]);
     assert_eq!((a.query_start, a.query_end), (0, 2)); // whole query consumed
     assert_eq!((a.target_start, a.target_end), (1, 3)); // free target ends trimmed
+    assert_eq!(a.cigar(), "2M");
+}
+
+#[test]
+fn shw_target_is_a_free_window_of_the_query() {
+    // The transpose of HW: the whole target aligns to a window of the query, query ends free.
+    let s = dna();
+    let q = [0u8, 1, 2, 3]; // ACGT
+    let t = [1u8, 2]; // CG; aligns to q[1..3], leading/trailing query free
+    let a = align(&q, &t, &s, Mode::Shw, usize::MAX).unwrap();
+    assert_eq!(a.score, 4);
+    assert_eq!(ops(&a), vec![AlignOp::Match, AlignOp::Match]);
+    assert_eq!((a.target_start, a.target_end), (0, 2)); // whole target consumed
+    assert_eq!((a.query_start, a.query_end), (1, 3)); // free query ends trimmed
     assert_eq!(a.cigar(), "2M");
 }
 

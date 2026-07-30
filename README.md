@@ -85,9 +85,10 @@ assert_eq!(hit.db_index, 1);       // the perfect-match sequence wins
 - **Static width proof.** The score integer width (`i8`, `i16`, or `i32`) is proven sufficient at
   construction rather than detected at runtime, so the hot loop is infallible. SIMD currently
   accelerates `i8`-width databases with `alphabet_len` at most 16; wider inputs use the scalar path.
-- **`align_pair`.** A single-pair entry point exists from day one. It is currently scalar-backed;
-  a striped intra-sequence SIMD backend is planned for v0.2.
-- **Modes.** `SW` (local), `NW` (global), `HW` (semi-global, query ends free), `OV` (overlap).
+- **`align_pair`.** A single-pair entry point exists from day one, with a striped intra-sequence
+  SIMD `Score` backend (SSE4.1/NEON) for `i8`-width alignments.
+- **Modes.** `SW` (local), `NW` (global), `HW` (semi-global: full query aligned within the target),
+  `SHW` (its transpose: full target aligned within the query), `OV` (overlap).
 - **No `unsafe` outside the SIMD backend modules**, and the core is dependency-free.
 
 ## Testing

@@ -99,6 +99,18 @@ fn brute_hw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32
     best
 }
 
+/// Semi-global transpose (SHW): target fully aligned to the best query window (mirror of HW).
+fn brute_shw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    let m = q.len();
+    let mut best = i32::MIN;
+    for a in 0..=m {
+        for b in a..=m {
+            best = best.max(brute_nw(&q[a..b], t, mat, al, go, ge));
+        }
+    }
+    best
+}
+
 /// Overlap (OV): best global score over substring pairs whose alignment touches a border at both
 /// its start (skips a prefix of query or target for free) and its end (skips a suffix for free),
 /// floored at 0 (the free border cells score 0).
@@ -127,6 +139,7 @@ fn brute(mode: Mode, q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i3
         Mode::Sw => brute_sw(q, t, mat, al, go, ge),
         Mode::Hw => brute_hw(q, t, mat, al, go, ge),
         Mode::Ov => brute_ov(q, t, mat, al, go, ge),
+        Mode::Shw => brute_shw(q, t, mat, al, go, ge),
         _ => unreachable!("ALL_MODES covers every mode this test exercises"),
     }
 }
@@ -154,7 +167,7 @@ fn all_sequences(alphabet: u8, max_len: usize) -> Vec<Vec<u8>> {
     out
 }
 
-const ALL_MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
 fn identity_matrix(al: usize, m: i32, x: i32) -> Vec<i32> {
     let mut v = vec![x; al * al];

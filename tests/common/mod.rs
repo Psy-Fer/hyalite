@@ -8,7 +8,7 @@
 
 use hyalite::{BestHit, Mode, Scoring, SearchType, align_pair};
 
-pub const ALL_MODES: [Mode; 4] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov];
+pub const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
 /// A match/mismatch substitution matrix over an `al`-symbol alphabet.
 pub fn identity_matrix(al: usize, m: i32, x: i32) -> Vec<i32> {
@@ -126,6 +126,19 @@ pub fn brute_hw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
     best
 }
 
+/// Semi-global transpose (SHW): the whole **target** is aligned to the best **query** window (the
+/// mirror image of [`brute_hw`], which windows the target).
+pub fn brute_shw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    let m = q.len();
+    let mut best = i32::MIN;
+    for a in 0..=m {
+        for b in a..=m {
+            best = best.max(brute_nw(&q[a..b], t, mat, al, go, ge));
+        }
+    }
+    best
+}
+
 /// Overlap (OV): best global score over substring pairs whose alignment touches a border at both
 /// ends, floored at 0.
 pub fn brute_ov(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
@@ -152,6 +165,7 @@ pub fn brute(mode: Mode, q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge
         Mode::Sw => brute_sw(q, t, mat, al, go, ge),
         Mode::Hw => brute_hw(q, t, mat, al, go, ge),
         Mode::Ov => brute_ov(q, t, mat, al, go, ge),
+        Mode::Shw => brute_shw(q, t, mat, al, go, ge),
         _ => unreachable!("ALL_MODES covers every mode"),
     }
 }

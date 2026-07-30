@@ -78,8 +78,9 @@ of an optimal *partial* alignment (ending, for `E`/`F`, in a gap), so it is subj
   - `OV` (both ends free): every cell is reachable by a pure diagonal from a `0` border in `≤
     min(m, n)` steps, so `|H| ≤ min(m, n) · |min_entry|`; `E`/`F` add one `gap_open`.
     → `min(m, n) · max(0, −min_entry) + gap_open`.
-  - `NW` / `HW` (a penalised border): a path can accumulate a full mismatch run *and* a full-span
-    gap → `(m + n) · max(0, −min_entry) + gap_open + (m + n − 1) · gap_ext` (over-counts; safe).
+  - `NW` / `HW` / `SHW` (a penalised border): a path can accumulate a full mismatch run *and* a
+    full-span gap → `(m + n) · max(0, −min_entry) + gap_open + (m + n − 1) · gap_ext` (over-counts;
+    safe). `SHW` is the transpose of `HW`, with the same bound.
 
 Getting these bounds *tight* matters: too loose and a workload over-provisions to a wider integer
 and loses SIMD (e.g. the CR4 overlap scan would fall back to scalar under a global-style bound);
