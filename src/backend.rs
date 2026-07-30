@@ -47,15 +47,24 @@ impl Backend {
         }
     }
 
-    /// The SIMD lane count (number of `i8` lanes) for this backend, or `None` for the scalar
-    /// backend, which does not use the inter-sequence lane kernel.
+    /// The SIMD register width in bytes for this backend, or `None` for the scalar backend, which
+    /// does not use the inter-sequence lane kernel.
     #[must_use]
-    pub(crate) fn simd_lanes(self) -> Option<usize> {
+    fn register_bytes(self) -> Option<usize> {
         match self {
             Backend::Scalar => None,
             Backend::Sse41 | Backend::Neon => Some(16),
             Backend::Avx2 => Some(32),
         }
+    }
+
+    /// The SIMD lane count at a given score width: register bytes / element bytes. An `i8` database
+    /// packs twice as many sequences per batch as an `i16` one on the same backend, so the lane
+    /// count — which drives the packing stride and the kernel's `L::LANES` — is width-dependent.
+    /// `None` for the scalar backend.
+    #[must_use]
+    pub(crate) fn simd_lanes(self, width: crate::ScoreWidth) -> Option<usize> {
+        self.register_bytes().map(|bytes| bytes / width.bytes())
     }
 
     /// Whether this backend is implemented and usable on the current build/CPU. Gated on both the

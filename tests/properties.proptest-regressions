@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 36ff6d4912811393bc7f74dc5ac7593dac36e46a337ce9cf1d6e688e395646e0 # shrinks to (s, db_seqs, q) = (Scheme { al: 2, matrix: [0, 0, 0, -5], gap_open: 8, gap_ext: 0 }, [[0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1]], [1, 1, 0, 1, 1])
+cc d32b75b65c9fe3ae7304c611f037ff9693ac01943f9a4ee52aa9cc7702c2157a # shrinks to (s, db_seqs, q) = (Scheme { al: 2, matrix: [0, 0, 11, 0], gap_open: 1, gap_ext: 0 }, [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], [1])

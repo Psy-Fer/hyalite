@@ -34,7 +34,7 @@ use crate::align::{AlignedHit, Alignment};
 use crate::backend::{self, Backend, BackendChoice};
 use crate::error::{Error, Result};
 use crate::hit::BestHit;
-use crate::inter::{self, Layout, LayoutChoice, PackedDb, SimdScratch};
+use crate::inter::{self, Layout, LayoutChoice, Packed, SimdScratch};
 use crate::kernel::{DpBuffers, align_core};
 use crate::mode::Mode;
 use crate::scoring::Scoring;
@@ -54,7 +54,7 @@ pub struct Database {
     width: ScoreWidth,
     backend: Backend,
     /// The database packed for the inter-sequence kernel; `Some` only for a SIMD backend.
-    packed: Option<PackedDb>,
+    packed: Option<Packed>,
 }
 
 impl Database {
@@ -166,11 +166,11 @@ impl Database {
         if self.search_type.tracks_end() {
             let ends_fit_i16 =
                 self.max_query_len <= i16::MAX as usize && self.max_target_len <= i16::MAX as usize;
-            if let Some(packed) = self
-                .packed
-                .as_ref()
-                .filter(|_| inter::backend_tracks_ends(self.backend) && ends_fit_i16)
-            {
+            if let Some(packed) = self.packed.as_ref().filter(|p| {
+                inter::backend_tracks_ends(self.backend)
+                    && ends_fit_i16
+                    && inter::fill_ends_available(p)
+            }) {
                 inter::fill_ends(
                     self.backend,
                     packed,
@@ -214,13 +214,26 @@ impl Database {
                 query,
                 &mut scratch.simd,
             );
-            for (index, &score) in scratch.simd.scores().iter().enumerate() {
+            // The per-target scores land in the width the database resolved to.
+            let push = |out: &mut Vec<BestHit>, index: usize, score: i32| {
                 out.push(BestHit {
-                    score: score as i32,
+                    score,
                     db_index: index,
                     query_end: None,
                     target_end: None,
                 });
+            };
+            match self.width {
+                ScoreWidth::I8 => {
+                    for (index, &score) in scratch.simd.scores().iter().enumerate() {
+                        push(out, index, score as i32);
+                    }
+                }
+                _ => {
+                    for (index, &score) in scratch.simd.scores16().iter().enumerate() {
+                        push(out, index, score as i32);
+                    }
+                }
             }
         } else {
             for (index, seq) in self.sequences.iter().enumerate() {
@@ -342,7 +355,7 @@ impl Database {
     /// The kernel data layout, or `None` for the scalar backend (which does not pack the database).
     #[must_use]
     pub fn layout(&self) -> Option<Layout> {
-        self.packed.as_ref().map(PackedDb::layout)
+        self.packed.as_ref().map(Packed::layout)
     }
 
     /// The maximum query length this database was built for.
@@ -498,11 +511,15 @@ impl DatabaseBuilder {
         };
         let resolved = backend::resolve(choice)?;
 
-        // A SIMD backend is only *usable* for a SIMD-eligible database (i8 width, small alphabet).
-        // If one was auto-selected but the database is ineligible, fall back to scalar; if it was
-        // explicitly forced, that is an error rather than a silent fallback.
-        let applicable = crate::inter::kernel_applies(width, scoring.alphabet_len());
-        let backend = if resolved == Backend::Scalar || applicable {
+        // A SIMD backend is only *usable* for a SIMD-eligible database (an `i8`/`i16` width the
+        // inter-sequence kernel supports, at a layout that fits). If one was auto-selected but the
+        // database is ineligible, fall back to scalar; if it was explicitly forced, that is an error.
+        let layout_choice = self.layout_choice.unwrap_or_default();
+        let plan = resolved.simd_lanes(width).and_then(|lanes| {
+            inter::simd_plan(width, alphabet_len, &sequences, lanes, layout_choice)
+                .map(|layout| (lanes, layout))
+        });
+        let backend = if resolved == Backend::Scalar || plan.is_some() {
             resolved
         } else {
             match choice {
@@ -513,13 +530,21 @@ impl DatabaseBuilder {
             }
         };
 
-        // Pack the database once for the resolved SIMD backend's lane count (query-independent),
-        // in the auto-selected or forced layout.
-        let layout_choice = self.layout_choice.unwrap_or_default();
-        let packed = backend.simd_lanes().map(|lanes| {
-            let layout = inter::choose_layout(&sequences, lanes, alphabet_len, layout_choice);
-            PackedDb::build(&sequences, lanes, layout, &scoring)
-        });
+        // Pack the database once (query-independent) at the proven width, in the planned layout.
+        let packed = if backend == Backend::Scalar {
+            None
+        } else {
+            let (lanes, layout) = plan.expect("a SIMD backend implies a SIMD plan");
+            Some(match width {
+                ScoreWidth::I8 => Packed::I8(inter::PackedDb::<i8>::build(
+                    &sequences, lanes, layout, &scoring,
+                )),
+                ScoreWidth::I16 => Packed::I16(inter::PackedDb::<i16>::build(
+                    &sequences, lanes, layout, &scoring,
+                )),
+                ScoreWidth::I32 => unreachable!("i32 width is never SIMD-eligible"),
+            })
+        };
 
         Ok(Database {
             sequences,
@@ -551,8 +576,13 @@ impl Scratch {
     /// Allocate scratch pre-sized for `db`, so no scan reallocates.
     #[must_use]
     pub fn new(db: &Database) -> Self {
-        let simd = match db.backend().simd_lanes() {
-            Some(lanes) => SimdScratch::new(db.sequence_count(), db.max_target_len(), lanes),
+        let simd = match db.backend().simd_lanes(db.score_width()) {
+            Some(lanes) => SimdScratch::new(
+                db.sequence_count(),
+                db.max_target_len(),
+                lanes,
+                db.score_width(),
+            ),
             None => SimdScratch::empty(),
         };
         Scratch {

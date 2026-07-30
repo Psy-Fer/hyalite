@@ -192,7 +192,9 @@ fn protein_scale_scoring_matches_reference() {
     let max_q = queries.iter().map(Vec::len).max().unwrap();
 
     for mode in ALL_MODES {
-        // Large alphabet ⇒ scalar path; result must still equal best-of-align_pair.
+        // Large alphabet (24 > 16) rules out the byte-shuffle Gathered layout, but a proven-`i16`
+        // width still runs on SIMD via the Precomputed layout; a proven-`i32` width falls back to
+        // scalar. Either way the result must equal best-of-`align_pair`.
         let db = Database::builder()
             .sequences(&seqs)
             .scoring(scoring.clone())
@@ -201,7 +203,9 @@ fn protein_scale_scoring_matches_reference() {
             .max_query_len(max_q)
             .build()
             .unwrap();
-        assert_eq!(db.backend(), Backend::Scalar, "alphabet 24 must use scalar");
+        if db.score_width() == ScoreWidth::I32 {
+            assert_eq!(db.backend(), Backend::Scalar, "i32 width must be scalar");
+        }
         let mut scratch = Scratch::new(&db);
         for q in &queries {
             let got = db.scan(&mut scratch, q);

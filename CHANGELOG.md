@@ -8,6 +8,16 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- `i16`-width database scan on SIMD: the inter-sequence kernel now runs at `i16` (SSE4.1 → 8 lanes,
+  AVX2 → 16 lanes, NEON → 8 lanes) via the Precomputed layout, so databases whose score proof
+  exceeds `i8` — long reads, large-magnitude matrices, and any alphabet larger than 16 (which the
+  byte-shuffle Gathered gather cannot serve) — are SIMD-accelerated instead of falling back to
+  scalar. `PackedDb`/`Database` carry the packed database at whichever width the proof selected
+  (`i8` or `i16`), and the lane count is width-aware (register bytes ÷ element bytes). Bit-identical
+  to the scalar oracle across every backend, mode, and both search types (`ScoreEnd` recovers the
+  winner's ends with one scalar re-alignment; in-vector end tracking stays `i8`-only for now).
+  Measured on a 64-target × 2000-read `i16` `SW` scan: ~15× (SSE4.1) and ~26× (AVX2) over scalar.
+
 - `Database::scan_all`: the per-target counterpart to `scan`, writing one `BestHit` per database
   sequence (in `db_index` order) into a caller-provided `Vec<BestHit>` (cleared and reused, so no
   per-call allocation). Per-target scores are SIMD-accelerated via a new `fill_scores` kernel path.

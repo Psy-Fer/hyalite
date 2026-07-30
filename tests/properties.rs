@@ -200,6 +200,18 @@ fn scheme_db_query() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<u8>)> {
     })
 }
 
+/// Like [`scheme_db_query`] but with wide matrix entries, so many schemes prove to `i16` width and
+/// exercise the `i16` inter-sequence kernel. `12`-long perfect matches at `80`/cell reach `960`,
+/// well past the `i8` range but inside `i16`; the tests filter to the modes that actually prove
+/// `i16` (`i8` is covered by [`scan_identical_across_simd_backends`], `i32` stays scalar).
+fn scheme_db_query_wide() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<u8>)> {
+    scheme(4, -80..=80).prop_flat_map(|s| {
+        let al = s.al;
+        let db = prop::collection::vec(seq(al, 12), 1..=6);
+        (Just(s), db, seq(al, 12))
+    })
+}
+
 proptest! {
     /// `Database::scan` equals the best `align_pair` over the database with the smallest-index
     /// tie-break, for random databases, queries, modes, and search types.
@@ -296,6 +308,49 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// The determinism contract at `i16` width: for every database whose proof selects `i16`, each
+    /// available SIMD backend (SSE4.1 → 8 lanes, AVX2 → 16 lanes) yields the exact same `BestHit`
+    /// as scalar — across all modes and both search types. Only the Precomputed layout applies at
+    /// `i16` (the byte-shuffle Gathered gather is `i8`-specific). This is the regression guard for
+    /// the `i16` inter-sequence kernel; its absence let a lane-count/width mismatch reach a build.
+    /// Skipped on CPUs with no SIMD backend.
+    #[test]
+    fn scan_identical_across_simd_backends_i16((s, db_seqs, q) in scheme_db_query_wide()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
+            return Ok(()); // no SIMD backend on this CPU; nothing to compare
+        }
+        let scoring = s.scoring();
+        let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
+
+        for mode in ALL_MODES {
+            // Target the `i16` kernel specifically; `i8` and `i32` are covered elsewhere.
+            if scoring.required_width(mode, 12, max_t).unwrap() != ScoreWidth::I16 {
+                continue;
+            }
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let scalar = scan_forced(
+                    Backend::Scalar, LayoutChoice::Auto, &db_seqs, &scoring, mode, st, &q,
+                );
+                for &b in &simd {
+                    let got = scan_forced(
+                        b, LayoutChoice::Force(Layout::Precomputed), &db_seqs, &scoring, mode, st, &q,
+                    );
+                    prop_assert_eq!(
+                        got, scalar, "i16 {}/Precomputed disagrees with scalar for {} {}", b, mode, st
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-target scan_all
 // ---------------------------------------------------------------------------
@@ -357,6 +412,67 @@ proptest! {
                     prop_assert_eq!(&out, &want, "scan_all {} {} {}", b, mode, st);
                     let hit = db.scan(&mut scratch, &q);
                     prop_assert_eq!(hit, want_best, "scan vs best-of-scan_all {} {} {}", b, mode, st);
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// `scan_all` at `i16` width: one hit per database sequence (in order), each bit-identical to
+    /// `align_pair`, on every available SIMD backend (Precomputed layout only) and both search
+    /// types — plus `scan` equal to the smallest-index best. The `i16` per-target `fill_scores`
+    /// path, distinct from the single-best `scan` path above.
+    #[test]
+    fn scan_all_matches_per_sequence_and_scan_i16((s, db_seqs, q) in scheme_db_query_wide()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
+            return Ok(());
+        }
+        let scoring = s.scoring();
+        let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
+
+        for mode in ALL_MODES {
+            if scoring.required_width(mode, 12, max_t).unwrap() != ScoreWidth::I16 {
+                continue;
+            }
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let want: Vec<BestHit> = db_seqs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, seq)| BestHit {
+                        db_index: i,
+                        ..align_pair(&q, seq, &scoring, mode, st).unwrap()
+                    })
+                    .collect();
+                let want_best = want
+                    .iter()
+                    .copied()
+                    .reduce(|a, c| if c.score > a.score { c } else { a })
+                    .unwrap();
+
+                for &b in &simd {
+                    let db = Database::builder()
+                        .sequences(&db_seqs)
+                        .scoring(scoring.clone())
+                        .mode(mode)
+                        .search_type(st)
+                        .max_query_len(12)
+                        .backend(BackendChoice::Force(b))
+                        .layout(LayoutChoice::Force(Layout::Precomputed))
+                        .build()
+                        .unwrap();
+                    let mut scratch = Scratch::new(&db);
+                    let mut out = Vec::new();
+                    db.scan_all(&mut scratch, &q, &mut out);
+                    prop_assert_eq!(&out, &want, "i16 scan_all {} {} {}", b, mode, st);
+                    let hit = db.scan(&mut scratch, &q);
+                    prop_assert_eq!(hit, want_best, "i16 scan vs best {} {} {}", b, mode, st);
                 }
             }
         }
