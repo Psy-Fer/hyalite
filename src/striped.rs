@@ -6,58 +6,72 @@
 //! horizontally-vectorised inner loop plus Farrar's "lazy-F" correction for the cross-lane
 //! vertical-gap dependency.
 //!
-//! The algorithm was first proven on a scalar stand-in (`ScalarStriped<N>`, kept under
+//! The algorithm was first proven on a scalar stand-in (`ScalarStriped<E, N>`, kept under
 //! `#[cfg(test)]`), exactly as the in-vector ScoreEnd work was proven on `ScalarLanes` before any
 //! intrinsics. The real SSE4.1 (x86-64) and NEON (aarch64) backends implement the same
-//! [`StripedLanes`] surface and run the same generic [`farrar_score`], so both are bit-identical to
-//! the scalar oracle.
+//! [`StripedLanes`] surface — at both `i8` (16 lanes) and `i16` (8 lanes) — and run the same
+//! generic [`farrar_score`], so every backend and width is bit-identical to the scalar oracle.
 //!
-//! Scope: **`Score`** for all four modes, `i8` width. `SW` clamps at `0`, so its lazy-F stops the
-//! moment the carried F decays to `<= 0`; the non-clamped modes (`NW`/`HW`/`OV`) instead stop once
-//! the carried F decays below the (fixed) minimum valid `H`, since `H` only rises during the loop.
-//! `ScoreEnd`/`Alignment`/wider widths stay on the scalar path — striped end-position tracking is a
-//! separate concern, and the single-pair path is not the throughput-critical one (that is the
+//! Scope: **`Score`** for all five modes, at whichever of `i8`/`i16` the width proof selects (the
+//! same saturating model, one width up; `i32` stays scalar). `SW` clamps at `0`, so its lazy-F
+//! stops the moment the carried F decays to `<= 0`; the non-clamped modes (`NW`/`HW`/`OV`/`SHW`)
+//! instead stop once the carried F decays below the (fixed) minimum valid `H`, since `H` only rises
+//! during the loop. `ScoreEnd`/`Alignment` stay on the scalar path — striped end-position tracking
+//! is a separate concern, and the single-pair path is not the throughput-critical one (that is the
 //! batched database scan).
 
 use crate::kernel::{Flags, gap_penalty};
 use crate::mode::Mode;
 use crate::scoring::Scoring;
 
-/// The `-∞` sentinel at i8 width, matching the scalar kernel's `NEG` for unreachable `E`/`F`
-/// cells. Saturating subtraction keeps it pinned, so it behaves as a true floor.
-const NEG8: i8 = i8::MIN;
-
-/// Saturating cast of an `i32` score into `i8` (never wraps; see the profile note below).
+/// Saturating cast of an `i32` score into `i8`/`i16` (clamps, never wraps; see the profile note in
+/// [`farrar_score`]). Used by the backends' `StripedLanes::sat`.
 #[inline(always)]
 fn sat_i8(v: i32) -> i8 {
     v.clamp(i8::MIN as i32, i8::MAX as i32) as i8
 }
+#[inline(always)]
+fn sat_i16(v: i32) -> i16 {
+    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
 
-/// The lane operations the striped kernel needs. Implemented by SSE4.1 / NEON with intrinsics and,
-/// under test, by a scalar array stand-in.
+/// The lane operations the striped kernel needs, generic over the element width (`i8` or `i16`).
+/// Implemented by SSE4.1 / NEON with intrinsics and, under test, by a scalar array stand-in. The
+/// arithmetic model is identical at every width — signed saturating, `Elem::MIN` as the `-∞`
+/// sentinel — so a kernel run at one width is bit-identical to the scalar oracle for inputs the
+/// width proof admits.
 trait StripedLanes {
-    /// Number of query stripes processed in parallel.
+    /// Number of lanes processed in parallel.
     const LANES: usize;
-    /// The vector type: `LANES` packed `i8` lanes.
+    /// The lane element (`i8` or `i16`).
+    type Elem: Copy + Ord;
+    /// The vector type: `LANES` packed `Elem` lanes.
     type V: Copy;
+    /// The `-∞` sentinel (`Elem::MIN`), pinned by saturating subtraction.
+    const NEG: Self::Elem;
 
-    fn splat(v: i8) -> Self::V;
-    /// Saturating signed `i8` addition, lane-wise.
+    /// Saturating cast of an `i32` score into `Elem` (clamps, never wraps).
+    fn sat(v: i32) -> Self::Elem;
+    /// Widen an `Elem` back to `i32` for the scalar answer reduction.
+    fn to_i32(e: Self::Elem) -> i32;
+
+    fn splat(v: Self::Elem) -> Self::V;
+    /// Saturating signed addition, lane-wise.
     fn adds(a: Self::V, b: Self::V) -> Self::V;
-    /// Saturating signed `i8` subtraction, lane-wise.
+    /// Saturating signed subtraction, lane-wise.
     fn subs(a: Self::V, b: Self::V) -> Self::V;
     fn max(a: Self::V, b: Self::V) -> Self::V;
     /// Shift lanes up by one (`out[l] = in[l-1]`), inserting `insert` at lane 0. This is the
-    /// cross-stripe carry (`_mm_slli_si128(v, 1)` with a lane-0 insert on x86).
-    fn shift_up(v: Self::V, insert: i8) -> Self::V;
+    /// cross-stripe carry (`_mm_slli_si128(v, size_of::<Elem>())` with a lane-0 insert on x86).
+    fn shift_up(v: Self::V, insert: Self::Elem) -> Self::V;
     /// Horizontal maximum across all lanes.
-    fn hmax(v: Self::V) -> i8;
+    fn hmax(v: Self::V) -> Self::Elem;
     /// Horizontal minimum across all lanes.
-    fn hmin(v: Self::V) -> i8;
+    fn hmin(v: Self::V) -> Self::Elem;
     /// Whether any lane of `a` is strictly greater than the matching lane of `b`.
     fn any_gt(a: Self::V, b: Self::V) -> bool;
-    fn load(src: &[i8]) -> Self::V;
-    fn store(v: Self::V, dst: &mut [i8]);
+    fn load(src: &[Self::Elem]) -> Self::V;
+    fn store(v: Self::V, dst: &mut [Self::Elem]);
 }
 
 /// Striped **score** for one query/target pair, in the saturating `i8` model, for any mode's
@@ -80,20 +94,21 @@ fn farrar_score<L: StripedLanes>(
     let tlen = target.len();
     let seg = qlen.div_ceil(p);
     let (go_i, ge_i) = (scoring.gap_open(), scoring.gap_ext());
-    let (go, ge) = (go_i as i8, ge_i as i8);
     let al = scoring.alphabet_len();
+    let neg = L::NEG;
+    let zero_e = L::sat(0);
 
-    // Query profile, striped: profile[t][v*p + l] = score(query[l*seg + v], t), or NEG8 for the
-    // padding lanes. Entries are **saturated** into `i8`: `SW`'s width proof bounds the score
-    // magnitude but not `|min_entry|`, so a mismatch below `-127` must clamp (not wrap) — it then
-    // drives `H` to the `0` floor exactly as the i32 oracle does.
-    let mut profile = vec![NEG8; al * seg * p];
+    // Query profile, striped: profile[t][v*p + l] = score(query[l*seg + v], t), or NEG for the
+    // padding lanes. Entries are **saturated** into `Elem`: `SW`'s width proof bounds the score
+    // magnitude but not `|min_entry|`, so a mismatch below the width's floor must clamp (not wrap) —
+    // it then drives `H` to the `0` floor exactly as the i32 oracle does.
+    let mut profile = vec![neg; al * seg * p];
     for (t, chunk) in profile.chunks_mut(seg * p).enumerate() {
         for v in 0..seg {
             for l in 0..p {
                 let qpos = l * seg + v;
                 if qpos < qlen {
-                    chunk[v * p + l] = sat_i8(scoring.score(query[qpos] as usize, t));
+                    chunk[v * p + l] = L::sat(scoring.score(query[qpos] as usize, t));
                 }
             }
         }
@@ -103,9 +118,9 @@ fn farrar_score<L: StripedLanes>(
     let idx = |pos: usize| (pos % seg) * p + pos / seg;
     let last_row = idx(qlen - 1);
 
-    let mut h_store = vec![0i8; seg * p]; // H[*][j]
-    let mut h_load = vec![0i8; seg * p]; //  H[*][j-1]
-    let mut e = vec![NEG8; seg * p]; //      E[*][j]   (padding lanes stay at the -inf sentinel)
+    let mut h_store = vec![zero_e; seg * p]; // H[*][j]
+    let mut h_load = vec![zero_e; seg * p]; //  H[*][j-1]
+    let mut e = vec![neg; seg * p]; //          E[*][j]   (padding lanes stay at the -inf sentinel)
     // Column-0 borders per query position: the left-column `H[i][0]` (`0` when free, else a
     // penalised gap of length `i = pos + 1`) and the matching `E[i][1] = H[i][0] - gap_open`
     // (opening a horizontal gap from that border; the extend term is `-inf`).
@@ -115,27 +130,28 @@ fn farrar_score<L: StripedLanes>(
         } else {
             -gap_penalty(go_i, ge_i, pos + 1)
         };
-        h_store[idx(pos)] = sat_i8(border);
-        e[idx(pos)] = sat_i8(border - go_i);
+        h_store[idx(pos)] = L::sat(border);
+        e[idx(pos)] = L::sat(border - go_i);
     }
 
-    let vgo = L::splat(go);
-    let vge = L::splat(ge);
-    let zero = L::splat(0);
+    let vgo = L::splat(L::sat(go_i));
+    let vge = L::splat(L::sat(ge_i));
+    let zero = L::splat(zero_e);
     let mut vmax = zero; // SW: the answer is the max over all cells
     // HW/OV last row includes the left-border cell `H[m][0]` (`j = 0`), which is exactly the
     // initial last-row entry before any target column is processed.
-    let mut row_best = h_store[last_row] as i32;
+    let mut row_best = L::to_i32(h_store[last_row]);
 
     // Non-local threshold mask: `MAX` at padding lanes, `MIN` at valid lanes, so `max(H, pad_hi)`
     // lifts padding out of the `hmin` reduction without touching `h_store` (padding is naturally
-    // driven very negative by its `NEG8` profile, so it never inflates the F reduction either).
-    let pad_hi: Vec<i8> = if flags.local {
+    // driven very negative by its `NEG` profile, so it never inflates the F reduction either).
+    let pad_max = L::sat(i32::MAX);
+    let pad_hi: Vec<L::Elem> = if flags.local {
         Vec::new()
     } else {
-        let mut m = vec![i8::MIN; seg * p];
+        let mut m = vec![neg; seg * p];
         for pos in qlen..seg * p {
-            m[idx(pos)] = i8::MAX;
+            m[idx(pos)] = pad_max;
         }
         m
     };
@@ -146,9 +162,9 @@ fn farrar_score<L: StripedLanes>(
         // Diagonal seed: `H[*][j-1]` of the last stripe, shifted up with the top-left border cell
         // `H[0][j-1]` — `0` when the top row is free, else the penalised leading-target gap.
         let seed = if flags.top_row_free {
-            0
+            zero_e
         } else {
-            sat_i8(-gap_penalty(go_i, ge_i, c))
+            L::sat(-gap_penalty(go_i, ge_i, c))
         };
         let mut vh = L::shift_up(L::load(&h_store[(seg - 1) * p..]), seed);
         core::mem::swap(&mut h_store, &mut h_load);
@@ -160,7 +176,7 @@ fn farrar_score<L: StripedLanes>(
         } else {
             -gap_penalty(go_i, ge_i, c + 1)
         };
-        let mut vf = L::shift_up(L::splat(NEG8), sat_i8(top_next - go_i));
+        let mut vf = L::shift_up(L::splat(neg), L::sat(top_next - go_i));
 
         for v in 0..seg {
             vh = L::adds(vh, L::load(&prof[v * p..])); // H[i-1][j-1] + score
@@ -183,7 +199,7 @@ fn farrar_score<L: StripedLanes>(
             // stop once it has decayed to `<= 0` everywhere. (Farrar's tighter `F <= H - gap_open`
             // test is unsafe for linear gaps `gap_open == gap_ext`.) Shifting in `0` is inert here.
             for _ in 0..p {
-                vf = L::shift_up(vf, 0);
+                vf = L::shift_up(vf, zero_e);
                 for v in 0..seg {
                     let vh = L::max(L::load(&h_store[v * p..]), vf);
                     L::store(vh, &mut h_store[v * p..]);
@@ -199,14 +215,14 @@ fn farrar_score<L: StripedLanes>(
             // can raise `H[pos]` only while it exceeds `H[pos]`; `H` only rises during the lazy-F,
             // so once the largest active F has decayed below the (fixed) minimum *valid* `H`, no
             // future shift can change anything. Inactive columns — almost all of them — break after
-            // a single pass; the `NEG8` insert keeps a fresh F out of lane 0. `p` shifts is the cap.
-            let mut hmin = i8::MAX;
+            // a single pass; the `NEG` insert keeps a fresh F out of lane 0. `p` shifts is the cap.
+            let mut hmin = pad_max;
             for v in 0..seg {
                 let masked = L::max(L::load(&h_store[v * p..]), L::load(&pad_hi[v * p..]));
                 hmin = hmin.min(L::hmin(masked));
             }
             for _ in 0..p {
-                vf = L::shift_up(vf, NEG8);
+                vf = L::shift_up(vf, neg);
                 for v in 0..seg {
                     let vh = L::max(L::load(&h_store[v * p..]), vf);
                     L::store(vh, &mut h_store[v * p..]);
@@ -227,17 +243,17 @@ fn farrar_score<L: StripedLanes>(
         }
 
         if flags.answer_last_row {
-            row_best = row_best.max(h_store[last_row] as i32);
+            row_best = row_best.max(L::to_i32(h_store[last_row]));
         }
     }
 
     if flags.local {
-        return L::hmax(vmax) as i32;
+        return L::to_i32(L::hmax(vmax));
     }
     // Corner `H[m][n]` is always in the answer region; add the last row (HW/OV) and, for OV, the
     // last column (`H[i][n]`, `i = 0..=m`). The `i = 0` cell of the last column is the top border
     // `H[0][n]`; all real rows are read over valid positions only (padding never contributes).
-    let mut best = h_store[last_row] as i32; // corner
+    let mut best = L::to_i32(h_store[last_row]); // corner
     if flags.answer_last_row {
         best = best.max(row_best);
     }
@@ -245,11 +261,11 @@ fn farrar_score<L: StripedLanes>(
         let top = if flags.top_row_free {
             0
         } else {
-            sat_i8(-gap_penalty(go_i, ge_i, tlen)) as i32
+            L::to_i32(L::sat(-gap_penalty(go_i, ge_i, tlen)))
         };
         best = best.max(top);
         for pos in 0..qlen {
-            best = best.max(h_store[idx(pos)] as i32);
+            best = best.max(L::to_i32(h_store[idx(pos)]));
         }
     }
     best
@@ -268,14 +284,15 @@ pub(crate) fn farrar_score_simd(
     target: &[u8],
     scoring: &Scoring,
     mode: Mode,
+    width: crate::width::ScoreWidth,
 ) -> Option<i32> {
     #[cfg(target_arch = "x86_64")]
     {
-        x86::score(query, target, scoring, mode)
+        x86::score(query, target, scoring, mode, width)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        Some(arm::score(query, target, scoring, mode))
+        arm::score(query, target, scoring, mode, width)
     }
 }
 
@@ -288,6 +305,7 @@ mod x86 {
     use super::{StripedLanes, farrar_mode};
     use crate::mode::Mode;
     use crate::scoring::Scoring;
+    use crate::width::ScoreWidth;
     use core::arch::x86_64::*;
 
     #[derive(Clone, Copy)]
@@ -295,8 +313,18 @@ mod x86 {
 
     impl StripedLanes for Striped128 {
         const LANES: usize = 16;
+        type Elem = i8;
         type V = __m128i;
+        const NEG: i8 = i8::MIN;
 
+        #[inline(always)]
+        fn sat(v: i32) -> i8 {
+            super::sat_i8(v)
+        }
+        #[inline(always)]
+        fn to_i32(e: i8) -> i32 {
+            e as i32
+        }
         #[inline(always)]
         fn splat(v: i8) -> __m128i {
             unsafe { _mm_set1_epi8(v) }
@@ -353,16 +381,102 @@ mod x86 {
         }
     }
 
+    /// SSE4.1 backend at `i16`: 8 lanes per `__m128i`. Same DP, one width up.
+    #[derive(Clone, Copy)]
+    pub(super) struct Striped128I16;
+
+    impl StripedLanes for Striped128I16 {
+        const LANES: usize = 8;
+        type Elem = i16;
+        type V = __m128i;
+        const NEG: i16 = i16::MIN;
+
+        #[inline(always)]
+        fn sat(v: i32) -> i16 {
+            super::sat_i16(v)
+        }
+        #[inline(always)]
+        fn to_i32(e: i16) -> i32 {
+            e as i32
+        }
+        #[inline(always)]
+        fn splat(v: i16) -> __m128i {
+            unsafe { _mm_set1_epi16(v) }
+        }
+        #[inline(always)]
+        fn adds(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_adds_epi16(a, b) }
+        }
+        #[inline(always)]
+        fn subs(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_subs_epi16(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_max_epi16(a, b) }
+        }
+        #[inline(always)]
+        fn shift_up(v: __m128i, insert: i16) -> __m128i {
+            unsafe { _mm_insert_epi16::<0>(_mm_slli_si128::<2>(v), insert as i32) }
+        }
+        #[inline(always)]
+        fn hmax(v: __m128i) -> i16 {
+            unsafe {
+                let v = _mm_max_epi16(v, _mm_srli_si128::<8>(v));
+                let v = _mm_max_epi16(v, _mm_srli_si128::<4>(v));
+                let v = _mm_max_epi16(v, _mm_srli_si128::<2>(v));
+                _mm_extract_epi16::<0>(v) as i16
+            }
+        }
+        #[inline(always)]
+        fn hmin(v: __m128i) -> i16 {
+            unsafe {
+                let v = _mm_min_epi16(v, _mm_srli_si128::<8>(v));
+                let v = _mm_min_epi16(v, _mm_srli_si128::<4>(v));
+                let v = _mm_min_epi16(v, _mm_srli_si128::<2>(v));
+                _mm_extract_epi16::<0>(v) as i16
+            }
+        }
+        #[inline(always)]
+        fn any_gt(a: __m128i, b: __m128i) -> bool {
+            unsafe { _mm_movemask_epi8(_mm_cmpgt_epi16(a, b)) != 0 }
+        }
+        #[inline(always)]
+        fn load(src: &[i16]) -> __m128i {
+            debug_assert!(src.len() >= 8);
+            unsafe { _mm_loadu_si128(src.as_ptr().cast()) }
+        }
+        #[inline(always)]
+        fn store(v: __m128i, dst: &mut [i16]) {
+            debug_assert!(dst.len() >= 8);
+            unsafe { _mm_storeu_si128(dst.as_mut_ptr().cast(), v) }
+        }
+    }
+
     #[target_feature(enable = "sse4.1")]
-    unsafe fn run(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
+    unsafe fn run_i8(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
         farrar_mode::<Striped128>(query, target, scoring, mode)
     }
 
-    pub(super) fn score(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> Option<i32> {
-        if std::is_x86_feature_detected!("sse4.1") {
-            Some(unsafe { run(query, target, scoring, mode) })
-        } else {
-            None
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run_i16(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
+        farrar_mode::<Striped128I16>(query, target, scoring, mode)
+    }
+
+    pub(super) fn score(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        mode: Mode,
+        width: ScoreWidth,
+    ) -> Option<i32> {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return None;
+        }
+        match width {
+            ScoreWidth::I8 => Some(unsafe { run_i8(query, target, scoring, mode) }),
+            ScoreWidth::I16 => Some(unsafe { run_i16(query, target, scoring, mode) }),
+            ScoreWidth::I32 => None,
         }
     }
 }
@@ -375,6 +489,7 @@ mod arm {
     use super::{StripedLanes, farrar_mode};
     use crate::mode::Mode;
     use crate::scoring::Scoring;
+    use crate::width::ScoreWidth;
     use core::arch::aarch64::*;
 
     #[derive(Clone, Copy)]
@@ -382,8 +497,18 @@ mod arm {
 
     impl StripedLanes for StripedNeon {
         const LANES: usize = 16;
+        type Elem = i8;
         type V = int8x16_t;
+        const NEG: i8 = i8::MIN;
 
+        #[inline(always)]
+        fn sat(v: i32) -> i8 {
+            super::sat_i8(v)
+        }
+        #[inline(always)]
+        fn to_i32(e: i8) -> i32 {
+            e as i32
+        }
         #[inline(always)]
         fn splat(v: i8) -> int8x16_t {
             unsafe { vdupq_n_s8(v) }
@@ -429,8 +554,81 @@ mod arm {
         }
     }
 
-    pub(super) fn score(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
-        farrar_mode::<StripedNeon>(query, target, scoring, mode)
+    /// NEON backend at `i16`: 8 lanes per `int16x8_t`.
+    #[derive(Clone, Copy)]
+    pub(super) struct StripedNeonI16;
+
+    impl StripedLanes for StripedNeonI16 {
+        const LANES: usize = 8;
+        type Elem = i16;
+        type V = int16x8_t;
+        const NEG: i16 = i16::MIN;
+
+        #[inline(always)]
+        fn sat(v: i32) -> i16 {
+            super::sat_i16(v)
+        }
+        #[inline(always)]
+        fn to_i32(e: i16) -> i32 {
+            e as i32
+        }
+        #[inline(always)]
+        fn splat(v: i16) -> int16x8_t {
+            unsafe { vdupq_n_s16(v) }
+        }
+        #[inline(always)]
+        fn adds(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+            unsafe { vqaddq_s16(a, b) }
+        }
+        #[inline(always)]
+        fn subs(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+            unsafe { vqsubq_s16(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+            unsafe { vmaxq_s16(a, b) }
+        }
+        #[inline(always)]
+        fn shift_up(v: int16x8_t, insert: i16) -> int16x8_t {
+            // out = [insert, v0, .., v6]
+            unsafe { vextq_s16::<7>(vdupq_n_s16(insert), v) }
+        }
+        #[inline(always)]
+        fn hmax(v: int16x8_t) -> i16 {
+            unsafe { vmaxvq_s16(v) }
+        }
+        #[inline(always)]
+        fn hmin(v: int16x8_t) -> i16 {
+            unsafe { vminvq_s16(v) }
+        }
+        #[inline(always)]
+        fn any_gt(a: int16x8_t, b: int16x8_t) -> bool {
+            unsafe { vmaxvq_u16(vcgtq_s16(a, b)) != 0 }
+        }
+        #[inline(always)]
+        fn load(src: &[i16]) -> int16x8_t {
+            debug_assert!(src.len() >= 8);
+            unsafe { vld1q_s16(src.as_ptr()) }
+        }
+        #[inline(always)]
+        fn store(v: int16x8_t, dst: &mut [i16]) {
+            debug_assert!(dst.len() >= 8);
+            unsafe { vst1q_s16(dst.as_mut_ptr(), v) }
+        }
+    }
+
+    pub(super) fn score(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        mode: Mode,
+        width: ScoreWidth,
+    ) -> Option<i32> {
+        match width {
+            ScoreWidth::I8 => Some(farrar_mode::<StripedNeon>(query, target, scoring, mode)),
+            ScoreWidth::I16 => Some(farrar_mode::<StripedNeonI16>(query, target, scoring, mode)),
+            ScoreWidth::I32 => None,
+        }
     }
 }
 
@@ -442,42 +640,89 @@ mod tests {
     use crate::scoring::Scoring;
     use proptest::prelude::*;
 
-    /// Scalar stand-in: a `[i8; N]` "vector". Validates the algorithm with no intrinsics, and lets
-    /// the differential run at lane counts the hardware backends do not use (1, 2, 4, 8).
-    struct ScalarStriped<const N: usize>;
+    /// A test element width (`i8` or `i16`) for the scalar stand-in.
+    trait SElem: Copy + Ord {
+        const MIN: Self;
+        fn sat(v: i32) -> Self;
+        fn to_i32(self) -> i32;
+        fn sadd(self, o: Self) -> Self;
+        fn ssub(self, o: Self) -> Self;
+    }
+    impl SElem for i8 {
+        const MIN: i8 = i8::MIN;
+        fn sat(v: i32) -> i8 {
+            super::sat_i8(v)
+        }
+        fn to_i32(self) -> i32 {
+            self as i32
+        }
+        fn sadd(self, o: i8) -> i8 {
+            self.saturating_add(o)
+        }
+        fn ssub(self, o: i8) -> i8 {
+            self.saturating_sub(o)
+        }
+    }
+    impl SElem for i16 {
+        const MIN: i16 = i16::MIN;
+        fn sat(v: i32) -> i16 {
+            super::sat_i16(v)
+        }
+        fn to_i32(self) -> i32 {
+            self as i32
+        }
+        fn sadd(self, o: i16) -> i16 {
+            self.saturating_add(o)
+        }
+        fn ssub(self, o: i16) -> i16 {
+            self.saturating_sub(o)
+        }
+    }
 
-    impl<const N: usize> StripedLanes for ScalarStriped<N> {
+    /// Scalar stand-in: a `[E; N]` "vector". Validates the generic algorithm with no intrinsics at
+    /// both element widths and at lane counts the hardware backends do not use (1, 2, 4, 8).
+    struct ScalarStriped<E, const N: usize>(core::marker::PhantomData<E>);
+
+    impl<E: SElem, const N: usize> StripedLanes for ScalarStriped<E, N> {
         const LANES: usize = N;
-        type V = [i8; N];
+        type Elem = E;
+        type V = [E; N];
+        const NEG: E = E::MIN;
 
-        fn splat(v: i8) -> [i8; N] {
+        fn sat(v: i32) -> E {
+            E::sat(v)
+        }
+        fn to_i32(e: E) -> i32 {
+            e.to_i32()
+        }
+        fn splat(v: E) -> [E; N] {
             [v; N]
         }
-        fn adds(a: [i8; N], b: [i8; N]) -> [i8; N] {
-            core::array::from_fn(|i| a[i].saturating_add(b[i]))
+        fn adds(a: [E; N], b: [E; N]) -> [E; N] {
+            core::array::from_fn(|i| a[i].sadd(b[i]))
         }
-        fn subs(a: [i8; N], b: [i8; N]) -> [i8; N] {
-            core::array::from_fn(|i| a[i].saturating_sub(b[i]))
+        fn subs(a: [E; N], b: [E; N]) -> [E; N] {
+            core::array::from_fn(|i| a[i].ssub(b[i]))
         }
-        fn max(a: [i8; N], b: [i8; N]) -> [i8; N] {
+        fn max(a: [E; N], b: [E; N]) -> [E; N] {
             core::array::from_fn(|i| a[i].max(b[i]))
         }
-        fn shift_up(v: [i8; N], insert: i8) -> [i8; N] {
+        fn shift_up(v: [E; N], insert: E) -> [E; N] {
             core::array::from_fn(|i| if i == 0 { insert } else { v[i - 1] })
         }
-        fn hmax(v: [i8; N]) -> i8 {
-            v.into_iter().max().unwrap_or(NEG8)
+        fn hmax(v: [E; N]) -> E {
+            v.into_iter().max().unwrap_or(E::MIN)
         }
-        fn hmin(v: [i8; N]) -> i8 {
-            v.into_iter().min().unwrap_or(i8::MAX)
+        fn hmin(v: [E; N]) -> E {
+            v.into_iter().min().unwrap_or(E::MIN)
         }
-        fn any_gt(a: [i8; N], b: [i8; N]) -> bool {
+        fn any_gt(a: [E; N], b: [E; N]) -> bool {
             (0..N).any(|i| a[i] > b[i])
         }
-        fn load(src: &[i8]) -> [i8; N] {
+        fn load(src: &[E]) -> [E; N] {
             core::array::from_fn(|i| src[i])
         }
-        fn store(v: [i8; N], dst: &mut [i8]) {
+        fn store(v: [E; N], dst: &mut [E]) {
             dst[..N].copy_from_slice(&v);
         }
     }
@@ -490,9 +735,9 @@ mod tests {
         v
     }
 
-    /// Scorings whose SW scores stay comfortably inside `i8` for short sequences. The last one has
-    /// a mismatch below `-127` — legal for `SW` (its i8 width bound is `gap_open`), and the reason
-    /// the profile must saturate rather than wrap.
+    /// A spread of scorings. Several stay inside `i8` for short sequences; the high-match one
+    /// (`+20`) crosses into `i16` past ~7 aligned columns, and the `-200` mismatch (legal for `SW`,
+    /// whose i8 bound is `gap_open`) is why the profile must saturate rather than wrap.
     fn scorings() -> Vec<Scoring> {
         vec![
             Scoring::new(4, id_matrix(4, 2, -1), 2, 1).unwrap(),
@@ -500,58 +745,59 @@ mod tests {
             Scoring::new(4, id_matrix(4, 1, -1), 1, 1).unwrap(),
             Scoring::new(4, id_matrix(4, 5, -4), 6, 3).unwrap(),
             Scoring::new(4, id_matrix(4, 2, -200), 2, 1).unwrap(),
+            Scoring::new(4, id_matrix(4, 20, -5), 8, 2).unwrap(), // crosses into i16
         ]
     }
 
     const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
-    /// The striped kernel realises the DP in `i8`; it matches the oracle exactly only where the
-    /// width proof says `i8` suffices — which is precisely where `align_pair` uses it. Returns
-    /// `true` when the case is in scope (non-empty and provably `i8`).
-    fn in_scope(q: &[u8], t: &[u8], s: &Scoring, mode: Mode) -> bool {
-        !q.is_empty()
-            && !t.is_empty()
-            && matches!(
-                s.required_width(mode, q.len(), t.len()),
-                Ok(crate::ScoreWidth::I8)
-            )
+    /// The striped kernel realises the DP in the proven width; it matches the oracle exactly where
+    /// the width proof says `i8` or `i16` suffices — precisely where `align_pair` uses it. Returns
+    /// that width for an in-scope (non-empty, `i8`/`i16`) case, else `None`.
+    fn scope_width(q: &[u8], t: &[u8], s: &Scoring, mode: Mode) -> Option<crate::ScoreWidth> {
+        if q.is_empty() || t.is_empty() {
+            return None;
+        }
+        match s.required_width(mode, q.len(), t.len()) {
+            Ok(w @ (crate::ScoreWidth::I8 | crate::ScoreWidth::I16)) => Some(w),
+            _ => None,
+        }
     }
 
-    /// Every lane count (scalar stand-in) and, where available, the hardware backend all agree with
-    /// the oracle, for every mode the case is in scope for.
+    /// Every lane count (scalar stand-in, at the proven width) and, where available, the hardware
+    /// backend all agree with the oracle, for every mode the case is in scope for.
     fn assert_matches_oracle(q: &[u8], t: &[u8], s: &Scoring) {
         for mode in ALL_MODES {
-            if !in_scope(q, t, s, mode) {
+            let Some(width) = scope_width(q, t, s, mode) else {
                 continue;
-            }
+            };
             let want = align_core(q, t, s, mode, &mut DpBuffers::new()).0;
-            assert_eq!(
-                farrar_mode::<ScalarStriped<1>>(q, t, s, mode),
-                want,
-                "N=1 {mode} q={q:?} t={t:?}"
-            );
-            assert_eq!(
-                farrar_mode::<ScalarStriped<2>>(q, t, s, mode),
-                want,
-                "N=2 {mode} q={q:?} t={t:?}"
-            );
-            assert_eq!(
-                farrar_mode::<ScalarStriped<4>>(q, t, s, mode),
-                want,
-                "N=4 {mode} q={q:?} t={t:?}"
-            );
-            assert_eq!(
-                farrar_mode::<ScalarStriped<8>>(q, t, s, mode),
-                want,
-                "N=8 {mode} q={q:?} t={t:?}"
-            );
-            assert_eq!(
-                farrar_mode::<ScalarStriped<16>>(q, t, s, mode),
-                want,
-                "N=16 {mode} q={q:?} t={t:?}"
-            );
-            if let Some(got) = farrar_score_simd(q, t, s, mode) {
-                assert_eq!(got, want, "SIMD {mode} q={q:?} t={t:?}");
+            // A few representative lane counts (1 = one big stripe, a middling one, and the
+            // hardware width) exercise the striping/lazy-F across `segLen` transitions; the shared
+            // generic kernel makes exhaustive lane sweeps redundant once the algorithm is pinned.
+            match width {
+                crate::ScoreWidth::I8 => {
+                    for got in [
+                        farrar_mode::<ScalarStriped<i8, 1>>(q, t, s, mode),
+                        farrar_mode::<ScalarStriped<i8, 5>>(q, t, s, mode),
+                        farrar_mode::<ScalarStriped<i8, 16>>(q, t, s, mode),
+                    ] {
+                        assert_eq!(got, want, "i8 {mode} q={q:?} t={t:?}");
+                    }
+                }
+                crate::ScoreWidth::I16 => {
+                    for got in [
+                        farrar_mode::<ScalarStriped<i16, 1>>(q, t, s, mode),
+                        farrar_mode::<ScalarStriped<i16, 3>>(q, t, s, mode),
+                        farrar_mode::<ScalarStriped<i16, 8>>(q, t, s, mode),
+                    ] {
+                        assert_eq!(got, want, "i16 {mode} q={q:?} t={t:?}");
+                    }
+                }
+                crate::ScoreWidth::I32 => {}
+            }
+            if let Some(got) = farrar_score_simd(q, t, s, mode, width) {
+                assert_eq!(got, want, "SIMD {width} {mode} q={q:?} t={t:?}");
             }
         }
     }
@@ -572,6 +818,7 @@ mod tests {
                 .map(|i| (i.wrapping_mul(5) % 4) as u8)
                 .collect();
             for mode in ALL_MODES {
+                let width = s.required_width(mode, q.len(), t.len()).unwrap();
                 let start = Instant::now();
                 let mut acc = 0i32;
                 for _ in 0..reps {
@@ -581,12 +828,12 @@ mod tests {
 
                 let start = Instant::now();
                 for _ in 0..reps {
-                    acc ^= farrar_score_simd(&q, &t, s, mode).unwrap();
+                    acc ^= farrar_score_simd(&q, &t, s, mode, width).unwrap();
                 }
                 let simd = start.elapsed().as_secs_f64();
 
                 println!(
-                    "{mode} {len}x{len} x{reps}: scalar {:.0}ms  striped {:.0}ms  speedup {:.1}x (acc {acc})",
+                    "{mode} {width} {len}x{len} x{reps}: scalar {:.0}ms  striped {:.0}ms  speedup {:.1}x (acc {acc})",
                     scalar * 1e3,
                     simd * 1e3,
                     scalar / simd,
@@ -622,6 +869,24 @@ mod tests {
                 assert_eq!(got, want, "{mode} q={q:?} t={t:?}");
             }
         }
+    }
+
+    /// Scores that provably exceed `i8` but fit `i16`: the i16 backends must match the oracle where
+    /// the i8 ones would saturate. Uses a high-match scoring over moderate lengths (all modes).
+    #[test]
+    fn i16_width_scores() {
+        let s = Scoring::new(4, id_matrix(4, 20, -5), 8, 2).unwrap();
+        let q: Vec<u8> = (0..25u8).map(|i| i % 4).collect();
+        let t: Vec<u8> = (0..25u8).map(|i| (i * 3) % 4).collect();
+        // Sanity: this is genuinely an i16 case for at least SW.
+        assert_eq!(
+            s.required_width(Mode::Sw, q.len(), t.len()),
+            Ok(crate::ScoreWidth::I16)
+        );
+        assert_matches_oracle(&q, &t, &s);
+        // An exact long match (score 25*20 = 500, well past i8).
+        let r: Vec<u8> = (0..30u8).map(|i| i % 4).collect();
+        assert_matches_oracle(&r, &r, &s);
     }
 
     /// A mismatch below `-127` must clamp, not wrap (the case is in scope for `SW`).
@@ -713,24 +978,18 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(3000))]
+        #![proptest_config(ProptestConfig::with_cases(1500))]
 
         #[test]
         fn random_pairs_match_oracle(
-            q in prop::collection::vec(0u8..4, 1..30),
-            t in prop::collection::vec(0u8..4, 1..30),
+            q in prop::collection::vec(0u8..4, 1..32),
+            t in prop::collection::vec(0u8..4, 1..32),
         ) {
+            // `assert_matches_oracle` covers every in-scope mode at the proven width (i8 or i16),
+            // every scalar lane count, and the hardware backend. Lengths up to 40 with the
+            // high-match scoring push well into i16 territory. (A panic fails the proptest.)
             for s in scorings() {
-                for mode in ALL_MODES {
-                    if !in_scope(&q, &t, &s, mode) { continue; }
-                    let want = align_core(&q, &t, &s, mode, &mut DpBuffers::new()).0;
-                    prop_assert_eq!(farrar_mode::<ScalarStriped<1>>(&q, &t, &s, mode), want, "N=1 {}", mode);
-                    prop_assert_eq!(farrar_mode::<ScalarStriped<8>>(&q, &t, &s, mode), want, "N=8 {}", mode);
-                    prop_assert_eq!(farrar_mode::<ScalarStriped<16>>(&q, &t, &s, mode), want, "N=16 {}", mode);
-                    if let Some(got) = farrar_score_simd(&q, &t, &s, mode) {
-                        prop_assert_eq!(got, want, "SIMD {}", mode);
-                    }
-                }
+                assert_matches_oracle(&q, &t, &s);
             }
         }
     }

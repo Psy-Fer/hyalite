@@ -35,12 +35,14 @@ All notable changes to `hyalite` are documented here. The format follows
   target aligned end to end; answer over the last column). Supported on every path (scalar, SIMD
   database scan, striped `align_pair`, and traceback), bit-identical across backends, and validated
   against an independent brute-force oracle.
-- Striped (Farrar) SIMD for `align_pair`: a `Score` alignment in any mode that provably fits `i8`
-  now runs an intra-sequence striped kernel on SSE4.1 (x86-64) or NEON (aarch64), ~2.4-3.9x faster
-  than the scalar path for a 2000x2000 pair (SW 3.9x, HW 3.0x, OV 2.7x, NW 2.4x). Bit-identical to
-  the scalar oracle (validated on a scalar stand-in across exhaustive short pairs and 3000 random
-  pairs for lane counts 1..16 and every mode, plus the hardware backend). `ScoreEnd`/`Alignment`
-  and wider-than-`i8` widths keep the scalar path.
+- Striped (Farrar) SIMD for `align_pair`: a `Score` alignment in any mode now runs an intra-sequence
+  striped kernel on SSE4.1 (x86-64) or NEON (aarch64), at whichever of **`i8` (16 lanes) or `i16`
+  (8 lanes)** the width proof selects — so 150 nt+ reads whose scores exceed `i8` are SIMD too, not
+  scalar. Several× faster than the scalar path for a 2000x2000 pair (`i16`: SW 12x, OV 8x, HW 7x,
+  SHW 6x, NW 5x). Bit-identical to the scalar oracle at every width, mode, and lane count (validated
+  on a width-generic scalar stand-in plus the hardware backends across exhaustive short pairs,
+  randomised pairs, length/padding boundaries, and long-gap stress). `ScoreEnd`/`Alignment` and
+  `i32` width keep the scalar path.
 - `SearchType::Alignment { max_bytes }` and the database traceback API: `Database::scan_aligned`
   returns the full `Alignment` of the single best hit (found by the fast score pass, then traced
   back once) as an `AlignedHit { db_index, alignment }`; `Database::scan_all_aligned` writes one
