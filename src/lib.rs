@@ -42,6 +42,8 @@ mod kernel;
 mod mode;
 mod scoring;
 mod search;
+#[cfg(test)]
+mod striped;
 mod width;
 
 pub use align::{AlignOp, AlignedHit, Alignment, align};
