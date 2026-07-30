@@ -26,8 +26,10 @@ All notable changes to `hyalite` are documented here. The format follows
   storing every `√m`-th DP row and recomputing row-strips on demand. It shares the walk logic and
   recomputes bit-for-bit the full-matrix cells, so the result is **byte-identical** regardless of
   budget (proven by exhaustive and randomised equivalence tests across all modes/scorings/strip
-  heights). Measured cost: ~1.05–1.1× time for ~50× less memory at length 8000. Over-tight budgets
-  that even the checkpoint path cannot meet return `TracebackBudgetExceeded`.
+  heights). Measured cost: ~1.05–1.1× time for ~50× less memory at length 8000, and it makes
+  genome-scale traceback feasible at all — a 100k×100k global alignment needs ~604 MiB via the
+  checkpoint path where the full matrix would need ~112 GiB. Over-tight budgets that even the
+  checkpoint path cannot meet return `TracebackBudgetExceeded`.
 
 ## [0.1.0] - 2026-07-29
 
