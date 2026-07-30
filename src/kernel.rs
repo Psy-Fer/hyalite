@@ -273,12 +273,16 @@ pub fn align_pair(
     // Prove i32 suffices for these lengths before running the DP.
     let width = scoring.required_width(mode, query.len(), target.len())?;
 
-    // Fast path: striped (Farrar) SIMD for a local score that provably fits `i8`. Bit-identical to
-    // the scalar kernel below (it is a saturating i8 realisation of the same DP), so this only
-    // affects speed. Other modes/search types and wider widths use the scalar path.
+    // Fast path: striped (Farrar) SIMD for a score-only search that provably fits `i8`.
+    // Bit-identical to the scalar kernel below (it is a saturating i8 realisation of the same DP),
+    // so this only affects speed. `ScoreEnd`/`Alignment` and wider widths use the scalar path.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if mode == Mode::Sw && search_type == SearchType::Score && width == crate::ScoreWidth::I8 {
-        if let Some(score) = crate::striped::farrar_sw_score_simd(query, target, scoring) {
+    if search_type == SearchType::Score
+        && width == crate::ScoreWidth::I8
+        && !query.is_empty()
+        && !target.is_empty()
+    {
+        if let Some(score) = crate::striped::farrar_score_simd(query, target, scoring, mode) {
             return Ok(BestHit {
                 score,
                 db_index: 0,
