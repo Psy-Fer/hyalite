@@ -10,9 +10,12 @@ All notable changes to `hyalite` are documented here. The format follows
 
 - `Database::scan_all`: the per-target counterpart to `scan`, writing one `BestHit` per database
   sequence (in `db_index` order) into a caller-provided `Vec<BestHit>` (cleared and reused, so no
-  per-call allocation). Per-target scores are SIMD-accelerated via a new `fill_scores` kernel path;
-  for `SearchType::ScoreEnd`, per-sequence end positions are currently recovered by the scalar
-  kernel (in-vector end tracking is a planned optimisation that will not change this API).
+  per-call allocation). Per-target scores are SIMD-accelerated via a new `fill_scores` kernel path.
+- In-vector `ScoreEnd` for `scan_all`: SIMD backends (SSE4.1, AVX2, NEON) now track per-target end
+  positions in-vector, so `SearchType::ScoreEnd` scans return scores *and* query/target ends at
+  SIMD speed. Positions are carried in a parallel `i16` domain alongside the `i8` scores; inputs
+  whose lengths exceed the `i16` position range fall back to the scalar per-sequence recovery.
+  Bit-identical to the scalar oracle on every backend (verified across backends × layouts × modes).
 
 ## [0.1.0] - 2026-07-29
 

@@ -442,6 +442,12 @@ impl SimdScratch {
     pub(crate) fn scores(&self) -> &[i8] {
         &self.scores
     }
+
+    /// The per-target end positions filled by [`fill_ends`]: `(target_end_col, query_end_row)`
+    /// slices, one entry per database sequence in `db_index` order.
+    pub(crate) fn ends(&self) -> (&[i16], &[i16]) {
+        (&self.cols, &self.rows)
+    }
 }
 
 /// Per-batch column loop over prebuilt packing and reused byte buffers. Writes `batch.real`
@@ -900,11 +906,43 @@ pub(crate) fn fill_scores(
     }
 }
 
+/// Whether the resolved `backend` has an in-vector `ScoreEnd` (end-position) kernel. All the SIMD
+/// backends do; the scalar backend has no packing and recovers ends directly.
+pub(crate) fn backend_tracks_ends(backend: crate::Backend) -> bool {
+    matches!(
+        backend,
+        crate::Backend::Sse41 | crate::Backend::Avx2 | crate::Backend::Neon
+    )
+}
+
+/// Fill per-target scores AND end positions on the resolved SIMD `backend` (see
+/// [`fill_ends_lanes`]). Only valid when [`backend_tracks_ends`] and positions fit `i16`.
+pub(crate) fn fill_ends(
+    backend: crate::Backend,
+    packed: &PackedDb,
+    mode: Mode,
+    gap_open: i32,
+    gap_ext: i32,
+    query: &[u8],
+    sc: &mut SimdScratch,
+) {
+    let flags = Flags::for_mode(mode);
+    let (go, ge) = (gap_open as i8, gap_ext as i8);
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        crate::Backend::Avx2 => avx2::run_ends(packed, query, go, ge, &flags, sc),
+        #[cfg(target_arch = "x86_64")]
+        crate::Backend::Sse41 => sse41::run_ends(packed, query, go, ge, &flags, sc),
+        #[cfg(target_arch = "aarch64")]
+        crate::Backend::Neon => neon::run_ends(packed, query, go, ge, &flags, sc),
+        other => unreachable!("no inter-sequence end kernel for backend {other}"),
+    }
+}
+
 /// Fill `sc.scores`/`sc.cols`/`sc.rows` with each database sequence's score and answer-cell
 /// coordinates (per-target `ScoreEnd`). The end tie-break is applied in-vector. Stage 1 exercises
-/// this only through the `ScalarLanes` reference; the SIMD dispatch is wired in a later stage.
+/// each SIMD backend via its `run_ends` shim, and by the `ScalarLanes` reference in tests.
 #[inline(always)]
-#[allow(dead_code)] // wired into the SIMD dispatch (and Database) in stage 2/3
 fn fill_ends_lanes<L: LanesEnds>(
     packed: &PackedDb,
     query: &[u8],
@@ -939,7 +977,10 @@ pub(crate) mod sse41 {
     // Intrinsics require `unsafe`; the crate is otherwise `deny(unsafe_code)`.
     #![allow(unsafe_code)]
 
-    use super::{Flags, Lanes, PackedDb, SimdScratch, fill_scores_lanes, scan_batched};
+    use super::{
+        Flags, Lanes, LanesEnds, PackedDb, SimdScratch, fill_ends_lanes, fill_scores_lanes,
+        scan_batched,
+    };
     use crate::hit::BestHit;
     use crate::kernel::DpBuffers;
     use crate::mode::Mode;
@@ -1003,6 +1044,69 @@ pub(crate) mod sse41 {
         }
     }
 
+    impl LanesEnds for Sse41 {
+        // 16 `i16` positions across two registers: lanes 0..8 and 8..16.
+        type PosV = (__m128i, __m128i);
+
+        #[inline(always)]
+        fn pos_splat(v: i16) -> (__m128i, __m128i) {
+            unsafe {
+                let s = _mm_set1_epi16(v);
+                (s, s)
+            }
+        }
+        #[inline(always)]
+        fn pos_store(v: (__m128i, __m128i), dst: &mut [i16]) {
+            debug_assert!(dst.len() >= 16);
+            unsafe {
+                _mm_storeu_si128(dst.as_mut_ptr().cast(), v.0);
+                _mm_storeu_si128(dst[8..].as_mut_ptr().cast(), v.1);
+            }
+        }
+        #[inline(always)]
+        fn update_answer(
+            active: __m128i,
+            best_score: __m128i,
+            best_col: (__m128i, __m128i),
+            best_row: (__m128i, __m128i),
+            cell: __m128i,
+            col: i16,
+            row: i16,
+        ) -> (__m128i, (__m128i, __m128i), (__m128i, __m128i)) {
+            unsafe {
+                let gt = _mm_cmpgt_epi8(cell, best_score);
+                let eq = _mm_cmpeq_epi8(cell, best_score);
+                let colv = _mm_set1_epi16(col);
+                let rowv = _mm_set1_epi16(row);
+                // Per i16 half: (col < best_col) | (col == best_col & row < best_row).
+                let lex = |bc: __m128i, br: __m128i| {
+                    let col_lt = _mm_cmpgt_epi16(bc, colv); // bc > col  <=>  col < bc
+                    let col_eq = _mm_cmpeq_epi16(colv, bc);
+                    let row_lt = _mm_cmpgt_epi16(br, rowv);
+                    _mm_or_si128(col_lt, _mm_and_si128(col_eq, row_lt))
+                };
+                let lex_lo = lex(best_col.0, best_row.0);
+                let lex_hi = lex(best_col.1, best_row.1);
+                // Narrow the two i16 lex masks to one i8 mask (SSE pack keeps natural order).
+                let lex8 = _mm_packs_epi16(lex_lo, lex_hi);
+                let take = _mm_and_si128(active, _mm_or_si128(gt, _mm_and_si128(eq, lex8)));
+                let new_score = _mm_blendv_epi8(best_score, cell, take);
+                // Widen the take mask back to i16 halves (sign-extend keeps natural order).
+                let take_lo = _mm_cvtepi8_epi16(take);
+                let take_hi = _mm_cvtepi8_epi16(_mm_srli_si128(take, 8));
+                let new_col = (
+                    _mm_blendv_epi8(best_col.0, colv, take_lo),
+                    _mm_blendv_epi8(best_col.1, colv, take_hi),
+                );
+                let new_row = (
+                    _mm_blendv_epi8(best_row.0, rowv, take_lo),
+                    _mm_blendv_epi8(best_row.1, rowv, take_hi),
+                );
+                (new_score, new_col, new_row)
+            }
+        }
+    }
+
     /// Feature-enabled shim: everything inlined here is compiled with SSE4.1.
     #[target_feature(enable = "sse4.1")]
     #[allow(clippy::too_many_arguments)]
@@ -1060,6 +1164,31 @@ pub(crate) mod sse41 {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
         unsafe { scores_ff(packed, query, go, ge, flags, sc) }
     }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn ends_ff(
+        packed: &PackedDb,
+        query: &[u8],
+        go: i8,
+        ge: i8,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        fill_ends_lanes::<Sse41>(packed, query, go, ge, flags, sc);
+    }
+
+    /// Per-target scores and end positions (see [`super::fill_ends`]). Same precondition as [`run`].
+    pub(crate) fn run_ends(
+        packed: &PackedDb,
+        query: &[u8],
+        go: i8,
+        ge: i8,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        debug_assert!(std::is_x86_feature_detected!("sse4.1"));
+        unsafe { ends_ff(packed, query, go, ge, flags, sc) }
+    }
 }
 
 /// AVX2 lane backend: 32 `i8` lanes per `__m256i`.
@@ -1067,7 +1196,10 @@ pub(crate) mod sse41 {
 pub(crate) mod avx2 {
     #![allow(unsafe_code)]
 
-    use super::{Flags, Lanes, PackedDb, SimdScratch, fill_scores_lanes, scan_batched};
+    use super::{
+        Flags, Lanes, LanesEnds, PackedDb, SimdScratch, fill_ends_lanes, fill_scores_lanes,
+        scan_batched,
+    };
     use crate::hit::BestHit;
     use crate::kernel::DpBuffers;
     use crate::mode::Mode;
@@ -1131,6 +1263,71 @@ pub(crate) mod avx2 {
         }
     }
 
+    impl LanesEnds for Avx2 {
+        // 32 `i16` positions across two registers: lanes 0..16 and 16..32.
+        type PosV = (__m256i, __m256i);
+
+        #[inline(always)]
+        fn pos_splat(v: i16) -> (__m256i, __m256i) {
+            unsafe {
+                let s = _mm256_set1_epi16(v);
+                (s, s)
+            }
+        }
+        #[inline(always)]
+        fn pos_store(v: (__m256i, __m256i), dst: &mut [i16]) {
+            debug_assert!(dst.len() >= 32);
+            unsafe {
+                _mm256_storeu_si256(dst.as_mut_ptr().cast(), v.0);
+                _mm256_storeu_si256(dst[16..].as_mut_ptr().cast(), v.1);
+            }
+        }
+        #[inline(always)]
+        fn update_answer(
+            active: __m256i,
+            best_score: __m256i,
+            best_col: (__m256i, __m256i),
+            best_row: (__m256i, __m256i),
+            cell: __m256i,
+            col: i16,
+            row: i16,
+        ) -> (__m256i, (__m256i, __m256i), (__m256i, __m256i)) {
+            unsafe {
+                let gt = _mm256_cmpgt_epi8(cell, best_score);
+                let eq = _mm256_cmpeq_epi8(cell, best_score);
+                let colv = _mm256_set1_epi16(col);
+                let rowv = _mm256_set1_epi16(row);
+                let lex = |bc: __m256i, br: __m256i| {
+                    let col_lt = _mm256_cmpgt_epi16(bc, colv); // col < bc
+                    let col_eq = _mm256_cmpeq_epi16(colv, bc);
+                    let row_lt = _mm256_cmpgt_epi16(br, rowv);
+                    _mm256_or_si256(col_lt, _mm256_and_si256(col_eq, row_lt))
+                };
+                let lex_lo = lex(best_col.0, best_row.0);
+                let lex_hi = lex(best_col.1, best_row.1);
+                // Narrow to i8. `packs` interleaves the two 128-bit halves, so permute the 64-bit
+                // chunks (0,2,1,3) back to natural lane order.
+                let packed = _mm256_packs_epi16(lex_lo, lex_hi);
+                let lex8 = _mm256_permute4x64_epi64(packed, 0b11_01_10_00);
+                let take =
+                    _mm256_and_si256(active, _mm256_or_si256(gt, _mm256_and_si256(eq, lex8)));
+                let new_score = _mm256_blendv_epi8(best_score, cell, take);
+                // Widen the take mask back to i16 halves (sign-extend keeps natural order).
+                let take_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(take));
+                let take_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(take, 1));
+                let new_col = (
+                    _mm256_blendv_epi8(best_col.0, colv, take_lo),
+                    _mm256_blendv_epi8(best_col.1, colv, take_hi),
+                );
+                let new_row = (
+                    _mm256_blendv_epi8(best_row.0, rowv, take_lo),
+                    _mm256_blendv_epi8(best_row.1, rowv, take_hi),
+                );
+                (new_score, new_col, new_row)
+            }
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn scan_ff(
@@ -1187,6 +1384,31 @@ pub(crate) mod avx2 {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
         unsafe { scores_ff(packed, query, go, ge, flags, sc) }
     }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn ends_ff(
+        packed: &PackedDb,
+        query: &[u8],
+        go: i8,
+        ge: i8,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        fill_ends_lanes::<Avx2>(packed, query, go, ge, flags, sc);
+    }
+
+    /// Per-target scores and end positions (see [`super::fill_ends`]). Same precondition as [`run`].
+    pub(crate) fn run_ends(
+        packed: &PackedDb,
+        query: &[u8],
+        go: i8,
+        ge: i8,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        debug_assert!(std::is_x86_feature_detected!("avx2"));
+        unsafe { ends_ff(packed, query, go, ge, flags, sc) }
+    }
 }
 
 /// NEON lane backend: 16 `i8` lanes per `int8x16_t`. NEON is baseline on aarch64, so there is no
@@ -1195,7 +1417,10 @@ pub(crate) mod avx2 {
 pub(crate) mod neon {
     #![allow(unsafe_code)]
 
-    use super::{Flags, Lanes, PackedDb, SimdScratch, fill_scores_lanes, scan_batched};
+    use super::{
+        Flags, Lanes, LanesEnds, PackedDb, SimdScratch, fill_ends_lanes, fill_scores_lanes,
+        scan_batched,
+    };
     use crate::hit::BestHit;
     use crate::kernel::DpBuffers;
     use crate::mode::Mode;
@@ -1257,6 +1482,69 @@ pub(crate) mod neon {
         }
     }
 
+    impl LanesEnds for Neon {
+        // 16 `i16` positions across two registers: lanes 0..8 and 8..16.
+        type PosV = (int16x8_t, int16x8_t);
+
+        #[inline(always)]
+        fn pos_splat(v: i16) -> (int16x8_t, int16x8_t) {
+            unsafe {
+                let s = vdupq_n_s16(v);
+                (s, s)
+            }
+        }
+        #[inline(always)]
+        fn pos_store(v: (int16x8_t, int16x8_t), dst: &mut [i16]) {
+            debug_assert!(dst.len() >= 16);
+            unsafe {
+                vst1q_s16(dst.as_mut_ptr(), v.0);
+                vst1q_s16(dst[8..].as_mut_ptr(), v.1);
+            }
+        }
+        #[inline(always)]
+        fn update_answer(
+            active: int8x16_t,
+            best_score: int8x16_t,
+            best_col: (int16x8_t, int16x8_t),
+            best_row: (int16x8_t, int16x8_t),
+            cell: int8x16_t,
+            col: i16,
+            row: i16,
+        ) -> (int8x16_t, (int16x8_t, int16x8_t), (int16x8_t, int16x8_t)) {
+            unsafe {
+                let gt = vreinterpretq_s8_u8(vcgtq_s8(cell, best_score));
+                let eq = vreinterpretq_s8_u8(vceqq_s8(cell, best_score));
+                let colv = vdupq_n_s16(col);
+                let rowv = vdupq_n_s16(row);
+                let lex = |bc: int16x8_t, br: int16x8_t| {
+                    let col_lt = vreinterpretq_s16_u16(vcgtq_s16(bc, colv)); // col < bc
+                    let col_eq = vreinterpretq_s16_u16(vceqq_s16(colv, bc));
+                    let row_lt = vreinterpretq_s16_u16(vcgtq_s16(br, rowv));
+                    vorrq_s16(col_lt, vandq_s16(col_eq, row_lt))
+                };
+                let lex_lo = lex(best_col.0, best_row.0);
+                let lex_hi = lex(best_col.1, best_row.1);
+                // Narrow the two i16 lex masks to one i8 mask (saturating narrow keeps natural order).
+                let lex8 = vcombine_s8(vqmovn_s16(lex_lo), vqmovn_s16(lex_hi));
+                let take = vandq_s8(active, vorrq_s8(gt, vandq_s8(eq, lex8)));
+                let take_u = vreinterpretq_u8_s8(take);
+                let new_score = vbslq_s8(take_u, cell, best_score);
+                // Widen the take mask back to i16 halves (sign-extend keeps natural order).
+                let take_lo = vreinterpretq_u16_s16(vmovl_s8(vget_low_s8(take)));
+                let take_hi = vreinterpretq_u16_s16(vmovl_s8(vget_high_s8(take)));
+                let new_col = (
+                    vbslq_s16(take_lo, colv, best_col.0),
+                    vbslq_s16(take_hi, colv, best_col.1),
+                );
+                let new_row = (
+                    vbslq_s16(take_lo, rowv, best_row.0),
+                    vbslq_s16(take_hi, rowv, best_row.1),
+                );
+                (new_score, new_col, new_row)
+            }
+        }
+    }
+
     /// Safe entry point. NEON is always available on aarch64, so no feature guard is needed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run(
@@ -1282,6 +1570,18 @@ pub(crate) mod neon {
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Neon>(packed, query, go, ge, flags, sc);
+    }
+
+    /// Per-target scores and end positions (see [`super::fill_ends`]). NEON is baseline.
+    pub(crate) fn run_ends(
+        packed: &PackedDb,
+        query: &[u8],
+        go: i8,
+        ge: i8,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        fill_ends_lanes::<Neon>(packed, query, go, ge, flags, sc);
     }
 }
 

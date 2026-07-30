@@ -141,9 +141,10 @@ impl Database {
     ///
     /// For [`SearchType::Score`] the per-sequence scores are computed by the resolved backend
     /// (SIMD-accelerated for an eligible database) and end positions are `None`. For
-    /// [`SearchType::ScoreEnd`] the end positions are currently recovered by the scalar kernel per
-    /// sequence (bit-identical, but not yet SIMD-accelerated); in-vector end tracking is a planned
-    /// optimisation that will not change this API.
+    /// [`SearchType::ScoreEnd`] the SIMD backends track end positions in-vector, so scores *and*
+    /// ends are SIMD-accelerated; the scalar backend (and inputs whose positions exceed the `i16`
+    /// position domain) recover ends via the scalar kernel per sequence. Every entry is
+    /// bit-identical across paths.
     ///
     /// Same caller contract as [`scan`](Self::scan): `query` is pre-encoded, `<= max_query_len`.
     pub fn scan_all(&self, scratch: &mut Scratch, query: &[u8], out: &mut Vec<BestHit>) {
@@ -157,19 +158,50 @@ impl Database {
         out.clear();
         out.reserve(self.sequences.len());
 
-        // `ScoreEnd` needs per-target end positions, which require the scalar DP (in-vector
-        // tracking is a future optimisation). `Score` uses the SIMD per-target kernel when a SIMD
+        // `ScoreEnd` needs per-target end positions. SIMD backends track them in-vector; otherwise
+        // (scalar backend, or positions that would not fit the `i16` position domain) we recover
+        // them with the scalar DP per sequence. `Score` uses the SIMD per-target kernel when a SIMD
         // backend is resolved.
         if self.search_type.tracks_end() {
-            for (index, seq) in self.sequences.iter().enumerate() {
-                let (score, query_end, target_end) =
-                    align_core(query, seq, &self.scoring, self.mode, &mut scratch.buf);
-                out.push(BestHit {
-                    score,
-                    db_index: index,
-                    query_end,
-                    target_end,
-                });
+            let ends_fit_i16 =
+                self.max_query_len <= i16::MAX as usize && self.max_target_len <= i16::MAX as usize;
+            if let Some(packed) = self
+                .packed
+                .as_ref()
+                .filter(|_| inter::backend_tracks_ends(self.backend) && ends_fit_i16)
+            {
+                inter::fill_ends(
+                    self.backend,
+                    packed,
+                    self.mode,
+                    self.scoring.gap_open(),
+                    self.scoring.gap_ext(),
+                    query,
+                    &mut scratch.simd,
+                );
+                let (cols, rows) = scratch.simd.ends();
+                let scores = scratch.simd.scores();
+                for index in 0..self.sequences.len() {
+                    // Position domain stores DP grid indices; `end = grid - 1`, `None` at grid 0
+                    // (nothing aligned), matching the scalar oracle's `checked_sub(1)`.
+                    out.push(BestHit {
+                        score: scores[index] as i32,
+                        db_index: index,
+                        query_end: (rows[index] as usize).checked_sub(1),
+                        target_end: (cols[index] as usize).checked_sub(1),
+                    });
+                }
+            } else {
+                for (index, seq) in self.sequences.iter().enumerate() {
+                    let (score, query_end, target_end) =
+                        align_core(query, seq, &self.scoring, self.mode, &mut scratch.buf);
+                    out.push(BestHit {
+                        score,
+                        db_index: index,
+                        query_end,
+                        target_end,
+                    });
+                }
             }
         } else if let Some(packed) = &self.packed {
             inter::fill_scores(
