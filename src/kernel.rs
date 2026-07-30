@@ -271,7 +271,24 @@ pub fn align_pair(
     }
 
     // Prove i32 suffices for these lengths before running the DP.
-    scoring.required_width(mode, query.len(), target.len())?;
+    let width = scoring.required_width(mode, query.len(), target.len())?;
+
+    // Fast path: striped (Farrar) SIMD for a local score that provably fits `i8`. Bit-identical to
+    // the scalar kernel below (it is a saturating i8 realisation of the same DP), so this only
+    // affects speed. Other modes/search types and wider widths use the scalar path.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if mode == Mode::Sw && search_type == SearchType::Score && width == crate::ScoreWidth::I8 {
+        if let Some(score) = crate::striped::farrar_sw_score_simd(query, target, scoring) {
+            return Ok(BestHit {
+                score,
+                db_index: 0,
+                query_end: None,
+                target_end: None,
+            });
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = width;
 
     let mut buf = DpBuffers::new();
     let (score, query_end, target_end) = align_core(query, target, scoring, mode, &mut buf);

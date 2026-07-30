@@ -30,6 +30,11 @@ All notable changes to `hyalite` are documented here. The format follows
   genome-scale traceback feasible at all — a 100k×100k global alignment needs ~604 MiB via the
   checkpoint path where the full matrix would need ~112 GiB. Over-tight budgets that even the
   checkpoint path cannot meet return `TracebackBudgetExceeded`.
+- Striped (Farrar) SIMD for `align_pair`: a local (`SW`) `Score` alignment that provably fits `i8`
+  now runs an intra-sequence striped kernel on SSE4.1 (x86-64) or NEON (aarch64), ~4.5x faster than
+  the scalar path for a 2000x2000 pair. Bit-identical to the scalar oracle (validated on a scalar
+  stand-in across exhaustive short pairs and 3000 random pairs for lane counts 1..16, plus the
+  hardware backend). Other modes, `ScoreEnd`/`Alignment`, and wider widths keep the scalar path.
 - `SearchType::Alignment { max_bytes }` and the database traceback API: `Database::scan_aligned`
   returns the full `Alignment` of the single best hit (found by the fast score pass, then traced
   back once) as an `AlignedHit { db_index, alignment }`; `Database::scan_all_aligned` writes one

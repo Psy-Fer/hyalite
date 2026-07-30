@@ -42,7 +42,9 @@ mod kernel;
 mod mode;
 mod scoring;
 mod search;
-#[cfg(test)]
+// The striped (Farrar) single-pair kernel exists only on the SIMD architectures it targets; other
+// architectures use the scalar `align_pair` path.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod striped;
 mod width;
 
