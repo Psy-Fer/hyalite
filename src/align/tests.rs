@@ -352,3 +352,101 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint (linear-space) path is byte-identical to the full-matrix path
+// ---------------------------------------------------------------------------
+
+/// Every sequence over `al` symbols of length `1..=maxlen`.
+fn all_seqs(al: u8, maxlen: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut frontier = vec![vec![]];
+    for _ in 0..maxlen {
+        let mut next = Vec::new();
+        for seq in &frontier {
+            for sym in 0..al {
+                let mut s = seq.clone();
+                s.push(sym);
+                next.push(s);
+            }
+        }
+        out.extend(next.iter().cloned());
+        frontier = next;
+    }
+    out
+}
+
+/// A spread of strip heights: 1 (maximum recompute), a few small, ~sqrt(m), and >= m (single
+/// strip == effectively full). Each must reproduce the full-matrix result exactly.
+fn ks_for(m: usize) -> Vec<usize> {
+    let mut v = vec![
+        1usize,
+        2,
+        3,
+        (m as u64).isqrt().max(1) as usize,
+        m.max(1),
+        m + 1,
+    ];
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+#[test]
+fn checkpoint_matches_full_exhaustively() {
+    // All non-empty pairs over small alphabets, every mode, several scorings, every strip height.
+    for (al, maxlen) in [(2u8, 5usize), (3, 3)] {
+        let seqs = all_seqs(al, maxlen);
+        for q in &seqs {
+            for t in &seqs {
+                for s in scorings() {
+                    for mode in ALL_MODES {
+                        let full = traceback_full(q, t, &s, mode);
+                        for k in ks_for(q.len()) {
+                            let cp = traceback_checkpoint(q, t, &s, mode, k);
+                            assert_eq!(full, cp, "mismatch: mode={mode} k={k} q={q:?} t={t:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4000))]
+
+    /// Random, larger pairs: the checkpoint path is byte-identical to the full-matrix path for
+    /// every strip height, and `align()`'s budget dispatch is likewise budget-independent.
+    #[test]
+    fn checkpoint_matches_full_random(
+        q in prop::collection::vec(0u8..4, 1..15),
+        t in prop::collection::vec(0u8..4, 1..15),
+    ) {
+        for s in scorings() {
+            for mode in ALL_MODES {
+                let full = traceback_full(&q, &t, &s, mode);
+                for k in ks_for(q.len()) {
+                    prop_assert_eq!(&traceback_checkpoint(&q, &t, &s, mode, k), &full,
+                        "k={} mode={}", k, mode);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tiny_budget_that_even_checkpoint_cannot_meet_errors() {
+    let s = dna();
+    let q = vec![0u8; 400];
+    let t = vec![1u8; 400];
+    // Far below any checkpoint footprint for a 400x400 problem.
+    match align(&q, &t, &s, Mode::Nw, 8) {
+        Err(Error::TracebackBudgetExceeded { .. }) => {}
+        other => panic!("expected budget error, got {other:?}"),
+    }
+    // With room, the checkpoint path succeeds and equals the full-matrix result.
+    let big = align(&q, &t, &s, Mode::Nw, usize::MAX).unwrap();
+    let checkpointed = align(&q, &t, &s, Mode::Nw, 1 << 20).unwrap();
+    assert_eq!(big, checkpointed);
+}

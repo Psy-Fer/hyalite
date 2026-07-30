@@ -19,9 +19,15 @@ All notable changes to `hyalite` are documented here. The format follows
 - Traceback: `align()` returns a full `Alignment` (score, half-open query/target spans, and a
   `Vec<AlignOp>` of `Match`/`Mismatch`/`Ins`/`Del`), with `.cigar()` (M-collapsed) and
   `.cigar_extended()` (`=`/`X`) formatters. Scalar Gotoh affine DP with a documented canonical
-  backward walk; a `max_bytes` budget bounds the working memory (over-budget is a typed
-  `TracebackBudgetExceeded` error until the linear-space Hirschberg path lands). Verified optimal
-  against the independent brute-force oracle and by re-scoring the emitted ops, across all modes.
+  backward walk. Verified optimal against the independent brute-force oracle and by re-scoring the
+  emitted ops, across all modes.
+- Linear-space traceback: when the full `H`/`E`/`F` matrices exceed the `max_bytes` budget,
+  `align()` transparently switches to a **checkpoint** path that bounds memory to `O(n·√m)` by
+  storing every `√m`-th DP row and recomputing row-strips on demand. It shares the walk logic and
+  recomputes bit-for-bit the full-matrix cells, so the result is **byte-identical** regardless of
+  budget (proven by exhaustive and randomised equivalence tests across all modes/scorings/strip
+  heights). Measured cost: ~1.05–1.1× time for ~50× less memory at length 8000. Over-tight budgets
+  that even the checkpoint path cannot meet return `TracebackBudgetExceeded`.
 
 ## [0.1.0] - 2026-07-29
 

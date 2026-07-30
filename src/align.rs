@@ -7,11 +7,14 @@
 //!
 //! # Memory budget
 //!
-//! This chunk stores the full `H`/`E`/`F` matrices, so it needs `3 * (m+1) * (n+1) * 4` bytes.
-//! [`align`] takes a `max_bytes` budget and returns [`Error::TracebackBudgetExceeded`] when the
-//! full matrix would exceed it. The linear-space Hirschberg path that serves larger pairs within
-//! a bounded footprint is a following chunk; until it lands, pass a generous budget (or
-//! `usize::MAX`) for unconditional full-matrix traceback.
+//! [`align`] takes a `max_bytes` budget. The full-matrix path stores the `H`/`E`/`F` matrices
+//! (`3 * (m+1) * (n+1) * 4` bytes) and is used whenever it fits. Above the budget, a
+//! **checkpoint** path bounds memory to `O(n * sqrt(m))`: it stores only every `sqrt(m)`-th DP
+//! row and recomputes each row-strip on demand during the walk. Because the walk logic is shared
+//! and the recomputed cells are bit-for-bit the full-matrix cells, the checkpoint path returns a
+//! **byte-identical** `Alignment` to the full-matrix path — the budget affects memory and time
+//! (~2x), never the result. If even the checkpoint footprint exceeds `max_bytes`,
+//! [`Error::TracebackBudgetExceeded`] is returned.
 //!
 //! # Canonical traceback
 //!
@@ -143,16 +146,16 @@ impl Alignment {
 /// [`align_pair`](crate::align_pair). The score equals what `align_pair` returns for the same
 /// inputs; this additionally reports the operations and the aligned span (see [`Alignment`]).
 ///
-/// `max_bytes` bounds the traceback working memory. The full-matrix path used here needs
-/// `3 * (query.len()+1) * (target.len()+1) * 4` bytes; exceeding `max_bytes` is a typed error
-/// (the linear-space path for larger pairs is a following chunk). Pass `usize::MAX` for an
-/// unconditional full-matrix traceback.
+/// `max_bytes` bounds the traceback working memory. The full-matrix path (needing
+/// `3 * (query.len()+1) * (target.len()+1) * 4` bytes) is used when it fits; above it a
+/// checkpoint path bounds memory to `O(n * sqrt(m))` at ~2x time and returns a **byte-identical**
+/// result. Pass `usize::MAX` to force the full-matrix path.
 ///
 /// # Errors
 ///
 /// - [`Error::SymbolOutOfRange`] if any symbol is `>= scoring.alphabet_len()`.
 /// - [`Error::ScoreRangeTooWide`] if the reachable score could overflow `i32` for these lengths.
-/// - [`Error::TracebackBudgetExceeded`] if the full matrix would exceed `max_bytes`.
+/// - [`Error::TracebackBudgetExceeded`] if even the checkpoint footprint exceeds `max_bytes`.
 pub fn align(
     query: &[u8],
     target: &[u8],
@@ -177,21 +180,44 @@ pub fn align(
     // Full-matrix footprint: three `i32` matrices of `(m+1)*(n+1)` cells. Computed in `u64` so the
     // product cannot overflow before it is compared against the budget (the pyopal #5/#8 lesson:
     // size the traceback buffer from an exact bound, never a truncated one).
-    let cells = (m as u64 + 1).saturating_mul(n as u64 + 1);
-    let needed = cells
-        .saturating_mul(3)
-        .saturating_mul(core::mem::size_of::<i32>() as u64);
-    if needed > max_bytes as u64 {
+    let full = full_matrix_bytes(m, n);
+    if full <= max_bytes as u64 || m == 0 || n == 0 {
+        return Ok(traceback_full(query, target, scoring, mode));
+    }
+
+    // Over budget: fall to the checkpoint path. Balance the strip height so the peak footprint is
+    // near-minimal (`~sqrt(m)`); if even that exceeds the budget, report it.
+    let k = (m as u64).isqrt().max(1) as usize;
+    let peak = checkpoint_bytes(m, n, k);
+    if peak > max_bytes as u64 {
         return Err(Error::TracebackBudgetExceeded {
-            needed_bytes: needed,
+            needed_bytes: peak,
             budget_bytes: max_bytes,
         });
     }
+    Ok(traceback_checkpoint(query, target, scoring, mode, k))
+}
 
-    Ok(traceback_full(query, target, scoring, mode))
+/// Bytes the full-matrix path allocates: three `i32` matrices of `(m+1) * (n+1)` cells.
+fn full_matrix_bytes(m: usize, n: usize) -> u64 {
+    (m as u64 + 1)
+        .saturating_mul(n as u64 + 1)
+        .saturating_mul(3)
+        .saturating_mul(4)
+}
+
+/// Peak bytes the checkpoint path allocates for strip height `k`: the checkpoint rows (`H` and
+/// `F` at every `k`-th row) plus one recomputed strip of up to `k + 1` rows (`H`/`E`/`F`).
+fn checkpoint_bytes(m: usize, n: usize, k: usize) -> u64 {
+    let num_ckpt = m as u64 / k as u64 + 1;
+    let strip_rows = k as u64 + 1;
+    (2 * num_ckpt + 3 * strip_rows)
+        .saturating_mul(n as u64 + 1)
+        .saturating_mul(4)
 }
 
 /// Which affine state the backward walk is currently in.
+#[derive(Clone, Copy)]
 enum State {
     /// A substitution/match matrix cell.
     H,
@@ -201,104 +227,91 @@ enum State {
     F,
 }
 
-/// Full `H`/`E`/`F` DP with backward traceback. Caller has validated symbols, the width bound,
-/// and the memory budget.
-fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> Alignment {
-    let m = query.len();
-    let n = target.len();
-    let flags = Flags::for_mode(mode);
-    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
-    let cols = n + 1;
-    let idx = |i: usize, j: usize| i * cols + j;
+/// Running best cell under the determinism-contract tie-break: maximise score, then minimise
+/// `(grid_col, grid_row)` (smallest target end, then smallest query end). Identical to the score
+/// kernels' selection, so every path agrees on where the alignment ends.
+struct Best {
+    score: i32,
+    row: usize,
+    col: usize,
+}
 
-    let mut h = vec![0i32; (m + 1) * cols];
-    let mut e = vec![NEG; (m + 1) * cols];
-    let mut f = vec![NEG; (m + 1) * cols];
-
-    // Borders. `H` borders are free (0) or a penalised gap run; the matching `E`/`F` border is set
-    // so the generic backward walk can trace a penalised border gap, and left `NEG` when the border
-    // is free (the walk stops there instead of consulting it).
-    for j in 1..=n {
-        h[idx(0, j)] = if flags.top_row_free {
-            0
-        } else {
-            -gap_penalty(go, ge, j)
-        };
-        e[idx(0, j)] = if flags.top_row_free {
-            NEG
-        } else {
-            h[idx(0, j)]
-        };
-    }
-    for i in 1..=m {
-        h[idx(i, 0)] = if flags.left_col_free {
-            0
-        } else {
-            -gap_penalty(go, ge, i)
-        };
-        f[idx(i, 0)] = if flags.left_col_free {
-            NEG
-        } else {
-            h[idx(i, 0)]
-        };
-    }
-
-    for i in 1..=m {
-        for j in 1..=n {
-            e[idx(i, j)] = (h[idx(i, j - 1)] - go).max(e[idx(i, j - 1)] - ge);
-            f[idx(i, j)] = (h[idx(i - 1, j)] - go).max(f[idx(i - 1, j)] - ge);
-            let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
-            let diag = h[idx(i - 1, j - 1)] + sub;
-            let mut cell = diag.max(e[idx(i, j)]).max(f[idx(i, j)]);
-            if flags.local {
-                cell = cell.max(0);
-            }
-            h[idx(i, j)] = cell;
+impl Best {
+    fn new() -> Self {
+        Best {
+            score: NEG,
+            row: 0,
+            col: 0,
         }
     }
 
-    // Optimal end cell, by the determinism-contract tie-break (max score, then smallest
-    // `(grid_col, grid_row)` = smallest target end, then smallest query end) over the mode's
-    // answer region — identical to the score kernels.
-    let mut best_score = NEG;
-    let mut gr = 0usize;
-    let mut gc = 0usize;
-    let mut consider = |score: i32, i: usize, j: usize| {
-        if score > best_score || (score == best_score && (j, i) < (gc, gr)) {
-            best_score = score;
-            gr = i;
-            gc = j;
+    fn consider(&mut self, score: i32, i: usize, j: usize) {
+        if score > self.score || (score == self.score && (j, i) < (self.col, self.row)) {
+            self.score = score;
+            self.row = i;
+            self.col = j;
         }
-    };
+    }
+}
+
+/// Feed one DP row into [`Best`] over the mode's answer region. Called with each row (`0..=m`) by
+/// both traceback paths, so end selection is bit-identical between them.
+fn consider_row(best: &mut Best, flags: &Flags, i: usize, m: usize, n: usize, hrow: &[i32]) {
     if flags.local {
-        for i in 0..=m {
-            for j in 0..=n {
-                consider(h[idx(i, j)], i, j);
-            }
+        for (j, &s) in hrow.iter().enumerate().take(n + 1) {
+            best.consider(s, i, j);
         }
     } else {
-        consider(h[idx(m, n)], m, n);
-        if flags.answer_last_row {
-            for j in 0..=n {
-                consider(h[idx(m, j)], m, j);
-            }
-        }
         if flags.answer_last_col {
-            for i in 0..=m {
-                consider(h[idx(i, n)], i, n);
+            best.consider(hrow[n], i, n);
+        }
+        if i == m {
+            best.consider(hrow[n], m, n); // corner, always in the answer region
+            if flags.answer_last_row {
+                for (j, &s) in hrow.iter().enumerate().take(n + 1) {
+                    best.consider(s, m, j);
+                }
             }
         }
     }
+}
 
-    // Backward walk from the end cell.
+/// Random access to the DP cells the backward walk needs. The full-matrix impl indexes stored
+/// matrices; the checkpoint impl recomputes row-strips on demand. Both hand back the exact same
+/// values, so the shared [`walk`] produces byte-identical output whichever backs it.
+///
+/// `prepare(i)` must be called before accessing cells at row `i`; it guarantees rows `i` and
+/// `i - 1` are available. The walk only ever reads rows `i` and `i - 1` for a non-increasing `i`.
+trait CellSource {
+    fn prepare(&mut self, i: usize);
+    fn h(&self, i: usize, j: usize) -> i32;
+    fn e(&self, i: usize, j: usize) -> i32;
+    fn f(&self, i: usize, j: usize) -> i32;
+}
+
+/// The shared backward walk. Given the optimal end cell `(gr, gc)`, it retraces the canonical
+/// alignment using only [`CellSource`] reads, returning the start cell and the ops (forward
+/// order). This is the single source of truth for the traceback's tie-break and stop rules.
+fn walk<C: CellSource>(
+    cells: &mut C,
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    flags: &Flags,
+    gr: usize,
+    gc: usize,
+) -> (usize, usize, Vec<AlignOp>) {
+    let go = scoring.gap_open();
     let mut i = gr;
     let mut j = gc;
     let mut state = State::H;
     let mut ops_rev: Vec<AlignOp> = Vec::new();
     loop {
+        cells.prepare(i);
         match state {
             State::H => {
-                if flags.local && h[idx(i, j)] == 0 {
+                let hij = cells.h(i, j);
+                if flags.local && hij == 0 {
                     break;
                 }
                 if i == 0 && j == 0 {
@@ -318,9 +331,8 @@ fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) ->
                     state = State::F; // trace the penalised left-column gap
                     continue;
                 }
-                let v = h[idx(i, j)];
                 let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
-                if v == h[idx(i - 1, j - 1)] + sub {
+                if hij == cells.h(i - 1, j - 1) + sub {
                     ops_rev.push(if query[i - 1] == target[j - 1] {
                         AlignOp::Match
                     } else {
@@ -328,7 +340,7 @@ fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) ->
                     });
                     i -= 1;
                     j -= 1;
-                } else if v == e[idx(i, j)] {
+                } else if hij == cells.e(i, j) {
                     state = State::E;
                 } else {
                     state = State::F;
@@ -336,31 +348,334 @@ fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) ->
             }
             State::E => {
                 ops_rev.push(AlignOp::Del);
-                let ev = e[idx(i, j)];
+                let ev = cells.e(i, j);
                 j -= 1;
-                if ev == h[idx(i, j)] - go {
+                if ev == cells.h(i, j) - go {
                     state = State::H;
                 } // else stays in E (extend)
             }
             State::F => {
                 ops_rev.push(AlignOp::Ins);
-                let fv = f[idx(i, j)];
+                let fv = cells.f(i, j);
                 i -= 1;
-                if fv == h[idx(i, j)] - go {
+                if fv == cells.h(i, j) - go {
                     state = State::H;
                 } // else stays in F (extend)
             }
         }
     }
-
     ops_rev.reverse();
+    (i, j, ops_rev)
+}
+
+/// [`CellSource`] over fully-materialised `H`/`E`/`F` matrices.
+struct FullCells {
+    h: Vec<i32>,
+    e: Vec<i32>,
+    f: Vec<i32>,
+    cols: usize,
+}
+
+impl CellSource for FullCells {
+    fn prepare(&mut self, _i: usize) {}
+    fn h(&self, i: usize, j: usize) -> i32 {
+        self.h[i * self.cols + j]
+    }
+    fn e(&self, i: usize, j: usize) -> i32 {
+        self.e[i * self.cols + j]
+    }
+    fn f(&self, i: usize, j: usize) -> i32 {
+        self.f[i * self.cols + j]
+    }
+}
+
+/// One border/recurrence step over a strip, writing cell `(local_r, j)` from row `local_r - 1`.
+/// Shared by the full DP and strip recompute so their cell values are identical by construction.
+#[allow(clippy::too_many_arguments)]
+fn fill_row(
+    h: &mut [i32],
+    e: &mut [i32],
+    f: &mut [i32],
+    prev: usize,
+    cur: usize,
+    cols: usize,
+    i: usize,
+    n: usize,
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    flags: &Flags,
+) {
+    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let base = cur * cols;
+    let pbase = prev * cols;
+    h[base] = if flags.left_col_free {
+        0
+    } else {
+        -gap_penalty(go, ge, i)
+    };
+    e[base] = NEG;
+    // Matching the top-row `E` border: set `F[i][0]` so the walk can trace and *close* a penalised
+    // left-column gap; leave `NEG` when the column is free (the walk stops there instead).
+    f[base] = if flags.left_col_free { NEG } else { h[base] };
+    for j in 1..=n {
+        e[base + j] = (h[base + j - 1] - go).max(e[base + j - 1] - ge);
+        f[base + j] = (h[pbase + j] - go).max(f[pbase + j] - ge);
+        let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
+        let diag = h[pbase + j - 1] + sub;
+        let mut cell = diag.max(e[base + j]).max(f[base + j]);
+        if flags.local {
+            cell = cell.max(0);
+        }
+        h[base + j] = cell;
+    }
+}
+
+/// Full `H`/`E`/`F` DP with backward traceback. Caller has validated symbols, the width bound,
+/// and the memory budget.
+fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> Alignment {
+    let m = query.len();
+    let n = target.len();
+    let flags = Flags::for_mode(mode);
+    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let cols = n + 1;
+
+    let mut h = vec![0i32; (m + 1) * cols];
+    let mut e = vec![NEG; (m + 1) * cols];
+    let mut f = vec![NEG; (m + 1) * cols];
+
+    // Top row (row 0) borders: free (0) or a penalised gap run. The matching `E[0][j]` is set so
+    // the walk can trace a penalised top-row gap, and left `NEG` when the row is free.
+    for j in 1..=n {
+        h[j] = if flags.top_row_free {
+            0
+        } else {
+            -gap_penalty(go, ge, j)
+        };
+        e[j] = if flags.top_row_free { NEG } else { h[j] };
+    }
+    for i in 1..=m {
+        fill_row(
+            &mut h,
+            &mut e,
+            &mut f,
+            i - 1,
+            i,
+            cols,
+            i,
+            n,
+            query,
+            target,
+            scoring,
+            &flags,
+        );
+    }
+
+    let mut best = Best::new();
+    for i in 0..=m {
+        consider_row(&mut best, &flags, i, m, n, &h[i * cols..i * cols + cols]);
+    }
+
+    let mut cells = FullCells { h, e, f, cols };
+    let (qs, ts, ops) = walk(
+        &mut cells, query, target, scoring, &flags, best.row, best.col,
+    );
     Alignment {
-        score: best_score,
-        query_start: i,
-        query_end: gr,
-        target_start: j,
-        target_end: gc,
-        ops: ops_rev,
+        score: best.score,
+        query_start: qs,
+        query_end: best.row,
+        target_start: ts,
+        target_end: best.col,
+        ops,
+    }
+}
+
+/// [`CellSource`] backed by row checkpoints and a single recomputed strip, bounding memory to
+/// `O(n * sqrt(m))`. Checkpoint `c` holds `H` and `F` at row `c * k`; a strip covers rows
+/// `[base ..= base + k]` (row `base` from its checkpoint, the rest recomputed) and is reloaded as
+/// the walk crosses below it. Recomputed cells equal the full-matrix cells bit-for-bit.
+struct CheckpointCells<'a> {
+    query: &'a [u8],
+    target: &'a [u8],
+    scoring: &'a Scoring,
+    flags: Flags,
+    m: usize,
+    n: usize,
+    k: usize,
+    cols: usize,
+    ckpt_h: Vec<i32>,
+    ckpt_f: Vec<i32>,
+    strip_h: Vec<i32>,
+    strip_e: Vec<i32>,
+    strip_f: Vec<i32>,
+    strip_base: usize,
+    strip_top: usize,
+    loaded: bool,
+}
+
+impl CheckpointCells<'_> {
+    /// Strip base (a checkpoint row) whose recomputed rows include row `i`.
+    fn base_for(&self, i: usize) -> usize {
+        if i == 0 { 0 } else { (i - 1) / self.k * self.k }
+    }
+
+    /// Recompute the strip rooted at checkpoint row `base` into `strip_*`.
+    fn load_strip(&mut self, base: usize) {
+        let cols = self.cols;
+        let top = (base + self.k).min(self.m);
+        let rows = top - base + 1;
+        self.strip_h.clear();
+        self.strip_h.resize(rows * cols, 0);
+        self.strip_e.clear();
+        self.strip_e.resize(rows * cols, NEG);
+        self.strip_f.clear();
+        self.strip_f.resize(rows * cols, NEG);
+
+        // Local row 0 == checkpoint row `base` (its `H`/`F`; `E` only matters for the true top row).
+        let c = base / self.k;
+        self.strip_h[0..cols].copy_from_slice(&self.ckpt_h[c * cols..c * cols + cols]);
+        self.strip_f[0..cols].copy_from_slice(&self.ckpt_f[c * cols..c * cols + cols]);
+        if base == 0 {
+            for j in 1..=self.n {
+                self.strip_e[j] = if self.flags.top_row_free {
+                    NEG
+                } else {
+                    self.strip_h[j]
+                };
+            }
+        }
+
+        for r in 1..rows {
+            let i = base + r;
+            fill_row(
+                &mut self.strip_h,
+                &mut self.strip_e,
+                &mut self.strip_f,
+                r - 1,
+                r,
+                cols,
+                i,
+                self.n,
+                self.query,
+                self.target,
+                self.scoring,
+                &self.flags,
+            );
+        }
+        self.strip_base = base;
+        self.strip_top = top;
+        self.loaded = true;
+    }
+
+    fn local(&self, i: usize, j: usize) -> usize {
+        (i - self.strip_base) * self.cols + j
+    }
+}
+
+impl CellSource for CheckpointCells<'_> {
+    fn prepare(&mut self, i: usize) {
+        let base = self.base_for(i);
+        if !self.loaded || base != self.strip_base {
+            self.load_strip(base);
+        }
+    }
+    fn h(&self, i: usize, j: usize) -> i32 {
+        self.strip_h[self.local(i, j)]
+    }
+    fn e(&self, i: usize, j: usize) -> i32 {
+        self.strip_e[self.local(i, j)]
+    }
+    fn f(&self, i: usize, j: usize) -> i32 {
+        self.strip_f[self.local(i, j)]
+    }
+}
+
+/// Checkpoint (linear-space) DP + backward traceback. Byte-identical to [`traceback_full`]: the
+/// forward pass finds the same end cell and stores every `k`-th `(H, F)` row, then the shared
+/// [`walk`] retraces over strips recomputed to the exact full-matrix cell values.
+fn traceback_checkpoint(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    mode: Mode,
+    k: usize,
+) -> Alignment {
+    let m = query.len();
+    let n = target.len();
+    let flags = Flags::for_mode(mode);
+    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let cols = n + 1;
+    let num_ckpt = m / k + 1;
+
+    let mut ckpt_h = vec![0i32; num_ckpt * cols];
+    let mut ckpt_f = vec![NEG; num_ckpt * cols];
+
+    // Forward pass in two rolling rows (a 2-row ping-pong buffer), storing every k-th `(H, F)`
+    // row and selecting the end cell with the shared tie-break.
+    let mut hh = vec![0i32; 2 * cols];
+    let mut ee = vec![NEG; 2 * cols];
+    let mut ff = vec![NEG; 2 * cols];
+    for (j, cell) in hh.iter_mut().enumerate().take(n + 1).skip(1) {
+        *cell = if flags.top_row_free {
+            0
+        } else {
+            -gap_penalty(go, ge, j)
+        };
+    }
+    let mut best = Best::new();
+    consider_row(&mut best, &flags, 0, m, n, &hh[0..cols]);
+    // Checkpoint 0 is row 0 (H border already in slot 0; F stays NEG).
+    ckpt_h[0..cols].copy_from_slice(&hh[0..cols]);
+
+    let (mut prev, mut cur) = (0usize, 1usize);
+    for i in 1..=m {
+        fill_row(
+            &mut hh, &mut ee, &mut ff, prev, cur, cols, i, n, query, target, scoring, &flags,
+        );
+        consider_row(
+            &mut best,
+            &flags,
+            i,
+            m,
+            n,
+            &hh[cur * cols..cur * cols + cols],
+        );
+        if i % k == 0 {
+            let c = i / k;
+            ckpt_h[c * cols..c * cols + cols].copy_from_slice(&hh[cur * cols..cur * cols + cols]);
+            ckpt_f[c * cols..c * cols + cols].copy_from_slice(&ff[cur * cols..cur * cols + cols]);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+
+    let mut cells = CheckpointCells {
+        query,
+        target,
+        scoring,
+        flags: Flags::for_mode(mode),
+        m,
+        n,
+        k,
+        cols,
+        ckpt_h,
+        ckpt_f,
+        strip_h: Vec::new(),
+        strip_e: Vec::new(),
+        strip_f: Vec::new(),
+        strip_base: 0,
+        strip_top: 0,
+        loaded: false,
+    };
+    let (qs, ts, ops) = walk(
+        &mut cells, query, target, scoring, &flags, best.row, best.col,
+    );
+    Alignment {
+        score: best.score,
+        query_start: qs,
+        query_end: best.row,
+        target_start: ts,
+        target_end: best.col,
+        ops,
     }
 }
 
