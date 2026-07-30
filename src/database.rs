@@ -30,6 +30,7 @@
 //! assert_eq!(hit.db_index, 0);
 //! ```
 
+use crate::align::{AlignedHit, Alignment};
 use crate::backend::{self, Backend, BackendChoice};
 use crate::error::{Error, Result};
 use crate::hit::BestHit;
@@ -235,6 +236,71 @@ impl Database {
         }
     }
 
+    /// Scan `query` against every sequence and return the full [`Alignment`] of the single best
+    /// hit, tagged with its database index.
+    ///
+    /// The best target is found by the fast (SIMD, where applicable) score pass — same winner and
+    /// tie-break as [`scan`](Self::scan) — and only that one target is traced back, so the scalar
+    /// traceback runs once rather than per sequence. The database must be built with
+    /// [`SearchType::Alignment`]; its `max_bytes` budget was proven sufficient at construction, so
+    /// this is infallible.
+    ///
+    /// Same caller contract as [`scan`](Self::scan): `query` is pre-encoded and `<= max_query_len`.
+    #[must_use]
+    pub fn scan_aligned(&self, scratch: &mut Scratch, query: &[u8]) -> AlignedHit {
+        let max_bytes = self.alignment_budget();
+        let best = self.scan(scratch, query);
+        let alignment = self.traceback_for(best.db_index, query, max_bytes);
+        AlignedHit {
+            db_index: best.db_index,
+            alignment,
+        }
+    }
+
+    /// Scan `query` against every sequence and write **one [`Alignment`] per database sequence**
+    /// into `out`, in database order (`out[i]` is the alignment against sequence `i`). `out` is
+    /// cleared first and reused.
+    ///
+    /// This is the per-target counterpart to [`scan_aligned`](Self::scan_aligned): it traces back
+    /// every sequence. The database must be built with [`SearchType::Alignment`]; the budget was
+    /// proven sufficient at construction, so this is infallible.
+    ///
+    /// Same caller contract as [`scan`](Self::scan): `query` is pre-encoded and `<= max_query_len`.
+    pub fn scan_all_aligned(&self, _scratch: &mut Scratch, query: &[u8], out: &mut Vec<Alignment>) {
+        let max_bytes = self.alignment_budget();
+        out.clear();
+        out.reserve(self.sequences.len());
+        for index in 0..self.sequences.len() {
+            out.push(self.traceback_for(index, query, max_bytes));
+        }
+    }
+
+    /// The traceback budget, asserting the database was built for alignment.
+    fn alignment_budget(&self) -> usize {
+        self.search_type.max_bytes().expect(
+            "scan_aligned/scan_all_aligned require a database built with SearchType::Alignment",
+        )
+    }
+
+    /// Trace back `query` against sequence `db_index`. The budget was proven sufficient for the
+    /// declared maximum problem size at construction, so this cannot exceed it.
+    fn traceback_for(&self, db_index: usize, query: &[u8], max_bytes: usize) -> Alignment {
+        debug_assert!(
+            query.len() <= self.max_query_len,
+            "query length {} exceeds declared max_query_len {}",
+            query.len(),
+            self.max_query_len
+        );
+        crate::align::traceback(
+            query,
+            &self.sequences[db_index],
+            &self.scoring,
+            self.mode,
+            max_bytes,
+        )
+        .expect("traceback budget proven sufficient at construction")
+    }
+
     /// The number of sequences in the database (always `>= 1`).
     #[must_use]
     pub fn sequence_count(&self) -> usize {
@@ -411,6 +477,19 @@ impl DatabaseBuilder {
 
         // Prove i32 suffices for any query up to max_query_len against these targets.
         let width = scoring.required_width(mode, max_query_len, max_target_len)?;
+
+        // For an `Alignment` search, prove the traceback budget covers the largest problem this
+        // database can pose (`max_query_len` x `max_target_len`). With that proven once, every
+        // `scan_aligned`/`scan_all_aligned` call is infallible — no budget check in the loop.
+        if let Some(max_bytes) = search_type.max_bytes() {
+            let needed = crate::align::traceback_min_bytes(max_query_len, max_target_len);
+            if needed > max_bytes as u64 {
+                return Err(Error::TracebackBudgetExceeded {
+                    needed_bytes: needed,
+                    budget_bytes: max_bytes,
+                });
+            }
+        }
 
         // Resolve the backend: an explicit builder choice wins, else HYALITE_BACKEND, else auto.
         let choice = match self.backend_choice {

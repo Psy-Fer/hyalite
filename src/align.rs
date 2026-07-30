@@ -79,6 +79,16 @@ pub struct Alignment {
     pub ops: Vec<AlignOp>,
 }
 
+/// A database sequence (identified by its index) paired with the alignment against it. Returned
+/// by [`Database::scan_aligned`](crate::Database::scan_aligned).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignedHit {
+    /// Index of the aligned database sequence.
+    pub db_index: usize,
+    /// The alignment against that sequence.
+    pub alignment: Alignment,
+}
+
 impl Alignment {
     /// The CIGAR string with match and mismatch collapsed to `M` (the standard operator set):
     /// e.g. `"5M1I3M"`. An empty alignment yields `""`.
@@ -173,7 +183,19 @@ pub fn align(
         }
     }
     scoring.required_width(mode, query.len(), target.len())?;
+    traceback(query, target, scoring, mode, max_bytes)
+}
 
+/// The traceback dispatch (full-matrix vs checkpoint) without the input revalidation done by
+/// [`align`]. Callers that have already validated symbols and the width bound — notably the
+/// [`Database`](crate::Database) scan paths — use this directly.
+pub(crate) fn traceback(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    mode: Mode,
+    max_bytes: usize,
+) -> Result<Alignment> {
     let m = query.len();
     let n = target.len();
 
@@ -196,6 +218,18 @@ pub fn align(
         });
     }
     Ok(traceback_checkpoint(query, target, scoring, mode, k))
+}
+
+/// The smallest `max_bytes` for which [`traceback`] succeeds on an `m`-by-`n` problem: the cheaper
+/// of the full-matrix and checkpoint footprints. Monotonic in `m` and `n`, so a database can
+/// validate its declared maximum problem size once and every shorter scan is then infallible.
+pub(crate) fn traceback_min_bytes(m: usize, n: usize) -> u64 {
+    let full = full_matrix_bytes(m, n);
+    if m == 0 || n == 0 {
+        return full;
+    }
+    let k = (m as u64).isqrt().max(1) as usize;
+    full.min(checkpoint_bytes(m, n, k))
 }
 
 /// Bytes the full-matrix path allocates: three `i32` matrices of `(m+1) * (n+1)` cells.

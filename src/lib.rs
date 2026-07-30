@@ -22,10 +22,11 @@
 //!
 //! # Status
 //!
-//! Scalar and SIMD (SSE4.1/AVX2/NEON) backends across all four alignment [`Mode`]s, `Score`
-//! and `ScoreEnd` [search types](SearchType), a per-target [`Database::scan_all`], and
-//! single-pair traceback via [`align`] (full-matrix; a linear-space path for large pairs and a
-//! striped `align_pair` land in later milestones — see `handover.md`).
+//! Scalar and SIMD (SSE4.1/AVX2/NEON) backends across all four alignment [`Mode`]s; `Score`,
+//! `ScoreEnd`, and full `Alignment` [search types](SearchType); per-target [`Database::scan_all`]
+//! and [`Database::scan_aligned`]; and traceback via [`align`] (full-matrix, with an automatic
+//! linear-space path for large pairs). A striped `align_pair` lands in a later milestone — see
+//! `handover.md`.
 
 // `deny` rather than `forbid` so the SIMD backend modules (M2b+) can locally `allow(unsafe_code)`
 // for intrinsics; everything else stays unsafe-free.
@@ -43,7 +44,7 @@ mod scoring;
 mod search;
 mod width;
 
-pub use align::{AlignOp, Alignment, align};
+pub use align::{AlignOp, AlignedHit, Alignment, align};
 pub use backend::{BACKEND_ENV_VAR, Backend, BackendChoice};
 pub use database::{Database, DatabaseBuilder, Scratch};
 pub use error::{Error, Result};

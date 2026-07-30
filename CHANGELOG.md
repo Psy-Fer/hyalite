@@ -30,6 +30,12 @@ All notable changes to `hyalite` are documented here. The format follows
   genome-scale traceback feasible at all — a 100k×100k global alignment needs ~604 MiB via the
   checkpoint path where the full matrix would need ~112 GiB. Over-tight budgets that even the
   checkpoint path cannot meet return `TracebackBudgetExceeded`.
+- `SearchType::Alignment { max_bytes }` and the database traceback API: `Database::scan_aligned`
+  returns the full `Alignment` of the single best hit (found by the fast score pass, then traced
+  back once) as an `AlignedHit { db_index, alignment }`; `Database::scan_all_aligned` writes one
+  `Alignment` per sequence into a caller `Vec`. The `max_bytes` budget is proven sufficient for the
+  database's declared maximum problem size at construction, so both scans are infallible. Verified
+  against the per-target `align()` result across every backend, all modes, and 2500 random schemes.
 
 ## [0.1.0] - 2026-07-29
 

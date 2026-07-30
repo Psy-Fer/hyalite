@@ -192,6 +192,50 @@ fn sw_recovers_exact_substring() {
     assert_eq!((a.target_start, a.target_end), (0, 4));
 }
 
+#[test]
+fn hw_query_is_a_free_window_of_the_target() {
+    let s = dna();
+    let q = [1u8, 2]; // CG
+    let t = [0u8, 1, 2, 3]; // ACGT; CG sits at t[1..3], leading/trailing target free
+    let a = align(&q, &t, &s, Mode::Hw, usize::MAX).unwrap();
+    assert_eq!(a.score, 4);
+    assert_eq!(ops(&a), vec![AlignOp::Match, AlignOp::Match]);
+    assert_eq!((a.query_start, a.query_end), (0, 2)); // whole query consumed
+    assert_eq!((a.target_start, a.target_end), (1, 3)); // free target ends trimmed
+    assert_eq!(a.cigar(), "2M");
+}
+
+#[test]
+fn ov_prefers_smaller_target_end_on_a_tie() {
+    // Two equal-scoring overlaps; the documented tie-break takes the smallest target end.
+    let s = dna();
+    let q = [2u8, 3]; // GT
+    let t = [2u8, 3, 2, 3]; // GTGT: GT matches at t[0..2] and t[2..4], same score
+    let a = align(&q, &t, &s, Mode::Ov, usize::MAX).unwrap();
+    assert_eq!(a.score, 4);
+    assert_eq!((a.target_start, a.target_end), (0, 2)); // smallest target end wins
+    assert_consistent(&a, &q, &t, &s, Mode::Ov);
+}
+
+#[test]
+fn in_alphabet_unknown_symbol_traces_back() {
+    // A 5-symbol alphabet where index 4 is an "N": scored, not special-cased. Including at the
+    // very start of the alignment (the pyopal crash case) must just produce a valid CIGAR.
+    let mut matrix = id_matrix(5, 2, -1);
+    matrix[4 * 5 + 4] = -1; // N vs N is not a reward here
+    let s = Scoring::new(5, matrix, 2, 1).unwrap();
+    for mode in ALL_MODES {
+        let q = [4u8, 0, 1]; // N A C
+        let t = [4u8, 0, 1]; // N A C
+        let a = align(&q, &t, &s, mode, usize::MAX).unwrap();
+        assert_consistent(&a, &q, &t, &s, mode);
+        // First op corresponds to the leading N/N column; symbol equality makes it a Match.
+        if !a.ops.is_empty() {
+            assert_eq!(a.ops[0], AlignOp::Match, "{mode}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Edge geometry
 // ---------------------------------------------------------------------------
