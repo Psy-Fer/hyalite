@@ -16,6 +16,12 @@ All notable changes to `hyalite` are documented here. The format follows
   SIMD speed. Positions are carried in a parallel `i16` domain alongside the `i8` scores; inputs
   whose lengths exceed the `i16` position range fall back to the scalar per-sequence recovery.
   Bit-identical to the scalar oracle on every backend (verified across backends × layouts × modes).
+- Traceback: `align()` returns a full `Alignment` (score, half-open query/target spans, and a
+  `Vec<AlignOp>` of `Match`/`Mismatch`/`Ins`/`Del`), with `.cigar()` (M-collapsed) and
+  `.cigar_extended()` (`=`/`X`) formatters. Scalar Gotoh affine DP with a documented canonical
+  backward walk; a `max_bytes` budget bounds the working memory (over-budget is a typed
+  `TracebackBudgetExceeded` error until the linear-space Hirschberg path lands). Verified optimal
+  against the independent brute-force oracle and by re-scoring the emitted ops, across all modes.
 
 ## [0.1.0] - 2026-07-29
 

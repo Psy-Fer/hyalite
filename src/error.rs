@@ -82,6 +82,17 @@ pub enum Error {
         /// The unrecognised name.
         name: String,
     },
+
+    /// A traceback ([`align`](crate::align)) needed more working memory than the caller's
+    /// `max_bytes` budget allowed. The full-matrix path needs `3 * (m+1) * (n+1) * 4` bytes; raise
+    /// the budget, or await the linear-space path that serves larger pairs within a bounded
+    /// footprint.
+    TracebackBudgetExceeded {
+        /// Bytes the full-matrix traceback would require.
+        needed_bytes: u64,
+        /// The caller's `max_bytes` budget.
+        budget_bytes: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -132,6 +143,14 @@ impl fmt::Display for Error {
                 f,
                 "unrecognised backend name {name:?}; expected one of: \
                  auto, scalar, sse4.1, avx2, neon"
+            ),
+            Error::TracebackBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            } => write!(
+                f,
+                "traceback needs {needed_bytes} bytes but the budget is {budget_bytes}; \
+                 raise max_bytes (the linear-space path is not yet available)"
             ),
         }
     }
