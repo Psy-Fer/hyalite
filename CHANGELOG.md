@@ -8,6 +8,19 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- Per-position maxima and bwa-compatible `score2`: `align_pair_position_max(query, target, scoring,
+  &mut Vec<i32>)` runs a local (SW) alignment and fills the caller's buffer with the best score
+  **ending at each target position** (`out[t] = max_i H[i][t]`), returning the global `BestHit` as
+  well; `score2(colmax, best_score, best_target_end, matrix_max, min_score)` applies bwa-mem's
+  `ksw.c` recipe — exclusion window `w = ceil(best_score / matrix_max)` around the best end, plus
+  contiguous-peak collapse and threshold — to yield the competing second-best peak `(score,
+  target_pos)`. This is the primitive a bwa-mem-style mate-rescue / mapping-quality consumer needs.
+  The maxima array is a pure per-column maximum, so it needs no tie-break and is deterministic by
+  construction (same across every backend), unlike an end position. Currently scalar-backed (a
+  striped-SIMD acceleration of the maxima sweep lands next); the `score2` selection is validated
+  against an independent transcription of bwa's peak-list algorithm, and the maxima against an
+  independent full-matrix SW oracle.
+
 - `i16`-width database scan on SIMD: the inter-sequence kernel now runs at `i16` (SSE4.1 → 8 lanes,
   AVX2 → 16 lanes, NEON → 8 lanes) via the Precomputed layout, so databases whose score proof
   exceeds `i8` — long reads, large-magnitude matrices, and any alphabet larger than 16 (which the

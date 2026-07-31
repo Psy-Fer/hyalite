@@ -160,21 +160,14 @@ impl DpBuffers {
     }
 }
 
-/// Run the scalar DP for one query/target pair, returning `(score, query_end, target_end)`.
-///
-/// Callers must have validated that every symbol is `< scoring.alphabet_len()`; this routine
-/// indexes the scoring matrix directly. `buf` is resized (reusing capacity) and fully
-/// overwritten, so its prior contents are irrelevant.
-pub(crate) fn align_core(
-    query: &[u8],
-    target: &[u8],
-    scoring: &Scoring,
-    mode: Mode,
-    buf: &mut DpBuffers,
-) -> (i32, Option<usize>, Option<usize>) {
+/// Fill `buf.h` with the full `(m + 1) * (n + 1)` `H` matrix (row-major) for one query/target pair
+/// under `flags`. `buf.f` is used as the carried `F` column. Callers must have validated that every
+/// symbol is `< scoring.alphabet_len()`; this routine indexes the scoring matrix directly. `buf` is
+/// resized (reusing capacity) and fully overwritten, so its prior contents are irrelevant.
+#[inline]
+fn fill_dp(query: &[u8], target: &[u8], scoring: &Scoring, flags: &Flags, buf: &mut DpBuffers) {
     let m = query.len();
     let n = target.len();
-    let flags = Flags::for_mode(mode);
     let (gap_open, gap_ext) = (scoring.gap_open(), scoring.gap_ext());
     let cols = n + 1;
     let idx = |i: usize, j: usize| i * cols + j;
@@ -220,8 +213,20 @@ pub(crate) fn align_core(
             h[idx(i, j)] = cell;
         }
     }
+}
 
-    // Answer region.
+/// Reduce the filled `H` matrix to `(score, query_end, target_end)` over the mode's answer region,
+/// applying the lane-order-independent tie-break (maximise score, then minimise `(target_end,
+/// query_end)`). `h` must be the `(m + 1) * (n + 1)` matrix from [`fill_dp`].
+#[inline]
+fn reduce_answer(
+    h: &[i32],
+    flags: &Flags,
+    m: usize,
+    n: usize,
+) -> (i32, Option<usize>, Option<usize>) {
+    let cols = n + 1;
+    let idx = |i: usize, j: usize| i * cols + j;
     let mut best = Best {
         score: NEG,
         grid_row: 0,
@@ -246,10 +251,28 @@ pub(crate) fn align_core(
             }
         }
     }
+    (
+        best.score,
+        best.grid_row.checked_sub(1),
+        best.grid_col.checked_sub(1),
+    )
+}
 
-    let query_end = best.grid_row.checked_sub(1);
-    let target_end = best.grid_col.checked_sub(1);
-    (best.score, query_end, target_end)
+/// Run the scalar DP for one query/target pair, returning `(score, query_end, target_end)`.
+///
+/// Callers must have validated that every symbol is `< scoring.alphabet_len()`; this routine
+/// indexes the scoring matrix directly. `buf` is resized (reusing capacity) and fully
+/// overwritten, so its prior contents are irrelevant.
+pub(crate) fn align_core(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    mode: Mode,
+    buf: &mut DpBuffers,
+) -> (i32, Option<usize>, Option<usize>) {
+    let flags = Flags::for_mode(mode);
+    fill_dp(query, target, scoring, &flags, buf);
+    reduce_answer(&buf.h, &flags, query.len(), target.len())
 }
 
 /// Align a single query against a single target and return the best-scoring [`BestHit`].
@@ -320,6 +343,148 @@ pub fn align_pair(
         query_end,
         target_end,
     })
+}
+
+/// Align a single query against a single target in **local (Smith-Waterman)** mode and fill `out`
+/// with the *per-target-position maxima*: `out[t]` is the best local alignment score **ending at
+/// target position `t`** (0-based), i.e. `max_i H[i][t]` over the SW DP. Returns the global
+/// [`BestHit`] (best score with its query/target end) as well.
+///
+/// This is the primitive a bwa-mem-style **mate-rescue** consumer needs for a second-best-score
+/// (`score2`) / mapping-quality computation: run it once for the read against its expected mate
+/// window, then feed `out` (plus the returned best `score`/`target_end` and the scoring matrix's
+/// maximum entry) to [`score2`] to obtain the competing peak. `out` is cleared and refilled.
+///
+/// The array is a pure per-column maximum: every value is `>= 0` (the SW floor), it needs no
+/// tie-break, and it is deterministic by construction — the same across every present and future
+/// backend, unlike an end *position*. Positions are 0-based; a consumer wanting half-open
+/// coordinates adds 1.
+///
+/// # Errors
+///
+/// - [`Error::SymbolOutOfRange`] if any symbol is `>= scoring.alphabet_len()`.
+/// - [`Error::ScoreRangeTooWide`] if the reachable score could overflow `i32` for these lengths.
+pub fn align_pair_position_max(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    out: &mut Vec<i32>,
+) -> Result<BestHit> {
+    let alphabet_len = scoring.alphabet_len();
+    for &sym in query.iter().chain(target.iter()) {
+        if sym as usize >= alphabet_len {
+            return Err(Error::SymbolOutOfRange {
+                symbol: sym as usize,
+                alphabet_len,
+            });
+        }
+    }
+
+    // Per-position maxima / `score2` is a local-alignment concept (see `score2`); this entry is
+    // SW-only. Prove i32 suffices for these lengths before running the DP.
+    let mode = Mode::Sw;
+    scoring.required_width(mode, query.len(), target.len())?;
+
+    let flags = Flags::for_mode(mode);
+    let mut buf = DpBuffers::new();
+    fill_dp(query, target, scoring, &flags, &mut buf);
+
+    let (m, n) = (query.len(), target.len());
+    let cols = n + 1;
+    out.clear();
+    out.reserve(n);
+    for t in 0..n {
+        // Best SW score ending at target position `t` = max over the query axis of H's column
+        // `t + 1`. The `0` seed is the SW floor (an empty alignment); H[0][*] is already 0.
+        let mut mx = 0i32;
+        for i in 0..=m {
+            let v = buf.h[i * cols + (t + 1)];
+            if v > mx {
+                mx = v;
+            }
+        }
+        out.push(mx);
+    }
+
+    let (score, query_end, target_end) = reduce_answer(&buf.h, &flags, m, n);
+    Ok(BestHit {
+        score,
+        db_index: 0,
+        query_end,
+        target_end,
+    })
+}
+
+/// bwa-mem-compatible **second-best score (`score2`)** from a per-target-position maxima array
+/// (as produced by [`align_pair_position_max`]).
+///
+/// Returns the highest-scoring secondary *peak* whose target end lies **outside** the exclusion
+/// window `[best_target_end - w, best_target_end + w]`, where `w = ceil(best_score / matrix_max)` —
+/// `w` being a lower bound on the primary alignment's target span, so anything inside the window is
+/// treated as overlapping the best hit. This reproduces bwa's `ksw.c` recipe exactly:
+///
+/// - only columns scoring `>= min_score` are considered (bwa's `minsc` threshold);
+/// - contiguous above-threshold columns are **collapsed into a single peak**, keeping the run's
+///   maximum and its position (bwa checks contiguity against the last kept peak *position*, so a
+///   run whose maximum is not at its end can split — replicated here);
+/// - among qualifying peaks, the highest score wins; ties go to the smallest target position.
+///
+/// Returns `(score2, target_pos)` (0-based `target_pos`) or `None` if no secondary peak qualifies
+/// (equivalently bwa's `score2 = 0`). Returns `None` if `matrix_max <= 0` (no positive substitution
+/// score, so the window is undefined). `matrix_max` is the **maximum substitution-matrix entry**
+/// (`scoring.entry_bounds().1`), not the maximum observed score.
+#[must_use]
+pub fn score2(
+    colmax: &[i32],
+    best_score: i32,
+    best_target_end: usize,
+    matrix_max: i32,
+    min_score: i32,
+) -> Option<(i32, usize)> {
+    if matrix_max <= 0 {
+        return None;
+    }
+    // Half-width = ceil(best_score / matrix_max), computed in i64 (best_score >= 0 for SW).
+    let w = ((best_score.max(0) as i64 + matrix_max as i64 - 1) / matrix_max as i64).max(0);
+    let te = best_target_end as i64;
+    let (low, high) = (te - w, te + w);
+
+    let mut best2: Option<(i32, usize)> = None;
+    // Fold a finished peak into `best2` if it falls outside the exclusion window.
+    let consider = |best2: &mut Option<(i32, usize)>, score: i32, pos: usize| {
+        let p = pos as i64;
+        if (p < low || p > high) && best2.is_none_or(|(bs, _)| score > bs) {
+            *best2 = Some((score, pos));
+        }
+    };
+
+    // Current open peak: (running max score, position of that max).
+    let mut cur: Option<(i32, usize)> = None;
+    for (i, &v) in colmax.iter().enumerate() {
+        if v < min_score {
+            continue;
+        }
+        match cur {
+            // Contiguous with the current peak's max position: extend, keeping the higher score.
+            Some((cs, cp)) if cp + 1 == i => {
+                if cs < v {
+                    cur = Some((v, i));
+                }
+            }
+            // A gap (sub-threshold column) or improvement past the stored position starts a new
+            // peak; finish the previous one first.
+            _ => {
+                if let Some((cs, cp)) = cur {
+                    consider(&mut best2, cs, cp);
+                }
+                cur = Some((v, i));
+            }
+        }
+    }
+    if let Some((cs, cp)) = cur {
+        consider(&mut best2, cs, cp);
+    }
+    best2
 }
 
 #[cfg(test)]
@@ -520,6 +685,198 @@ mod tests {
                     mode, max_mag, width, width.max_abs()
                 );
             }
+        }
+    }
+
+    // ---- Per-position maxima (`align_pair_position_max`) + `score2` ---------------------------
+
+    /// Independent naive full-matrix SW oracle: returns the per-target-column maxima and the global
+    /// best. Deliberately a separate implementation from `fill_dp` (Vec-of-Vec, explicit E/F).
+    fn naive_sw_colmax(q: &[u8], t: &[u8], s: &Scoring) -> (Vec<i32>, i32) {
+        let (m, n) = (q.len(), t.len());
+        let (go, ge) = (s.gap_open(), s.gap_ext());
+        let ninf = i32::MIN / 2;
+        let mut h = vec![vec![0i32; n + 1]; m + 1];
+        let mut e = vec![vec![ninf; n + 1]; m + 1];
+        let mut f = vec![vec![ninf; n + 1]; m + 1];
+        for i in 1..=m {
+            for j in 1..=n {
+                e[i][j] = (h[i][j - 1] - go).max(e[i][j - 1] - ge);
+                f[i][j] = (h[i - 1][j] - go).max(f[i - 1][j] - ge);
+                let sub = s.score(q[i - 1] as usize, t[j - 1] as usize);
+                h[i][j] = (h[i - 1][j - 1] + sub).max(e[i][j]).max(f[i][j]).max(0);
+            }
+        }
+        let mut colmax = vec![0i32; n];
+        let mut best = 0i32;
+        for (jt, cm) in colmax.iter_mut().enumerate() {
+            let mut mx = 0i32;
+            for row in h.iter() {
+                mx = mx.max(row[jt + 1]);
+            }
+            *cm = mx;
+            best = best.max(mx);
+        }
+        (colmax, best)
+    }
+
+    #[test]
+    fn position_max_hand_computed_cases() {
+        let s = Scoring::new(4, matrix(4, 2, -1), 2, 1).unwrap();
+        let mut out = Vec::new();
+
+        // Perfect diagonal: best ending at target pos t is the t+1-long match run.
+        let hit = align_pair_position_max(&[0, 1, 2, 3], &[0, 1, 2, 3], &s, &mut out).unwrap();
+        assert_eq!(out, vec![2, 4, 6, 8]);
+        assert_eq!(hit.score, 8);
+        assert_eq!((hit.query_end, hit.target_end), (Some(3), Some(3)));
+
+        // Match only at the last target position.
+        let hit = align_pair_position_max(&[0], &[1, 1, 0], &s, &mut out).unwrap();
+        assert_eq!(out, vec![0, 0, 2]);
+        assert_eq!(hit.score, 2);
+        assert_eq!(hit.target_end, Some(2));
+
+        // All-mismatch clamps to the SW floor everywhere.
+        let hit = align_pair_position_max(&[0, 0], &[1, 1], &s, &mut out).unwrap();
+        assert_eq!(out, vec![0, 0]);
+        assert_eq!(hit.score, 0);
+
+        // Empty target => empty array; empty query => all-zero array.
+        let hit = align_pair_position_max(&[0, 1], &[], &s, &mut out).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(hit.score, 0);
+        align_pair_position_max(&[], &[0, 1, 2], &s, &mut out).unwrap();
+        assert_eq!(out, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn position_max_out_of_range_symbol_is_reported() {
+        let s = Scoring::new(4, matrix(4, 2, -1), 2, 1).unwrap();
+        let mut out = vec![1, 2, 3]; // must be left cleared/refilled, never read stale
+        let err = align_pair_position_max(&[0, 5], &[0], &s, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            Error::SymbolOutOfRange {
+                symbol: 5,
+                alphabet_len: 4
+            }
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        /// The per-position maxima array equals the independent naive full-matrix column maxima,
+        /// its length is the target length, the returned hit equals the scalar SW oracle, and the
+        /// global best equals the array maximum (all >= 0). Many varied alphabets/matrices/gaps.
+        #[test]
+        fn position_max_matches_naive_and_oracle((al, mat, go, ge, q, t) in scheme_and_pair()) {
+            let s = Scoring::new(al, mat, go, ge).unwrap();
+            let mut out = Vec::new();
+            let hit = align_pair_position_max(&q, &t, &s, &mut out).unwrap();
+
+            prop_assert_eq!(out.len(), t.len());
+            let (want_col, want_best) = naive_sw_colmax(&q, &t, &s);
+            prop_assert_eq!(&out, &want_col);
+
+            let oracle = align_pair(&q, &t, &s, Mode::Sw, SearchType::ScoreEnd).unwrap();
+            prop_assert_eq!(hit, oracle);
+
+            let arr_best = out.iter().copied().max().unwrap_or(0);
+            prop_assert_eq!(hit.score, arr_best);
+            prop_assert_eq!(hit.score, want_best);
+            prop_assert!(out.iter().all(|&v| v >= 0));
+        }
+    }
+
+    /// Reference `score2`: a structurally different transcription of bwa's `ksw.c` recipe — build
+    /// the explicit peak list (`b[]`), then filter by the exclusion window. Cross-checks the
+    /// streaming `score2` implementation.
+    fn score2_reference(
+        colmax: &[i32],
+        best_score: i32,
+        te: usize,
+        matrix_max: i32,
+        min_score: i32,
+    ) -> Option<(i32, usize)> {
+        if matrix_max <= 0 {
+            return None;
+        }
+        let mut peaks: Vec<(i32, usize)> = Vec::new();
+        for (i, &v) in colmax.iter().enumerate() {
+            if v < min_score {
+                continue;
+            }
+            match peaks.last().copied() {
+                Some((_, p)) if p + 1 == i => {
+                    let last = peaks.last_mut().unwrap();
+                    if last.0 < v {
+                        *last = (v, i);
+                    }
+                }
+                _ => peaks.push((v, i)),
+            }
+        }
+        let w = ((best_score.max(0) as i64 + matrix_max as i64 - 1) / matrix_max as i64).max(0);
+        let (low, high) = (te as i64 - w, te as i64 + w);
+        let mut best2: Option<(i32, usize)> = None;
+        for (score, pos) in peaks {
+            let p = pos as i64;
+            if (p < low || p > high) && best2.is_none_or(|(bs, _)| score > bs) {
+                best2 = Some((score, pos));
+            }
+        }
+        best2
+    }
+
+    #[test]
+    fn score2_hand_computed_cases() {
+        // Two distinct peaks; the primary (pos 1) is inside the window, the far one survives.
+        let colmax = [0, 5, 0, 0, 0, 0, 0, 0, 4, 0];
+        assert_eq!(score2(&colmax, 5, 1, 1, 1), Some((4, 8))); // w=5, window [-4,6]; 8 outside
+
+        // The literally-second-highest cell (the 4 adjacent to the max 5) is COLLAPSED into the
+        // primary peak, not returned as score2 — the whole point of the window+collapse.
+        let colmax = [0, 3, 5, 4, 0];
+        assert_eq!(score2(&colmax, 5, 2, 5, 1), None); // w=1, window [1,3]; only peak is inside
+
+        // The collapse-split quirk: a contiguous run whose max is not at its end splits into two
+        // peaks (bwa checks contiguity against the last stored max position).
+        let colmax = [3, 5, 4, 6];
+        assert_eq!(score2(&colmax, 1, 20, 1, 1), Some((6, 3))); // peaks (5,1),(6,3); best is (6,3)
+
+        // Ties go to the smallest target position (strict `>` on replacement).
+        let colmax = [7, 0, 7];
+        assert_eq!(score2(&colmax, 1, 10, 1, 1), Some((7, 0)));
+
+        // No qualifying peak => None; and a non-positive matrix max => None.
+        assert_eq!(score2(&[0, 0, 0], 0, 0, 1, 1), None);
+        assert_eq!(score2(&[5, 5], 5, 0, 0, 1), None);
+
+        // Threshold gates out sub-minsc columns. matrix_max=9 => w=1, window [5,7].
+        let colmax = [2, 0, 0, 0, 0, 0, 9];
+        assert_eq!(score2(&colmax, 9, 6, 9, 5), None); // pos6 (best) in window; pos0=2 < minsc 5
+        assert_eq!(score2(&colmax, 9, 6, 9, 1), Some((2, 0))); // minsc 1: pos0 a peak, outside
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(600))]
+
+        /// The streaming `score2` matches the explicit-peak-list reference on random arrays,
+        /// windows, thresholds, and matrix maxima — including the degenerate cases.
+        #[test]
+        fn score2_matches_reference(
+            colmax in prop::collection::vec(0i32..=20, 0..=40),
+            best_score in 0i32..=40,
+            te in 0usize..=40,
+            matrix_max in -2i32..=8,
+            min_score in 1i32..=6,
+        ) {
+            prop_assert_eq!(
+                score2(&colmax, best_score, te, matrix_max, min_score),
+                score2_reference(&colmax, best_score, te, matrix_max, min_score)
+            );
         }
     }
 }
