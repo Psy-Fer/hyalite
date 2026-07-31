@@ -994,6 +994,102 @@ mod tests {
         }
     }
 
+    /// Faithful scalar per-target-column-max baseline: the same flat-`H` SW DP and per-column max
+    /// that `align_pair_position_max` runs on its scalar path, allocating per call just as the
+    /// public entry does (via `DpBuffers::new()`), so the comparison against the striped SIMD kernel
+    /// (which also allocates its striped buffers per call) is apples-to-apples.
+    fn scalar_colmax_baseline(q: &[u8], t: &[u8], s: &Scoring, out: &mut Vec<i32>) {
+        let (m, n) = (q.len(), t.len());
+        let (go, ge) = (s.gap_open(), s.gap_ext());
+        let cols = n + 1;
+        let idx = |i: usize, j: usize| i * cols + j;
+        let ninf = i32::MIN / 4;
+        let mut h = vec![0i32; (m + 1) * cols];
+        let mut f = vec![ninf; cols];
+        for i in 1..=m {
+            let mut e = ninf;
+            for j in 1..=n {
+                e = (h[idx(i, j - 1)] - go).max(e - ge);
+                f[j] = (h[idx(i - 1, j)] - go).max(f[j] - ge);
+                let sub = s.score(q[i - 1] as usize, t[j - 1] as usize);
+                h[idx(i, j)] = (h[idx(i - 1, j - 1)] + sub).max(e).max(f[j]).max(0);
+            }
+        }
+        out.clear();
+        out.reserve(n);
+        for jt in 0..n {
+            let mut mx = 0i32;
+            for i in 0..=m {
+                mx = mx.max(h[idx(i, jt + 1)]);
+            }
+            out.push(mx);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing; run with: cargo test --release striped::tests::position_max_timing -- --ignored --nocapture"]
+    fn position_max_timing() {
+        use std::time::Instant;
+        // Scorings whose SW score provably fits the named width at the sizes below, so the striped
+        // kernel actually runs there (an i32-width case would fall back to scalar). `i8` needs short
+        // reads (score < 128); `i16` covers the mate-rescue shape (a ~150 nt read vs a ~1400 nt
+        // window) and longer.
+        let i8_scoring = Scoring::new(4, id_matrix(4, 2, -1), 2, 1).unwrap();
+        let i16_scoring = Scoring::new(4, id_matrix(4, 10, -5), 8, 2).unwrap();
+        let cases = [
+            ("i8", &i8_scoring, 60usize, 90usize, 20000usize),
+            ("i16", &i16_scoring, 150, 1400, 2000),
+            ("i16", &i16_scoring, 1000, 1000, 200),
+        ];
+
+        for (label, s, qlen, tlen, reps) in cases {
+            let q: Vec<u8> = (0..qlen as u32)
+                .map(|i| (i.wrapping_mul(7) % 4) as u8)
+                .collect();
+            let t: Vec<u8> = (0..tlen as u32)
+                .map(|i| (i.wrapping_mul(5) % 4) as u8)
+                .collect();
+            let width = s.required_width(Mode::Sw, qlen, tlen).unwrap();
+
+            // Correctness guard: the timed paths must agree before we trust the numbers.
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            scalar_colmax_baseline(&q, &t, s, &mut a);
+            assert!(
+                farrar_position_max_simd(&q, &t, s, width, &mut b).is_some(),
+                "{label}: expected a SIMD backend at width {width}"
+            );
+            assert_eq!(
+                a, b,
+                "{label} {width} {qlen}x{tlen}: SIMD disagrees with scalar"
+            );
+
+            let mut out = Vec::new();
+            let mut acc = 0i64;
+
+            let start = Instant::now();
+            for _ in 0..reps {
+                scalar_colmax_baseline(&q, &t, s, &mut out);
+                acc ^= out[out.len() - 1] as i64;
+            }
+            let scalar = start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            for _ in 0..reps {
+                farrar_position_max_simd(&q, &t, s, width, &mut out);
+                acc ^= out[out.len() - 1] as i64;
+            }
+            let simd = start.elapsed().as_secs_f64();
+
+            println!(
+                "position_max {label} {width} {qlen}x{tlen} x{reps}: scalar {:.0}ms  striped {:.0}ms  speedup {:.1}x (acc {acc})",
+                scalar * 1e3,
+                simd * 1e3,
+                scalar / simd,
+            );
+        }
+    }
+
     #[test]
     fn hand_cases() {
         let s = &scorings()[0];
