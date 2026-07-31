@@ -201,10 +201,11 @@ fn fill_dp(query: &[u8], target: &[u8], scoring: &Scoring, flags: &Flags, buf: &
 
     for i in 1..=m {
         let mut e = NEG; // E[i][0]: no query-gap can end at column 0.
+        let qrow = scoring.score_row(query[i - 1] as usize); // bound-check once per row, not per cell
         for j in 1..=n {
             e = (h[idx(i, j - 1)] - gap_open).max(e - gap_ext);
             f[j] = (h[idx(i - 1, j)] - gap_open).max(f[j] - gap_ext);
-            let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
+            let sub = qrow[target[j - 1] as usize];
             let diag = h[idx(i - 1, j - 1)] + sub;
             let mut cell = diag.max(e).max(f[j]);
             if flags.local {
@@ -386,6 +387,7 @@ pub fn align_pair_position_max(
     let mode = Mode::Sw;
     let width = scoring.required_width(mode, query.len(), target.len())?;
     out.clear();
+    out.reserve(target.len()); // one entry per target column; avoids growth reallocs on either path
 
     // Fill `out` with the per-target-position maxima. The striped SIMD kernel does it at `i8`/`i16`
     // width; otherwise the scalar full-matrix DP. Both produce the identical array (width proof),
@@ -411,7 +413,6 @@ pub fn align_pair_position_max(
         fill_dp(query, target, scoring, &flags, &mut buf);
         let (m, n) = (query.len(), target.len());
         let cols = n + 1;
-        out.reserve(n);
         for t in 0..n {
             // Best SW score ending at target position `t` = max over the query axis of H's column
             // `t + 1`. The `0` seed is the SW floor (an empty alignment); H[0][*] is already 0.

@@ -89,6 +89,12 @@ trait StripedLanes {
 /// (`max_i H[i][c+1]`). This is meaningful for `SW` (the only caller requests it there). The
 /// reduction includes every lane: a padding lane can only hold a gap-penalised copy of a real cell
 /// in the same column, so it never exceeds the real column maximum (as for the global answer).
+///
+/// `#[inline(always)]` is load-bearing: this monomorphised kernel must fold into the
+/// `#[target_feature(enable = "sse4.1")]` `run_*` shim so its SSE4.1 intrinsics are generated in the
+/// feature context. Left un-inlined it would codegen without the feature and each vector op in the
+/// inner loop would become an out-of-line call (handover §5).
+#[inline(always)]
 fn farrar_score<L: StripedLanes>(
     query: &[u8],
     target: &[u8],
@@ -292,11 +298,15 @@ fn farrar_score<L: StripedLanes>(
 }
 
 /// Dispatch to [`farrar_score`] for the given mode. `_` on the mode keeps the call sites uniform.
+/// `#[inline(always)]` so it folds through into the `#[target_feature]` shim (see [`farrar_score`]).
+#[inline(always)]
 fn farrar_mode<L: StripedLanes>(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
     farrar_score::<L>(query, target, scoring, &Flags::for_mode(mode), None)
 }
 
 /// Fill `out` with the per-target-position maxima for a local (`SW`) alignment on lanes `L`.
+/// `#[inline(always)]` so it folds through into the `#[target_feature]` shim (see [`farrar_score`]).
+#[inline(always)]
 fn farrar_position_max<L: StripedLanes>(
     query: &[u8],
     target: &[u8],

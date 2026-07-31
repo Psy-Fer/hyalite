@@ -116,6 +116,7 @@ impl Scoring {
     ///
     /// Panics if `q` or `t` is `>= alphabet_len`. Callers in the hot path pass pre-validated
     /// encoded indices, so this bound is a debug guard rather than a runtime cost there.
+    #[inline]
     #[must_use]
     pub fn score(&self, q: usize, t: usize) -> i32 {
         assert!(
@@ -124,6 +125,20 @@ impl Scoring {
             self.alphabet_len
         );
         self.matrix[q * self.alphabet_len + t]
+    }
+
+    /// The substitution-score row for query symbol `q`: `self.matrix[q * al .. (q + 1) * al]`,
+    /// indexable by target symbol. Hoisting this out of a DP's inner column loop moves the query
+    /// bound check from per-cell to per-row (the target symbol is still bound-checked per access).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `q >= alphabet_len`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn score_row(&self, q: usize) -> &[i32] {
+        let al = self.alphabet_len;
+        &self.matrix[q * al..q * al + al]
     }
 
     /// Prove the narrowest [`ScoreWidth`] whose range cannot overflow for `mode` over sequences

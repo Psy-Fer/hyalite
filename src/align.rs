@@ -355,7 +355,8 @@ fn walk<C: CellSource>(
     let mut i = gr;
     let mut j = gc;
     let mut state = State::H;
-    let mut ops_rev: Vec<AlignOp> = Vec::new();
+    // An alignment path has at most `m + n` ops (each step consumes a query and/or target base).
+    let mut ops_rev: Vec<AlignOp> = Vec::with_capacity(query.len() + target.len());
     loop {
         cells.prepare(i);
         match state {

@@ -894,7 +894,11 @@ fn scan_batch_ends<L: LanesEnds>(
 /// Requires an `I8`-width, `alphabet_len <= 16` database (see [`kernel_applies`]); the caller
 /// gates that. Returns the same [`BestHit`] the scalar path would: highest score, smallest
 /// `db_index` on a tie, and — for `ScoreEnd` — the winner's ends via one scalar re-alignment.
-#[inline]
+///
+/// `#[inline(always)]` (matching `fill_scores_lanes`/`fill_ends_lanes`) so it folds into the
+/// `#[target_feature]` `run` shim and its `scan_batch` inner loop is generated in the feature
+/// context — otherwise the SIMD ops become out-of-line calls at the shim boundary (handover §5).
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_batched<L: Lanes>(
     packed: &PackedDb<L::Elem>,
