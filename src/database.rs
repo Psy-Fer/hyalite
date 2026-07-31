@@ -498,11 +498,14 @@ impl DatabaseBuilder {
         // Prove i32 suffices for any query up to max_query_len against these targets.
         let width = scoring.required_width(mode, max_query_len, max_target_len)?;
 
-        // For an `Alignment` search, prove the traceback budget covers the largest problem this
-        // database can pose (`max_query_len` x `max_target_len`). With that proven once, every
-        // `scan_aligned`/`scan_all_aligned` call is infallible — no budget check in the loop.
+        // For an `Alignment` search, prove the traceback budget covers every problem this database
+        // can pose — the whole `[0, max_query_len] x [0, max_target_len]` box, including empty
+        // queries and empty target sequences. With that proven once, every
+        // `scan_aligned`/`scan_all_aligned` call is infallible and within budget — no check in the
+        // loop.
         if let Some(max_bytes) = search_type.max_bytes() {
-            let needed = crate::align::traceback_min_bytes(max_query_len, max_target_len);
+            let needed =
+                crate::align::traceback_min_bytes_for_database(max_query_len, max_target_len);
             if needed > max_bytes as u64 {
                 return Err(Error::TracebackBudgetExceeded {
                     needed_bytes: needed,

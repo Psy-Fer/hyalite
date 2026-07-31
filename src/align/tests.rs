@@ -494,6 +494,76 @@ proptest! {
 }
 
 #[test]
+fn database_traceback_budget_is_monotonic() {
+    // The Database proves its `Alignment` budget once for the largest declared problem and then
+    // treats every shorter scan as infallible AND within budget — sound only if the budget it uses
+    // (`traceback_min_bytes_for_database`) is monotonic non-decreasing in both max_m and max_n, so
+    // no smaller box can need more. (Raw `traceback_min_bytes` is deliberately NOT monotonic at the
+    // degenerate n==0/m==0 edges — an empty query/sequence takes the single-row/column full path;
+    // `_for_database` folds those edges in, which is what restores monotonicity.) The checkpoint
+    // term uses `k = isqrt(m)`, whose block boundaries are where monotonicity could break; sweep
+    // across many.
+    for &n in &[0usize, 1, 2, 3, 5, 8, 21, 64, 100] {
+        let mut prev = 0u64;
+        for m in 0..=400usize {
+            let v = traceback_min_bytes_for_database(m, n);
+            assert!(
+                v >= prev,
+                "non-monotonic in max_m at m={m} n={n}: {v} < {prev}"
+            );
+            prev = v;
+        }
+    }
+    for &m in &[0usize, 1, 2, 3, 5, 8, 21, 64, 100] {
+        let mut prev = 0u64;
+        for n in 0..=400usize {
+            let v = traceback_min_bytes_for_database(m, n);
+            assert!(
+                v >= prev,
+                "non-monotonic in max_n at m={m} n={n}: {v} < {prev}"
+            );
+            prev = v;
+        }
+    }
+}
+
+#[test]
+fn database_budget_covers_every_sub_problem() {
+    // Directly exercise the Database's infallibility guarantee: the budget proven for the largest
+    // (max_m, max_n) box must let `traceback` succeed for EVERY smaller (m, n) — in every mode —
+    // and the bytes it actually allocates must never exceed that budget (including the degenerate
+    // empty-query / empty-target edges, which take the unconditional full-matrix path).
+    let s = dna();
+    // Include the narrow regime (tiny max_n, larger max_m) where the degenerate edge dominates.
+    for (bm, bn) in [(40usize, 55usize), (30, 1), (1, 30), (25, 2)] {
+        let budget = traceback_min_bytes_for_database(bm, bn);
+        for m in 0..=bm {
+            for n in 0..=bn {
+                // The bytes traceback will allocate for this sub-problem must fit the budget.
+                // Mirror `traceback`'s dispatch: the full-matrix path when it is forced (empty
+                // query/target) or fits, else the checkpoint path.
+                let allocated = if m == 0 || n == 0 || full_matrix_bytes(m, n) <= budget {
+                    full_matrix_bytes(m, n)
+                } else {
+                    checkpoint_bytes(m, n, (m as u64).isqrt().max(1) as usize)
+                };
+                assert!(
+                    allocated <= budget,
+                    "m={m} n={n} box=({bm},{bn}): allocates {allocated} > budget {budget}"
+                );
+                let q = vec![0u8; m];
+                let t = vec![1u8; n];
+                for mode in ALL_MODES {
+                    traceback(&q, &t, &s, mode, budget as usize).unwrap_or_else(|e| {
+                        panic!("m={m} n={n} mode={mode} box=({bm},{bn}): unexpected {e:?}")
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn tiny_budget_that_even_checkpoint_cannot_meet_errors() {
     let s = dna();
     let q = vec![0u8; 400];

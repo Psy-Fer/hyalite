@@ -49,7 +49,10 @@ All notable changes to `hyalite` are documented here. The format follows
   recomputes the full-matrix cells bit-for-bit, so the result is **byte-identical** regardless of
   budget. Measured cost: ~1.05–1.1× time for ~50× less memory at length 8000; a 100k×100k global
   alignment needs ~604 MiB via the checkpoint path where the full matrix would need ~112 GiB.
-  Over-tight budgets that even the checkpoint path cannot meet return `TracebackBudgetExceeded`.
+  Over-tight budgets that even the checkpoint path cannot meet return `TracebackBudgetExceeded`. The
+  `max_bytes` budget is an exact upper bound on the peak allocation, and a `Database` built for
+  `SearchType::Alignment` validates it once against every sub-problem it can pose (including empty
+  queries and empty target sequences), so `scan_aligned` / `scan_all_aligned` are infallible.
 - `Mode::Shw`: a fifth alignment mode (Opal issue #29, never implemented upstream) — the transpose
   of `HW`, aligning the whole **target** within a free window of the **query** (query end-gaps free,
   target aligned end to end; answer over the last column). Supported on every path (scalar, SIMD

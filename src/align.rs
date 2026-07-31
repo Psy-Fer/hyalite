@@ -221,8 +221,10 @@ pub(crate) fn traceback(
 }
 
 /// The smallest `max_bytes` for which [`traceback`] succeeds on an `m`-by-`n` problem: the cheaper
-/// of the full-matrix and checkpoint footprints. Monotonic in `m` and `n`, so a database can
-/// validate its declared maximum problem size once and every shorter scan is then infallible.
+/// of the full-matrix and checkpoint footprints. Monotonic in `m` and `n` **on the positive
+/// domain**; the degenerate `m == 0` / `n == 0` edges take the unconditional full-matrix path (a
+/// single row/column) and can exceed the interior value for a tiny opposite dimension — see
+/// [`traceback_min_bytes_for_database`], which a database uses so every sub-problem is covered.
 pub(crate) fn traceback_min_bytes(m: usize, n: usize) -> u64 {
     let full = full_matrix_bytes(m, n);
     if m == 0 || n == 0 {
@@ -230,6 +232,20 @@ pub(crate) fn traceback_min_bytes(m: usize, n: usize) -> u64 {
     }
     let k = (m as u64).isqrt().max(1) as usize;
     full.min(checkpoint_bytes(m, n, k))
+}
+
+/// The smallest `max_bytes` that makes **every** sub-problem of a database whose largest scan is
+/// `max_m` by `max_n` traceable: the maximum of [`traceback_min_bytes`] over the whole
+/// `[0, max_m] x [0, max_n]` box. `traceback_min_bytes` is monotonic on the positive domain, so the
+/// only points that can exceed `traceback_min_bytes(max_m, max_n)` are the degenerate edges — an
+/// empty query (`full_matrix_bytes(0, max_n)`) or an empty target sequence
+/// (`full_matrix_bytes(max_m, 0)`), a single DP row/column. Folding those in makes the value an
+/// exact upper bound and monotonic non-decreasing in both arguments, so a database validates its
+/// declared maximum once and every shorter scan is then infallible *and* within budget.
+pub(crate) fn traceback_min_bytes_for_database(max_m: usize, max_n: usize) -> u64 {
+    traceback_min_bytes(max_m, max_n)
+        .max(full_matrix_bytes(max_m, 0))
+        .max(full_matrix_bytes(0, max_n))
 }
 
 /// Bytes the full-matrix path allocates: three `i32` matrices of `(m+1) * (n+1)` cells.
@@ -681,6 +697,16 @@ fn traceback_checkpoint(
         }
         std::mem::swap(&mut prev, &mut cur);
     }
+
+    // The forward-pass rolling buffers are dead once the checkpoints are captured. Free them before
+    // the walk so the peak footprint matches `checkpoint_bytes` exactly: the walk then holds only
+    // the checkpoints (`2 * num_ckpt` rows) plus one recomputed strip (`3 * (k + 1)` rows). Left
+    // alive they would live through the walk and push the real peak `6 * (n + 1) * 4` bytes above
+    // the budgeted bound (`3 * (k + 1) >= 6` for `k >= 1`, so the forward pass itself stays under
+    // the walk's footprint).
+    drop(hh);
+    drop(ee);
+    drop(ff);
 
     let mut cells = CheckpointCells {
         query,
