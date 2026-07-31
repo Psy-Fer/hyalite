@@ -74,6 +74,30 @@ trait StripedLanes {
     fn store(v: Self::V, dst: &mut [Self::Elem]);
 }
 
+/// Reusable striped working buffers for one element width. Held in a [`PairScratch`](crate::PairScratch)
+/// so a caller aligning many pairs allocates once and reuses them; [`farrar_score`] `clear()`s and
+/// `resize()`s each per call, staying within capacity after the first (largest) call. All buffers are
+/// `seg * p`-sized (the profile `al` times that) — driven by **query** length, not target length.
+pub(crate) struct StripedBufs<E> {
+    profile: Vec<E>,
+    h_store: Vec<E>,
+    h_load: Vec<E>,
+    e: Vec<E>,
+    pad_hi: Vec<E>,
+}
+
+impl<E> StripedBufs<E> {
+    pub(crate) fn new() -> Self {
+        StripedBufs {
+            profile: Vec::new(),
+            h_store: Vec::new(),
+            h_load: Vec::new(),
+            e: Vec::new(),
+            pad_hi: Vec::new(),
+        }
+    }
+}
+
 /// Striped **score** for one query/target pair, in the saturating `i8` model, for any mode's
 /// border/answer geometry ([`Flags`]).
 ///
@@ -101,6 +125,7 @@ fn farrar_score<L: StripedLanes>(
     scoring: &Scoring,
     flags: &Flags,
     mut col_max: Option<&mut Vec<i32>>,
+    bufs: &mut StripedBufs<L::Elem>,
 ) -> i32 {
     let p = L::LANES;
     let qlen = query.len();
@@ -110,13 +135,17 @@ fn farrar_score<L: StripedLanes>(
     let al = scoring.alphabet_len();
     let neg = L::NEG;
     let zero_e = L::sat(0);
+    let cells = seg * p;
 
     // Query profile, striped: profile[t][v*p + l] = score(query[l*seg + v], t), or NEG for the
     // padding lanes. Entries are **saturated** into `Elem`: `SW`'s width proof bounds the score
     // magnitude but not `|min_entry|`, so a mismatch below the width's floor must clamp (not wrap) —
-    // it then drives `H` to the `0` floor exactly as the i32 oracle does.
-    let mut profile = vec![neg; al * seg * p];
-    for (t, chunk) in profile.chunks_mut(seg * p).enumerate() {
+    // it then drives `H` to the `0` floor exactly as the i32 oracle does. Reused from `bufs`
+    // (`clear` + `resize` fills every element, matching `vec![neg; ...]`, without reallocating once
+    // the buffer has grown to the largest query seen).
+    bufs.profile.clear();
+    bufs.profile.resize(al * cells, neg);
+    for (t, chunk) in bufs.profile.chunks_mut(cells).enumerate() {
         for v in 0..seg {
             for l in 0..p {
                 let qpos = l * seg + v;
@@ -131,9 +160,12 @@ fn farrar_score<L: StripedLanes>(
     let idx = |pos: usize| (pos % seg) * p + pos / seg;
     let last_row = idx(qlen - 1);
 
-    let mut h_store = vec![zero_e; seg * p]; // H[*][j]
-    let mut h_load = vec![zero_e; seg * p]; //  H[*][j-1]
-    let mut e = vec![neg; seg * p]; //          E[*][j]   (padding lanes stay at the -inf sentinel)
+    bufs.h_store.clear();
+    bufs.h_store.resize(cells, zero_e); // H[*][j]
+    bufs.h_load.clear();
+    bufs.h_load.resize(cells, zero_e); // H[*][j-1]
+    bufs.e.clear();
+    bufs.e.resize(cells, neg); //          E[*][j]   (padding lanes stay at the -inf sentinel)
     // Column-0 borders per query position: the left-column `H[i][0]` (`0` when free, else a
     // penalised gap of length `i = pos + 1`) and the matching `E[i][1] = H[i][0] - gap_open`
     // (opening a horizontal gap from that border; the extend term is `-inf`).
@@ -143,9 +175,31 @@ fn farrar_score<L: StripedLanes>(
         } else {
             -gap_penalty(go_i, ge_i, pos + 1)
         };
-        h_store[idx(pos)] = L::sat(border);
-        e[idx(pos)] = L::sat(border - go_i);
+        bufs.h_store[idx(pos)] = L::sat(border);
+        bufs.e[idx(pos)] = L::sat(border - go_i);
     }
+
+    // Non-local threshold mask: `MAX` at padding lanes, `MIN` at valid lanes, so `max(H, pad_hi)`
+    // lifts padding out of the `hmin` reduction without touching `h_store` (padding is naturally
+    // driven very negative by its `NEG` profile, so it never inflates the F reduction either).
+    // Left empty for local (`SW`), which does not use it.
+    let pad_max = L::sat(i32::MAX);
+    bufs.pad_hi.clear();
+    if !flags.local {
+        bufs.pad_hi.resize(cells, neg);
+        for pos in qlen..cells {
+            bufs.pad_hi[idx(pos)] = pad_max;
+        }
+    }
+
+    // Bind the reused buffers as working slices for the column loop. These are five disjoint fields
+    // of `*bufs`, so the shared (`profile`/`pad_hi`) and mutable (`h_store`/`h_load`/`e`) borrows
+    // coexist. `h_store`/`h_load` are swapped per column as slice refs (a cheap pointer swap).
+    let profile: &[L::Elem] = &bufs.profile;
+    let pad_hi: &[L::Elem] = &bufs.pad_hi;
+    let mut h_store: &mut [L::Elem] = &mut bufs.h_store;
+    let mut h_load: &mut [L::Elem] = &mut bufs.h_load;
+    let e: &mut [L::Elem] = &mut bufs.e;
 
     let vgo = L::splat(L::sat(go_i));
     let vge = L::splat(L::sat(ge_i));
@@ -154,20 +208,6 @@ fn farrar_score<L: StripedLanes>(
     // HW/OV last row includes the left-border cell `H[m][0]` (`j = 0`), which is exactly the
     // initial last-row entry before any target column is processed.
     let mut row_best = L::to_i32(h_store[last_row]);
-
-    // Non-local threshold mask: `MAX` at padding lanes, `MIN` at valid lanes, so `max(H, pad_hi)`
-    // lifts padding out of the `hmin` reduction without touching `h_store` (padding is naturally
-    // driven very negative by its `NEG` profile, so it never inflates the F reduction either).
-    let pad_max = L::sat(i32::MAX);
-    let pad_hi: Vec<L::Elem> = if flags.local {
-        Vec::new()
-    } else {
-        let mut m = vec![neg; seg * p];
-        for pos in qlen..seg * p {
-            m[idx(pos)] = pad_max;
-        }
-        m
-    };
 
     for (c, &tt) in target.iter().enumerate() {
         let prof = &profile[tt as usize * seg * p..];
@@ -300,8 +340,14 @@ fn farrar_score<L: StripedLanes>(
 /// Dispatch to [`farrar_score`] for the given mode. `_` on the mode keeps the call sites uniform.
 /// `#[inline(always)]` so it folds through into the `#[target_feature]` shim (see [`farrar_score`]).
 #[inline(always)]
-fn farrar_mode<L: StripedLanes>(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
-    farrar_score::<L>(query, target, scoring, &Flags::for_mode(mode), None)
+fn farrar_mode<L: StripedLanes>(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    mode: Mode,
+    bufs: &mut StripedBufs<L::Elem>,
+) -> i32 {
+    farrar_score::<L>(query, target, scoring, &Flags::for_mode(mode), None, bufs)
 }
 
 /// Fill `out` with the per-target-position maxima for a local (`SW`) alignment on lanes `L`.
@@ -312,6 +358,7 @@ fn farrar_position_max<L: StripedLanes>(
     target: &[u8],
     scoring: &Scoring,
     out: &mut Vec<i32>,
+    bufs: &mut StripedBufs<L::Elem>,
 ) {
     let _ = farrar_score::<L>(
         query,
@@ -319,6 +366,7 @@ fn farrar_position_max<L: StripedLanes>(
         scoring,
         &Flags::for_mode(Mode::Sw),
         Some(out),
+        bufs,
     );
 }
 
@@ -331,14 +379,16 @@ pub(crate) fn farrar_score_simd(
     scoring: &Scoring,
     mode: Mode,
     width: crate::width::ScoreWidth,
+    s8: &mut StripedBufs<i8>,
+    s16: &mut StripedBufs<i16>,
 ) -> Option<i32> {
     #[cfg(target_arch = "x86_64")]
     {
-        x86::score(query, target, scoring, mode, width)
+        x86::score(query, target, scoring, mode, width, s8, s16)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        arm::score(query, target, scoring, mode, width)
+        arm::score(query, target, scoring, mode, width, s8, s16)
     }
 }
 
@@ -351,14 +401,16 @@ pub(crate) fn farrar_position_max_simd(
     scoring: &Scoring,
     width: crate::width::ScoreWidth,
     out: &mut Vec<i32>,
+    s8: &mut StripedBufs<i8>,
+    s16: &mut StripedBufs<i16>,
 ) -> Option<()> {
     #[cfg(target_arch = "x86_64")]
     {
-        x86::position_max(query, target, scoring, width, out)
+        x86::position_max(query, target, scoring, width, out, s8, s16)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        arm::position_max(query, target, scoring, width, out)
+        arm::position_max(query, target, scoring, width, out, s8, s16)
     }
 }
 
@@ -368,7 +420,7 @@ mod x86 {
     // Intrinsics require `unsafe`; the crate is otherwise `deny(unsafe_code)`.
     #![allow(unsafe_code)]
 
-    use super::{StripedLanes, farrar_mode, farrar_position_max};
+    use super::{StripedBufs, StripedLanes, farrar_mode, farrar_position_max};
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::width::ScoreWidth;
@@ -520,13 +572,25 @@ mod x86 {
     }
 
     #[target_feature(enable = "sse4.1")]
-    unsafe fn run_i8(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
-        farrar_mode::<Striped128>(query, target, scoring, mode)
+    unsafe fn run_i8(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        mode: Mode,
+        bufs: &mut StripedBufs<i8>,
+    ) -> i32 {
+        farrar_mode::<Striped128>(query, target, scoring, mode, bufs)
     }
 
     #[target_feature(enable = "sse4.1")]
-    unsafe fn run_i16(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
-        farrar_mode::<Striped128I16>(query, target, scoring, mode)
+    unsafe fn run_i16(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        mode: Mode,
+        bufs: &mut StripedBufs<i16>,
+    ) -> i32 {
+        farrar_mode::<Striped128I16>(query, target, scoring, mode, bufs)
     }
 
     pub(super) fn score(
@@ -535,25 +599,39 @@ mod x86 {
         scoring: &Scoring,
         mode: Mode,
         width: ScoreWidth,
+        s8: &mut StripedBufs<i8>,
+        s16: &mut StripedBufs<i16>,
     ) -> Option<i32> {
         if !std::is_x86_feature_detected!("sse4.1") {
             return None;
         }
         match width {
-            ScoreWidth::I8 => Some(unsafe { run_i8(query, target, scoring, mode) }),
-            ScoreWidth::I16 => Some(unsafe { run_i16(query, target, scoring, mode) }),
+            ScoreWidth::I8 => Some(unsafe { run_i8(query, target, scoring, mode, s8) }),
+            ScoreWidth::I16 => Some(unsafe { run_i16(query, target, scoring, mode, s16) }),
             ScoreWidth::I32 => None,
         }
     }
 
     #[target_feature(enable = "sse4.1")]
-    unsafe fn run_i8_pos(query: &[u8], target: &[u8], scoring: &Scoring, out: &mut Vec<i32>) {
-        farrar_position_max::<Striped128>(query, target, scoring, out)
+    unsafe fn run_i8_pos(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        out: &mut Vec<i32>,
+        bufs: &mut StripedBufs<i8>,
+    ) {
+        farrar_position_max::<Striped128>(query, target, scoring, out, bufs)
     }
 
     #[target_feature(enable = "sse4.1")]
-    unsafe fn run_i16_pos(query: &[u8], target: &[u8], scoring: &Scoring, out: &mut Vec<i32>) {
-        farrar_position_max::<Striped128I16>(query, target, scoring, out)
+    unsafe fn run_i16_pos(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        out: &mut Vec<i32>,
+        bufs: &mut StripedBufs<i16>,
+    ) {
+        farrar_position_max::<Striped128I16>(query, target, scoring, out, bufs)
     }
 
     pub(super) fn position_max(
@@ -562,13 +640,15 @@ mod x86 {
         scoring: &Scoring,
         width: ScoreWidth,
         out: &mut Vec<i32>,
+        s8: &mut StripedBufs<i8>,
+        s16: &mut StripedBufs<i16>,
     ) -> Option<()> {
         if !std::is_x86_feature_detected!("sse4.1") {
             return None;
         }
         match width {
-            ScoreWidth::I8 => unsafe { run_i8_pos(query, target, scoring, out) },
-            ScoreWidth::I16 => unsafe { run_i16_pos(query, target, scoring, out) },
+            ScoreWidth::I8 => unsafe { run_i8_pos(query, target, scoring, out, s8) },
+            ScoreWidth::I16 => unsafe { run_i16_pos(query, target, scoring, out, s16) },
             ScoreWidth::I32 => return None,
         }
         Some(())
@@ -580,7 +660,7 @@ mod x86 {
 mod arm {
     #![allow(unsafe_code)]
 
-    use super::{StripedLanes, farrar_mode, farrar_position_max};
+    use super::{StripedBufs, StripedLanes, farrar_mode, farrar_position_max};
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::width::ScoreWidth;
@@ -717,10 +797,14 @@ mod arm {
         scoring: &Scoring,
         mode: Mode,
         width: ScoreWidth,
+        s8: &mut StripedBufs<i8>,
+        s16: &mut StripedBufs<i16>,
     ) -> Option<i32> {
         match width {
-            ScoreWidth::I8 => Some(farrar_mode::<StripedNeon>(query, target, scoring, mode)),
-            ScoreWidth::I16 => Some(farrar_mode::<StripedNeonI16>(query, target, scoring, mode)),
+            ScoreWidth::I8 => Some(farrar_mode::<StripedNeon>(query, target, scoring, mode, s8)),
+            ScoreWidth::I16 => Some(farrar_mode::<StripedNeonI16>(
+                query, target, scoring, mode, s16,
+            )),
             ScoreWidth::I32 => None,
         }
     }
@@ -731,10 +815,14 @@ mod arm {
         scoring: &Scoring,
         width: ScoreWidth,
         out: &mut Vec<i32>,
+        s8: &mut StripedBufs<i8>,
+        s16: &mut StripedBufs<i16>,
     ) -> Option<()> {
         match width {
-            ScoreWidth::I8 => farrar_position_max::<StripedNeon>(query, target, scoring, out),
-            ScoreWidth::I16 => farrar_position_max::<StripedNeonI16>(query, target, scoring, out),
+            ScoreWidth::I8 => farrar_position_max::<StripedNeon>(query, target, scoring, out, s8),
+            ScoreWidth::I16 => {
+                farrar_position_max::<StripedNeonI16>(query, target, scoring, out, s16)
+            }
             ScoreWidth::I32 => return None,
         }
         Some(())
@@ -909,25 +997,57 @@ mod tests {
             match width {
                 crate::ScoreWidth::I8 => {
                     for got in [
-                        farrar_mode::<ScalarStriped<i8, 1>>(q, t, s, mode),
-                        farrar_mode::<ScalarStriped<i8, 5>>(q, t, s, mode),
-                        farrar_mode::<ScalarStriped<i8, 16>>(q, t, s, mode),
+                        farrar_mode::<ScalarStriped<i8, 1>>(q, t, s, mode, &mut StripedBufs::new()),
+                        farrar_mode::<ScalarStriped<i8, 5>>(q, t, s, mode, &mut StripedBufs::new()),
+                        farrar_mode::<ScalarStriped<i8, 16>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
                     ] {
                         assert_eq!(got, want, "i8 {mode} q={q:?} t={t:?}");
                     }
                 }
                 crate::ScoreWidth::I16 => {
                     for got in [
-                        farrar_mode::<ScalarStriped<i16, 1>>(q, t, s, mode),
-                        farrar_mode::<ScalarStriped<i16, 3>>(q, t, s, mode),
-                        farrar_mode::<ScalarStriped<i16, 8>>(q, t, s, mode),
+                        farrar_mode::<ScalarStriped<i16, 1>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
+                        farrar_mode::<ScalarStriped<i16, 3>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
+                        farrar_mode::<ScalarStriped<i16, 8>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
                     ] {
                         assert_eq!(got, want, "i16 {mode} q={q:?} t={t:?}");
                     }
                 }
                 crate::ScoreWidth::I32 => {}
             }
-            if let Some(got) = farrar_score_simd(q, t, s, mode, width) {
+            if let Some(got) = farrar_score_simd(
+                q,
+                t,
+                s,
+                mode,
+                width,
+                &mut StripedBufs::new(),
+                &mut StripedBufs::new(),
+            ) {
                 assert_eq!(got, want, "SIMD {width} {mode} q={q:?} t={t:?}");
             }
 
@@ -939,7 +1059,7 @@ mod tests {
                 macro_rules! chk {
                     ($l:ty) => {{
                         let mut got = Vec::new();
-                        farrar_position_max::<$l>(q, t, s, &mut got);
+                        farrar_position_max::<$l>(q, t, s, &mut got, &mut StripedBufs::new());
                         assert_eq!(got, want_col, "pos {} q={q:?} t={t:?}", stringify!($l));
                     }};
                 }
@@ -957,7 +1077,17 @@ mod tests {
                     crate::ScoreWidth::I32 => {}
                 }
                 let mut got = Vec::new();
-                if farrar_position_max_simd(q, t, s, width, &mut got).is_some() {
+                if farrar_position_max_simd(
+                    q,
+                    t,
+                    s,
+                    width,
+                    &mut got,
+                    &mut StripedBufs::new(),
+                    &mut StripedBufs::new(),
+                )
+                .is_some()
+                {
                     assert_eq!(got, want_col, "pos SIMD {width} q={q:?} t={t:?}");
                 }
             }
@@ -988,9 +1118,11 @@ mod tests {
                 }
                 let scalar = start.elapsed().as_secs_f64();
 
+                let mut s8 = StripedBufs::new();
+                let mut s16 = StripedBufs::new();
                 let start = Instant::now();
                 for _ in 0..reps {
-                    acc ^= farrar_score_simd(&q, &t, s, mode, width).unwrap();
+                    acc ^= farrar_score_simd(&q, &t, s, mode, width, &mut s8, &mut s16).unwrap();
                 }
                 let simd = start.elapsed().as_secs_f64();
 
@@ -1061,12 +1193,16 @@ mod tests {
                 .collect();
             let width = s.required_width(Mode::Sw, qlen, tlen).unwrap();
 
+            // Reused striped scratch (the `_with` pattern) — no per-call allocation.
+            let mut s8 = StripedBufs::new();
+            let mut s16 = StripedBufs::new();
+
             // Correctness guard: the timed paths must agree before we trust the numbers.
             let mut a = Vec::new();
             let mut b = Vec::new();
             scalar_colmax_baseline(&q, &t, s, &mut a);
             assert!(
-                farrar_position_max_simd(&q, &t, s, width, &mut b).is_some(),
+                farrar_position_max_simd(&q, &t, s, width, &mut b, &mut s8, &mut s16).is_some(),
                 "{label}: expected a SIMD backend at width {width}"
             );
             assert_eq!(
@@ -1086,7 +1222,7 @@ mod tests {
 
             let start = Instant::now();
             for _ in 0..reps {
-                farrar_position_max_simd(&q, &t, s, width, &mut out);
+                farrar_position_max_simd(&q, &t, s, width, &mut out, &mut s8, &mut s16);
                 acc ^= out[out.len() - 1] as i64;
             }
             let simd = start.elapsed().as_secs_f64();

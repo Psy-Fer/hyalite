@@ -276,18 +276,79 @@ pub(crate) fn align_core(
     reduce_answer(&buf.h, &flags, query.len(), target.len())
 }
 
+/// Reusable working memory for the pairwise entry points ([`align_pair_with`],
+/// [`align_pair_position_max_with`]). Create one per worker thread and reuse it across calls so the
+/// striped SIMD kernel and the scalar DP allocate nothing per call — the same contract the database
+/// scan path gets from [`Scratch`](crate::Scratch). The one-shot [`align_pair`] /
+/// [`align_pair_position_max`] wrap a throwaway `PairScratch`, so prefer the `_with` variants in a
+/// hot loop (e.g. many reads against expected windows).
+pub struct PairScratch {
+    /// Striped kernel buffers, one set per element width (only the resolved width's set is filled).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    s8: crate::striped::StripedBufs<i8>,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    s16: crate::striped::StripedBufs<i16>,
+    /// Scalar DP buffers (fallback path, and the `ScoreEnd`/`Alignment`/`i32` cases).
+    buf: DpBuffers,
+}
+
+impl PairScratch {
+    /// A fresh scratch with empty buffers; they grow to the largest problem seen and are then
+    /// reused without reallocating.
+    #[must_use]
+    pub fn new() -> Self {
+        PairScratch {
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            s8: crate::striped::StripedBufs::new(),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            s16: crate::striped::StripedBufs::new(),
+            buf: DpBuffers::new(),
+        }
+    }
+}
+
+impl Default for PairScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Align a single query against a single target and return the best-scoring [`BestHit`].
 ///
 /// `query` and `target` are pre-encoded alphabet indices (`0..scoring.alphabet_len()`), matching
-/// Opal's convention. This is the day-one public pair-alignment entry point; it is currently
-/// scalar-backed (a SIMD striped backend lands in a later milestone) and its results are, by the
-/// determinism contract, exactly what every future backend will return.
+/// Opal's convention. Results are, by the determinism contract, exactly what every backend returns.
+/// This allocates its working memory per call; use [`align_pair_with`] with a reused [`PairScratch`]
+/// in a hot loop.
 ///
 /// # Errors
 ///
 /// - [`Error::SymbolOutOfRange`] if any symbol is `>= scoring.alphabet_len()`.
 /// - [`Error::ScoreRangeTooWide`] if the reachable score could overflow `i32` for these lengths.
 pub fn align_pair(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    mode: Mode,
+    search_type: SearchType,
+) -> Result<BestHit> {
+    align_pair_with(
+        &mut PairScratch::new(),
+        query,
+        target,
+        scoring,
+        mode,
+        search_type,
+    )
+}
+
+/// [`align_pair`] reusing a caller-provided [`PairScratch`], so a hot loop of pair alignments
+/// allocates nothing per call. Same result and errors as [`align_pair`].
+///
+/// # Errors
+///
+/// See [`align_pair`].
+pub fn align_pair_with(
+    scratch: &mut PairScratch,
     query: &[u8],
     target: &[u8],
     scoring: &Scoring,
@@ -316,8 +377,15 @@ pub fn align_pair(
         && !query.is_empty()
         && !target.is_empty()
     {
-        if let Some(score) = crate::striped::farrar_score_simd(query, target, scoring, mode, width)
-        {
+        if let Some(score) = crate::striped::farrar_score_simd(
+            query,
+            target,
+            scoring,
+            mode,
+            width,
+            &mut scratch.s8,
+            &mut scratch.s16,
+        ) {
             return Ok(BestHit {
                 score,
                 db_index: 0,
@@ -329,8 +397,7 @@ pub fn align_pair(
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = width;
 
-    let mut buf = DpBuffers::new();
-    let (score, query_end, target_end) = align_core(query, target, scoring, mode, &mut buf);
+    let (score, query_end, target_end) = align_core(query, target, scoring, mode, &mut scratch.buf);
 
     let (query_end, target_end) = if search_type.tracks_end() {
         (query_end, target_end)
@@ -372,6 +439,23 @@ pub fn align_pair_position_max(
     scoring: &Scoring,
     out: &mut Vec<i32>,
 ) -> Result<BestHit> {
+    align_pair_position_max_with(&mut PairScratch::new(), query, target, scoring, out)
+}
+
+/// [`align_pair_position_max`] reusing a caller-provided [`PairScratch`], so a hot loop (e.g. a
+/// mate-rescue consumer aligning many reads against their expected windows) allocates nothing per
+/// call. Same result and errors as [`align_pair_position_max`].
+///
+/// # Errors
+///
+/// See [`align_pair_position_max`].
+pub fn align_pair_position_max_with(
+    scratch: &mut PairScratch,
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    out: &mut Vec<i32>,
+) -> Result<BestHit> {
     let alphabet_len = scoring.alphabet_len();
     for &sym in query.iter().chain(target.iter()) {
         if sym as usize >= alphabet_len {
@@ -398,8 +482,16 @@ pub fn align_pair_position_max(
             matches!(width, crate::ScoreWidth::I8 | crate::ScoreWidth::I16)
                 && !query.is_empty()
                 && !target.is_empty()
-                && crate::striped::farrar_position_max_simd(query, target, scoring, width, out)
-                    .is_some()
+                && crate::striped::farrar_position_max_simd(
+                    query,
+                    target,
+                    scoring,
+                    width,
+                    out,
+                    &mut scratch.s8,
+                    &mut scratch.s16,
+                )
+                .is_some()
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -409,8 +501,8 @@ pub fn align_pair_position_max(
     };
     if !filled {
         let flags = Flags::for_mode(mode);
-        let mut buf = DpBuffers::new();
-        fill_dp(query, target, scoring, &flags, &mut buf);
+        fill_dp(query, target, scoring, &flags, &mut scratch.buf);
+        let buf = &scratch.buf;
         let (m, n) = (query.len(), target.len());
         let cols = n + 1;
         for t in 0..n {
@@ -822,6 +914,52 @@ mod tests {
             prop_assert_eq!(hit.score, arr_best);
             prop_assert_eq!(hit.score, want_best);
             prop_assert!(out.iter().all(|&v| v >= 0));
+        }
+    }
+
+    #[test]
+    fn pair_scratch_reuse_matches_one_shot() {
+        // A single reused `PairScratch` must give bit-identical results to the allocating one-shot
+        // entry across a sequence of varying sizes and modes — the resize-grow-then-shrink pattern
+        // is exactly where a stale-buffer bug would show. Widths span i8 and i16.
+        let s_i8 = Scoring::new(4, matrix(4, 2, -1), 2, 1).unwrap();
+        let s_i16 = Scoring::new(4, matrix(4, 20, -5), 8, 2).unwrap(); // crosses into i16
+        let mk = |seed: u64, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((seed.wrapping_mul(i as u64 + 1) >> 3) % 4) as u8)
+                .collect()
+        };
+        // Deliberately non-monotonic lengths: big, small, big, empty, ... to force grow + shrink.
+        let lens = [40usize, 3, 55, 1, 30, 0, 12, 48, 2];
+
+        let mut scratch = PairScratch::new();
+        let mut out_reused = Vec::new();
+        let mut out_oneshot = Vec::new();
+        for (k, &ql) in lens.iter().enumerate() {
+            let tl = lens[(k + 3) % lens.len()];
+            for s in [&s_i8, &s_i16] {
+                let q = mk(0x9e37_79b1 + k as u64, ql);
+                let t = mk(0x1234_5678 + k as u64, tl);
+                for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw] {
+                    for st in [SearchType::Score, SearchType::ScoreEnd] {
+                        let reused = align_pair_with(&mut scratch, &q, &t, s, mode, st).unwrap();
+                        let oneshot = align_pair(&q, &t, s, mode, st).unwrap();
+                        assert_eq!(
+                            reused, oneshot,
+                            "align_pair_with {mode} {st} ql={ql} tl={tl}"
+                        );
+                    }
+                }
+                // Position-max entry too (SW-only).
+                let reused =
+                    align_pair_position_max_with(&mut scratch, &q, &t, s, &mut out_reused).unwrap();
+                let oneshot = align_pair_position_max(&q, &t, s, &mut out_oneshot).unwrap();
+                assert_eq!(reused, oneshot, "position_max_with hit ql={ql} tl={tl}");
+                assert_eq!(
+                    out_reused, out_oneshot,
+                    "position_max_with array ql={ql} tl={tl}"
+                );
+            }
         }
     }
 

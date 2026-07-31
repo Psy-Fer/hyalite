@@ -8,6 +8,12 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- Reusable pairwise scratch: `PairScratch` plus `align_pair_with` / `align_pair_position_max_with`
+  run the same alignments as `align_pair` / `align_pair_position_max` but reuse caller-owned working
+  memory, so a hot loop of pair alignments allocates nothing per call (mirroring the `Database` +
+  `Scratch` split for the DB-scan path). The one-shot entries are thin wrappers over a throwaway
+  `PairScratch`. The striped kernel's per-call buffers are sized by query length only.
+
 - Per-position maxima and bwa-compatible `score2`: `align_pair_position_max(query, target, scoring,
   &mut Vec<i32>)` runs a local (SW) alignment and fills the caller's buffer with the best score
   **ending at each target position** (`out[t] = max_i H[i][t]`), returning the best score and its

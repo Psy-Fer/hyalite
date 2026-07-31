@@ -54,7 +54,10 @@ pub use database::{Database, DatabaseBuilder, Scratch};
 pub use error::{Error, Result};
 pub use hit::BestHit;
 pub use inter::{Layout, LayoutChoice};
-pub use kernel::{align_pair, align_pair_position_max, score2};
+pub use kernel::{
+    PairScratch, align_pair, align_pair_position_max, align_pair_position_max_with,
+    align_pair_with, score2,
+};
 pub use mode::Mode;
 pub use scoring::Scoring;
 pub use search::SearchType;
