@@ -347,8 +347,9 @@ pub fn align_pair(
 
 /// Align a single query against a single target in **local (Smith-Waterman)** mode and fill `out`
 /// with the *per-target-position maxima*: `out[t]` is the best local alignment score **ending at
-/// target position `t`** (0-based), i.e. `max_i H[i][t]` over the SW DP. Returns the global
-/// [`BestHit`] (best score with its query/target end) as well.
+/// target position `t`** (0-based), i.e. `max_i H[i][t]` over the SW DP. Returns the best score and
+/// its target end as a [`BestHit`] (`query_end` is always `None` — this search does not track the
+/// query axis; `target_end` is `None` only when the best score is `0`, i.e. no positive alignment).
 ///
 /// This is the primitive a bwa-mem-style **mate-rescue** consumer needs for a second-best-score
 /// (`score2`) / mapping-quality computation: run it once for the read against its expected mate
@@ -356,9 +357,9 @@ pub fn align_pair(
 /// maximum entry) to [`score2`] to obtain the competing peak. `out` is cleared and refilled.
 ///
 /// The array is a pure per-column maximum: every value is `>= 0` (the SW floor), it needs no
-/// tie-break, and it is deterministic by construction — the same across every present and future
-/// backend, unlike an end *position*. Positions are 0-based; a consumer wanting half-open
-/// coordinates adds 1.
+/// tie-break, and it is deterministic by construction — bit-identical across every backend (a
+/// striped SIMD kernel fills it at `i8`/`i16` width, the scalar DP otherwise), unlike an end
+/// *position*. Positions are 0-based; a consumer wanting half-open coordinates adds 1.
 ///
 /// # Errors
 ///
@@ -383,34 +384,60 @@ pub fn align_pair_position_max(
     // Per-position maxima / `score2` is a local-alignment concept (see `score2`); this entry is
     // SW-only. Prove i32 suffices for these lengths before running the DP.
     let mode = Mode::Sw;
-    scoring.required_width(mode, query.len(), target.len())?;
-
-    let flags = Flags::for_mode(mode);
-    let mut buf = DpBuffers::new();
-    fill_dp(query, target, scoring, &flags, &mut buf);
-
-    let (m, n) = (query.len(), target.len());
-    let cols = n + 1;
+    let width = scoring.required_width(mode, query.len(), target.len())?;
     out.clear();
-    out.reserve(n);
-    for t in 0..n {
-        // Best SW score ending at target position `t` = max over the query axis of H's column
-        // `t + 1`. The `0` seed is the SW floor (an empty alignment); H[0][*] is already 0.
-        let mut mx = 0i32;
-        for i in 0..=m {
-            let v = buf.h[i * cols + (t + 1)];
-            if v > mx {
-                mx = v;
-            }
+
+    // Fill `out` with the per-target-position maxima. The striped SIMD kernel does it at `i8`/`i16`
+    // width; otherwise the scalar full-matrix DP. Both produce the identical array (width proof),
+    // and the score / target end are derived from it below, so the result is backend-independent.
+    let filled = {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            matches!(width, crate::ScoreWidth::I8 | crate::ScoreWidth::I16)
+                && !query.is_empty()
+                && !target.is_empty()
+                && crate::striped::farrar_position_max_simd(query, target, scoring, width, out)
+                    .is_some()
         }
-        out.push(mx);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = width;
+            false
+        }
+    };
+    if !filled {
+        let flags = Flags::for_mode(mode);
+        let mut buf = DpBuffers::new();
+        fill_dp(query, target, scoring, &flags, &mut buf);
+        let (m, n) = (query.len(), target.len());
+        let cols = n + 1;
+        out.reserve(n);
+        for t in 0..n {
+            // Best SW score ending at target position `t` = max over the query axis of H's column
+            // `t + 1`. The `0` seed is the SW floor (an empty alignment); H[0][*] is already 0.
+            let mut mx = 0i32;
+            for i in 0..=m {
+                let v = buf.h[i * cols + (t + 1)];
+                if v > mx {
+                    mx = v;
+                }
+            }
+            out.push(mx);
+        }
     }
 
-    let (score, query_end, target_end) = reduce_answer(&buf.h, &flags, m, n);
+    // Best score = the array maximum (>= 0). Target end = the smallest position achieving it, or
+    // `None` when the best is 0 (the empty alignment ends nowhere) — matching the scalar oracle.
+    let score = out.iter().copied().max().unwrap_or(0);
+    let target_end = if score > 0 {
+        out.iter().position(|&v| v == score)
+    } else {
+        None
+    };
     Ok(BestHit {
         score,
         db_index: 0,
-        query_end,
+        query_end: None,
         target_end,
     })
 }
@@ -725,29 +752,33 @@ mod tests {
         let s = Scoring::new(4, matrix(4, 2, -1), 2, 1).unwrap();
         let mut out = Vec::new();
 
-        // Perfect diagonal: best ending at target pos t is the t+1-long match run.
+        // Perfect diagonal: best ending at target pos t is the t+1-long match run. Query axis is
+        // not tracked, so query_end is None; target_end is the best column.
         let hit = align_pair_position_max(&[0, 1, 2, 3], &[0, 1, 2, 3], &s, &mut out).unwrap();
         assert_eq!(out, vec![2, 4, 6, 8]);
         assert_eq!(hit.score, 8);
-        assert_eq!((hit.query_end, hit.target_end), (Some(3), Some(3)));
+        assert_eq!((hit.query_end, hit.target_end), (None, Some(3)));
 
         // Match only at the last target position.
         let hit = align_pair_position_max(&[0], &[1, 1, 0], &s, &mut out).unwrap();
         assert_eq!(out, vec![0, 0, 2]);
         assert_eq!(hit.score, 2);
-        assert_eq!(hit.target_end, Some(2));
+        assert_eq!((hit.query_end, hit.target_end), (None, Some(2)));
 
-        // All-mismatch clamps to the SW floor everywhere.
+        // All-mismatch clamps to the SW floor everywhere; best 0 => no target end.
         let hit = align_pair_position_max(&[0, 0], &[1, 1], &s, &mut out).unwrap();
         assert_eq!(out, vec![0, 0]);
         assert_eq!(hit.score, 0);
+        assert_eq!(hit.target_end, None);
 
-        // Empty target => empty array; empty query => all-zero array.
+        // Empty target => empty array; empty query => all-zero array. Both score 0, no target end.
         let hit = align_pair_position_max(&[0, 1], &[], &s, &mut out).unwrap();
         assert!(out.is_empty());
         assert_eq!(hit.score, 0);
-        align_pair_position_max(&[], &[0, 1, 2], &s, &mut out).unwrap();
+        assert_eq!(hit.target_end, None);
+        let hit = align_pair_position_max(&[], &[0, 1, 2], &s, &mut out).unwrap();
         assert_eq!(out, vec![0, 0, 0]);
+        assert_eq!(hit.target_end, None);
     }
 
     #[test]
@@ -780,8 +811,11 @@ mod tests {
             let (want_col, want_best) = naive_sw_colmax(&q, &t, &s);
             prop_assert_eq!(&out, &want_col);
 
+            // Score and target end match the scalar SW oracle; query end is not tracked here.
             let oracle = align_pair(&q, &t, &s, Mode::Sw, SearchType::ScoreEnd).unwrap();
-            prop_assert_eq!(hit, oracle);
+            prop_assert_eq!(hit.score, oracle.score);
+            prop_assert_eq!(hit.target_end, oracle.target_end);
+            prop_assert_eq!(hit.query_end, None);
 
             let arr_best = out.iter().copied().max().unwrap_or(0);
             prop_assert_eq!(hit.score, arr_best);

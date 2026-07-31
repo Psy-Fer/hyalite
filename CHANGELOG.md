@@ -10,16 +10,15 @@ All notable changes to `hyalite` are documented here. The format follows
 
 - Per-position maxima and bwa-compatible `score2`: `align_pair_position_max(query, target, scoring,
   &mut Vec<i32>)` runs a local (SW) alignment and fills the caller's buffer with the best score
-  **ending at each target position** (`out[t] = max_i H[i][t]`), returning the global `BestHit` as
-  well; `score2(colmax, best_score, best_target_end, matrix_max, min_score)` applies bwa-mem's
+  **ending at each target position** (`out[t] = max_i H[i][t]`), returning the best score and its
+  target end. `score2(colmax, best_score, best_target_end, matrix_max, min_score)` applies bwa-mem's
   `ksw.c` recipe — exclusion window `w = ceil(best_score / matrix_max)` around the best end, plus
-  contiguous-peak collapse and threshold — to yield the competing second-best peak `(score,
-  target_pos)`. This is the primitive a bwa-mem-style mate-rescue / mapping-quality consumer needs.
-  The maxima array is a pure per-column maximum, so it needs no tie-break and is deterministic by
-  construction (same across every backend), unlike an end position. Currently scalar-backed (a
-  striped-SIMD acceleration of the maxima sweep lands next); the `score2` selection is validated
-  against an independent transcription of bwa's peak-list algorithm, and the maxima against an
-  independent full-matrix SW oracle.
+  contiguous-peak collapse and a minimum-score threshold — to yield the competing second-best peak
+  `(score, target_pos)`. This is the primitive a bwa-mem-style mate-rescue / mapping-quality
+  consumer needs. The maxima array is a pure per-column maximum: it carries no tie-break and is
+  bit-identical across every backend. It is filled by the striped (Farrar) SIMD kernel on SSE4.1
+  (x86-64) or NEON (aarch64) at whichever of `i8`/`i16` the width proof selects, and by the scalar
+  DP otherwise.
 
 - `i16`-width database scan on SIMD: the inter-sequence kernel now runs at `i16` (SSE4.1 → 8 lanes,
   AVX2 → 16 lanes, NEON → 8 lanes) via the Precomputed layout, so databases whose score proof
@@ -27,12 +26,10 @@ All notable changes to `hyalite` are documented here. The format follows
   byte-shuffle Gathered gather cannot serve) — are SIMD-accelerated instead of falling back to
   scalar. `PackedDb`/`Database` carry the packed database at whichever width the proof selected
   (`i8` or `i16`), and the lane count is width-aware (register bytes ÷ element bytes). Both search
-  types run in-vector: `ScoreEnd` tracks per-target end positions in-vector at `i16` too (positions
-  share the score width, so no widen/narrow — simpler than the `i8` case), with the same
-  lane-order-independent end tie-break; `scan`'s single best hit recovers its ends with one scalar
-  re-alignment. Bit-identical to the scalar oracle across every backend, mode, and both search
-  types. Measured over scalar: a 64-target × 2000-read `i16` `SW` `Score` scan runs ~15× (SSE4.1) /
-  ~26× (AVX2); the per-target `i16` `HW` `ScoreEnd` `scan_all` runs ~13× / ~22×.
+  types run in-vector, including per-target `ScoreEnd` end positions, with the same
+  lane-order-independent tie-break. Bit-identical to the scalar oracle across every backend, mode,
+  and search type. Measured over scalar: a 64-target × 2000-read `i16` `SW` `Score` scan runs ~15×
+  (SSE4.1) / ~26× (AVX2), and a per-target `i16` `HW` `ScoreEnd` `scan_all` ~13× / ~22×.
 
 - `Database::scan_all`: the per-target counterpart to `scan`, writing one `BestHit` per database
   sequence (in `db_index` order) into a caller-provided `Vec<BestHit>` (cleared and reused, so no
@@ -41,34 +38,28 @@ All notable changes to `hyalite` are documented here. The format follows
   positions in-vector, so `SearchType::ScoreEnd` scans return scores *and* query/target ends at
   SIMD speed. Positions are carried in a parallel `i16` domain alongside the `i8` scores; inputs
   whose lengths exceed the `i16` position range fall back to the scalar per-sequence recovery.
-  Bit-identical to the scalar oracle on every backend (verified across backends × layouts × modes).
+  Bit-identical to the scalar oracle on every backend.
 - Traceback: `align()` returns a full `Alignment` (score, half-open query/target spans, and a
   `Vec<AlignOp>` of `Match`/`Mismatch`/`Ins`/`Del`), with `.cigar()` (M-collapsed) and
   `.cigar_extended()` (`=`/`X`) formatters. Scalar Gotoh affine DP with a documented canonical
-  backward walk. Verified optimal against the independent brute-force oracle and by re-scoring the
-  emitted ops, across all modes.
+  backward walk, yielding the optimal alignment in every mode.
 - Linear-space traceback: when the full `H`/`E`/`F` matrices exceed the `max_bytes` budget,
   `align()` transparently switches to a **checkpoint** path that bounds memory to `O(n·√m)` by
   storing every `√m`-th DP row and recomputing row-strips on demand. It shares the walk logic and
-  recomputes bit-for-bit the full-matrix cells, so the result is **byte-identical** regardless of
-  budget (proven by exhaustive and randomised equivalence tests across all modes/scorings/strip
-  heights). Measured cost: ~1.05–1.1× time for ~50× less memory at length 8000, and it makes
-  genome-scale traceback feasible at all — a 100k×100k global alignment needs ~604 MiB via the
-  checkpoint path where the full matrix would need ~112 GiB. Over-tight budgets that even the
-  checkpoint path cannot meet return `TracebackBudgetExceeded`.
+  recomputes the full-matrix cells bit-for-bit, so the result is **byte-identical** regardless of
+  budget. Measured cost: ~1.05–1.1× time for ~50× less memory at length 8000; a 100k×100k global
+  alignment needs ~604 MiB via the checkpoint path where the full matrix would need ~112 GiB.
+  Over-tight budgets that even the checkpoint path cannot meet return `TracebackBudgetExceeded`.
 - `Mode::Shw`: a fifth alignment mode (Opal issue #29, never implemented upstream) — the transpose
   of `HW`, aligning the whole **target** within a free window of the **query** (query end-gaps free,
   target aligned end to end; answer over the last column). Supported on every path (scalar, SIMD
-  database scan, striped `align_pair`, and traceback), bit-identical across backends, and validated
-  against an independent brute-force oracle.
+  database scan, striped `align_pair`, and traceback), bit-identical across backends.
 - Striped (Farrar) SIMD for `align_pair`: a `Score` alignment in any mode now runs an intra-sequence
   striped kernel on SSE4.1 (x86-64) or NEON (aarch64), at whichever of **`i8` (16 lanes) or `i16`
   (8 lanes)** the width proof selects — so 150 nt+ reads whose scores exceed `i8` are SIMD too, not
   scalar. Several× faster than the scalar path for a 2000x2000 pair (`i16`: SW 12x, OV 8x, HW 7x,
-  SHW 6x, NW 5x). Bit-identical to the scalar oracle at every width, mode, and lane count (validated
-  on a width-generic scalar stand-in plus the hardware backends across exhaustive short pairs,
-  randomised pairs, length/padding boundaries, and long-gap stress). `ScoreEnd`/`Alignment` and
-  `i32` width keep the scalar path.
+  SHW 6x, NW 5x). Bit-identical to the scalar oracle at every width, mode, and lane count.
+  `ScoreEnd`/`Alignment` and `i32` width keep the scalar path.
 - `SearchType::Alignment { max_bytes }` and the database traceback API: `Database::scan_aligned`
   returns the full `Alignment` of the single best hit (found by the fast score pass, then traced
   back once) as an `AlignedHit { db_index, alignment }`; `Database::scan_all_aligned` writes one

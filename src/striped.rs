@@ -83,11 +83,18 @@ trait StripedLanes {
 /// result is independent of the lane count — the property the SIMD backends rely on for
 /// determinism. Callers pass non-empty `query`/`target` (the degenerate cases go to the scalar
 /// kernel).
+///
+/// When `col_max` is `Some`, it is filled (via `push`, so the caller passes a cleared `Vec`) with
+/// the per-target-position maxima: `col_max[c]` is the best score ending at target position `c`
+/// (`max_i H[i][c+1]`). This is meaningful for `SW` (the only caller requests it there). The
+/// reduction includes every lane: a padding lane can only hold a gap-penalised copy of a real cell
+/// in the same column, so it never exceeds the real column maximum (as for the global answer).
 fn farrar_score<L: StripedLanes>(
     query: &[u8],
     target: &[u8],
     scoring: &Scoring,
     flags: &Flags,
+    mut col_max: Option<&mut Vec<i32>>,
 ) -> i32 {
     let p = L::LANES;
     let qlen = query.len();
@@ -234,6 +241,19 @@ fn farrar_score<L: StripedLanes>(
             }
         }
 
+        // Per-target-position maximum for this column: the max over all lanes of the final
+        // `H[*][c+1]`, floored at `0` (the SW empty-alignment floor). Padding lanes hold only a
+        // gap-penalised copy of some real cell in the same column, so they never exceed the real
+        // column maximum — including them is safe, exactly as for the global answer `vmax`.
+        // `h_store` now holds the final `H[*][c+1]`; the E-recompute below does not touch it.
+        if let Some(out) = col_max.as_mut() {
+            let mut col = L::load(&h_store[0..]);
+            for v in 1..seg {
+                col = L::max(col, L::load(&h_store[v * p..]));
+            }
+            out.push(L::to_i32(L::hmax(col)).max(0));
+        }
+
         // Recompute E from the *final* (post-lazy-F) H, so E[i][j+1] sees F's contribution to
         // H[i][j] exactly as the scalar oracle does.
         for v in 0..seg {
@@ -273,7 +293,23 @@ fn farrar_score<L: StripedLanes>(
 
 /// Dispatch to [`farrar_score`] for the given mode. `_` on the mode keeps the call sites uniform.
 fn farrar_mode<L: StripedLanes>(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) -> i32 {
-    farrar_score::<L>(query, target, scoring, &Flags::for_mode(mode))
+    farrar_score::<L>(query, target, scoring, &Flags::for_mode(mode), None)
+}
+
+/// Fill `out` with the per-target-position maxima for a local (`SW`) alignment on lanes `L`.
+fn farrar_position_max<L: StripedLanes>(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    out: &mut Vec<i32>,
+) {
+    let _ = farrar_score::<L>(
+        query,
+        target,
+        scoring,
+        &Flags::for_mode(Mode::Sw),
+        Some(out),
+    );
 }
 
 /// Striped score for `mode` on the fastest available SIMD backend for this build, or `None` when
@@ -296,13 +332,33 @@ pub(crate) fn farrar_score_simd(
     }
 }
 
+/// Fill `out` (cleared by the caller) with the per-target-position maxima for a local (`SW`)
+/// alignment on the fastest available SIMD backend, or `None` when none applies (so the caller
+/// fills `out` with the scalar path). Callers pass non-empty sequences at `i8`/`i16` width.
+pub(crate) fn farrar_position_max_simd(
+    query: &[u8],
+    target: &[u8],
+    scoring: &Scoring,
+    width: crate::width::ScoreWidth,
+    out: &mut Vec<i32>,
+) -> Option<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::position_max(query, target, scoring, width, out)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        arm::position_max(query, target, scoring, width, out)
+    }
+}
+
 /// SSE4.1 backend: 16 `i8` lanes per `__m128i`.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     // Intrinsics require `unsafe`; the crate is otherwise `deny(unsafe_code)`.
     #![allow(unsafe_code)]
 
-    use super::{StripedLanes, farrar_mode};
+    use super::{StripedLanes, farrar_mode, farrar_position_max};
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::width::ScoreWidth;
@@ -479,6 +535,34 @@ mod x86 {
             ScoreWidth::I32 => None,
         }
     }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run_i8_pos(query: &[u8], target: &[u8], scoring: &Scoring, out: &mut Vec<i32>) {
+        farrar_position_max::<Striped128>(query, target, scoring, out)
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run_i16_pos(query: &[u8], target: &[u8], scoring: &Scoring, out: &mut Vec<i32>) {
+        farrar_position_max::<Striped128I16>(query, target, scoring, out)
+    }
+
+    pub(super) fn position_max(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        width: ScoreWidth,
+        out: &mut Vec<i32>,
+    ) -> Option<()> {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return None;
+        }
+        match width {
+            ScoreWidth::I8 => unsafe { run_i8_pos(query, target, scoring, out) },
+            ScoreWidth::I16 => unsafe { run_i16_pos(query, target, scoring, out) },
+            ScoreWidth::I32 => return None,
+        }
+        Some(())
+    }
 }
 
 /// NEON backend: 16 `i8` lanes per `int8x16_t`. NEON is baseline on aarch64, so no feature guard.
@@ -486,7 +570,7 @@ mod x86 {
 mod arm {
     #![allow(unsafe_code)]
 
-    use super::{StripedLanes, farrar_mode};
+    use super::{StripedLanes, farrar_mode, farrar_position_max};
     use crate::mode::Mode;
     use crate::scoring::Scoring;
     use crate::width::ScoreWidth;
@@ -630,6 +714,21 @@ mod arm {
             ScoreWidth::I32 => None,
         }
     }
+
+    pub(super) fn position_max(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        width: ScoreWidth,
+        out: &mut Vec<i32>,
+    ) -> Option<()> {
+        match width {
+            ScoreWidth::I8 => farrar_position_max::<StripedNeon>(query, target, scoring, out),
+            ScoreWidth::I16 => farrar_position_max::<StripedNeonI16>(query, target, scoring, out),
+            ScoreWidth::I32 => return None,
+        }
+        Some(())
+    }
 }
 
 #[cfg(test)]
@@ -735,6 +834,28 @@ mod tests {
         v
     }
 
+    /// Independent naive full-matrix SW per-target-column maxima (Vec-of-Vec, explicit E/F). The
+    /// oracle for `farrar_position_max`.
+    fn naive_sw_colmax(q: &[u8], t: &[u8], s: &Scoring) -> Vec<i32> {
+        let (m, n) = (q.len(), t.len());
+        let (go, ge) = (s.gap_open(), s.gap_ext());
+        let ninf = i32::MIN / 2;
+        let mut h = vec![vec![0i32; n + 1]; m + 1];
+        let mut e = vec![vec![ninf; n + 1]; m + 1];
+        let mut f = vec![vec![ninf; n + 1]; m + 1];
+        for i in 1..=m {
+            for j in 1..=n {
+                e[i][j] = (h[i][j - 1] - go).max(e[i][j - 1] - ge);
+                f[i][j] = (h[i - 1][j] - go).max(f[i - 1][j] - ge);
+                let sub = s.score(q[i - 1] as usize, t[j - 1] as usize);
+                h[i][j] = (h[i - 1][j - 1] + sub).max(e[i][j]).max(f[i][j]).max(0);
+            }
+        }
+        (0..n)
+            .map(|jt| (0..=m).map(|i| h[i][jt + 1]).max().unwrap_or(0).max(0))
+            .collect()
+    }
+
     /// A spread of scorings. Several stay inside `i8` for short sequences; the high-match one
     /// (`+20`) crosses into `i16` past ~7 aligned columns, and the `-200` mismatch (legal for `SW`,
     /// whose i8 bound is `gap_open`) is why the profile must saturate rather than wrap.
@@ -798,6 +919,37 @@ mod tests {
             }
             if let Some(got) = farrar_score_simd(q, t, s, mode, width) {
                 assert_eq!(got, want, "SIMD {width} {mode} q={q:?} t={t:?}");
+            }
+
+            // Per-target-position maxima (SW only): every lane count and the hardware backend match
+            // the naive column-max oracle. The stripe permutation and padding lanes must not change
+            // the result — the padding-exclusion in the kernel is what makes this hold with padding.
+            if mode == Mode::Sw {
+                let want_col = naive_sw_colmax(q, t, s);
+                macro_rules! chk {
+                    ($l:ty) => {{
+                        let mut got = Vec::new();
+                        farrar_position_max::<$l>(q, t, s, &mut got);
+                        assert_eq!(got, want_col, "pos {} q={q:?} t={t:?}", stringify!($l));
+                    }};
+                }
+                match width {
+                    crate::ScoreWidth::I8 => {
+                        chk!(ScalarStriped<i8, 1>);
+                        chk!(ScalarStriped<i8, 5>);
+                        chk!(ScalarStriped<i8, 16>);
+                    }
+                    crate::ScoreWidth::I16 => {
+                        chk!(ScalarStriped<i16, 1>);
+                        chk!(ScalarStriped<i16, 3>);
+                        chk!(ScalarStriped<i16, 8>);
+                    }
+                    crate::ScoreWidth::I32 => {}
+                }
+                let mut got = Vec::new();
+                if farrar_position_max_simd(q, t, s, width, &mut got).is_some() {
+                    assert_eq!(got, want_col, "pos SIMD {width} q={q:?} t={t:?}");
+                }
             }
         }
     }
