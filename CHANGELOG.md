@@ -8,6 +8,11 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- `Database::scan_scores`: write each sequence's best **score** (in `db_index` order) into a
+  caller-provided `Vec<i32>` (cleared and reused) — the per-sequence array the single-best `scan`
+  computes and discards, returned in full without a `BestHit` per sequence. For demultiplexers,
+  tie/margin handling, and any all-scores use. Bit-identical across backends; allocation-free apart
+  from growing the output.
 - `align_pairs`: align a batch of independent `(query, target)` pairs, writing one `BestHit` per
   pair (in order, `db_index = pair index`) into a caller-provided `Vec` (cleared and reused). Reuses
   one internal `PairScratch` across the batch, so beyond growing the output it allocates nothing per

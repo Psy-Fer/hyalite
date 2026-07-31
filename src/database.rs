@@ -256,6 +256,54 @@ impl Database {
         }
     }
 
+    /// Scan `query` against every sequence and write each sequence's best **score** (in `db_index`
+    /// order) into `out` (cleared and reused). This is the lightweight counterpart to
+    /// [`scan_all`](Self::scan_all): the same per-sequence score array the single-best
+    /// [`scan`](Self::scan) computes and then discards, but returned in full and without building a
+    /// [`BestHit`] per sequence.
+    ///
+    /// Useful when a caller needs *all* the scores rather than just the winner — e.g. a demultiplexer
+    /// choosing the best-matching barcode and gating on the margin to the second-best, or any
+    /// tie/ambiguity handling. The array is directly sortable; find the best and second-best with a
+    /// single pass. Scores are bit-identical across every backend (the same per-target kernel
+    /// [`scan_all`] uses), independent of the database's [`SearchType`] (end positions, if any, are
+    /// not computed here).
+    ///
+    /// Allocation-free apart from growing `out`. Same caller contract as [`scan`](Self::scan):
+    /// `query` is pre-encoded and `<= max_query_len`.
+    pub fn scan_scores(&self, scratch: &mut Scratch, query: &[u8], out: &mut Vec<i32>) {
+        debug_assert!(
+            query.len() <= self.max_query_len,
+            "query length {} exceeds declared max_query_len {}",
+            query.len(),
+            self.max_query_len
+        );
+
+        out.clear();
+        out.reserve(self.sequences.len());
+
+        if let Some(packed) = &self.packed {
+            inter::fill_scores(
+                self.backend,
+                packed,
+                self.mode,
+                self.scoring.gap_open(),
+                self.scoring.gap_ext(),
+                query,
+                &mut scratch.simd,
+            );
+            // Scores land in the width the database resolved to (`i32` width is never packed).
+            match self.width {
+                ScoreWidth::I8 => out.extend(scratch.simd.scores().iter().map(|&s| s as i32)),
+                _ => out.extend(scratch.simd.scores16().iter().map(|&s| s as i32)),
+            }
+        } else {
+            for seq in &self.sequences {
+                out.push(align_core(query, seq, &self.scoring, self.mode, &mut scratch.buf).0);
+            }
+        }
+    }
+
     /// Scan `query` against every sequence and return the full [`Alignment`] of the single best
     /// hit, tagged with its database index.
     ///
@@ -861,6 +909,41 @@ mod tests {
         assert_eq!(hit.db_index, 1);
         assert_eq!(hit.score, 8);
         assert_eq!((hit.query_end, hit.target_end), (Some(3), Some(3)));
+    }
+
+    #[test]
+    fn scan_scores_returns_the_per_sequence_array() {
+        // Three "barcodes"; a query matching barcode 1 best. scan_scores gives every score in
+        // db_index order — the demultiplexer / margin use case.
+        let db = db_with(
+            &[
+                vec![2u8, 2, 2, 2], // GGGG  — poor
+                vec![0u8, 1, 2, 3], // ACGT  — exact match to the query
+                vec![0u8, 1, 2, 2], // ACGG  — near match
+            ],
+            Mode::Sw,
+            SearchType::Score,
+        );
+        let mut scratch = Scratch::new(&db);
+        let mut scores = vec![999; 7]; // pre-filled: must be cleared, not appended to
+        db.scan_scores(&mut scratch, &[0u8, 1, 2, 3], &mut scores);
+
+        // One score per sequence, in order; matches the best hit and align_pair per sequence.
+        assert_eq!(scores.len(), 3);
+        assert_eq!(scores[1], 8); // exact 4-match
+        assert!(scores[1] > scores[2] && scores[2] > scores[0]);
+        assert_eq!(db.scan(&mut scratch, &[0u8, 1, 2, 3]).score, scores[1]);
+
+        // Margin between best and second-best (what a demux would gate on).
+        let mut sorted = scores.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let margin = sorted[0] - sorted[1];
+        assert_eq!(sorted[0], 8);
+        assert!(margin > 0);
+
+        // Reused across a different-length query with no stale entries.
+        db.scan_scores(&mut scratch, &[0u8, 1], &mut scores);
+        assert_eq!(scores.len(), 3);
     }
 
     #[test]

@@ -412,6 +412,11 @@ proptest! {
                     prop_assert_eq!(&out, &want, "scan_all {} {} {}", b, mode, st);
                     let hit = db.scan(&mut scratch, &q);
                     prop_assert_eq!(hit, want_best, "scan vs best-of-scan_all {} {} {}", b, mode, st);
+                    // `scan_scores` returns exactly the per-sequence score array of `scan_all`.
+                    let mut scores = Vec::new();
+                    db.scan_scores(&mut scratch, &q, &mut scores);
+                    let want_scores: Vec<i32> = out.iter().map(|h| h.score).collect();
+                    prop_assert_eq!(&scores, &want_scores, "scan_scores {} {} {}", b, mode, st);
                 }
             }
         }
@@ -473,6 +478,10 @@ proptest! {
                     prop_assert_eq!(&out, &want, "i16 scan_all {} {} {}", b, mode, st);
                     let hit = db.scan(&mut scratch, &q);
                     prop_assert_eq!(hit, want_best, "i16 scan vs best {} {} {}", b, mode, st);
+                    let mut scores = Vec::new();
+                    db.scan_scores(&mut scratch, &q, &mut scores);
+                    let want_scores: Vec<i32> = out.iter().map(|h| h.score).collect();
+                    prop_assert_eq!(&scores, &want_scores, "i16 scan_scores {} {} {}", b, mode, st);
                 }
             }
         }
