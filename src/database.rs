@@ -181,12 +181,19 @@ impl Database {
                     &mut scratch.simd,
                 );
                 let (cols, rows) = scratch.simd.ends();
-                let scores = scratch.simd.scores();
+                // Scores land in the database's resolved width; positions are always `i16`. Read
+                // per index (no allocation) from the matching width's buffer.
+                let i8_width = self.width == ScoreWidth::I8;
                 for index in 0..self.sequences.len() {
+                    let score = if i8_width {
+                        scratch.simd.scores()[index] as i32
+                    } else {
+                        scratch.simd.scores16()[index] as i32
+                    };
                     // Position domain stores DP grid indices; `end = grid - 1`, `None` at grid 0
                     // (nothing aligned), matching the scalar oracle's `checked_sub(1)`.
                     out.push(BestHit {
-                        score: scores[index] as i32,
+                        score,
                         db_index: index,
                         query_end: (rows[index] as usize).checked_sub(1),
                         target_end: (cols[index] as usize).checked_sub(1),

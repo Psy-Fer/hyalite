@@ -13,10 +13,13 @@ All notable changes to `hyalite` are documented here. The format follows
   exceeds `i8` — long reads, large-magnitude matrices, and any alphabet larger than 16 (which the
   byte-shuffle Gathered gather cannot serve) — are SIMD-accelerated instead of falling back to
   scalar. `PackedDb`/`Database` carry the packed database at whichever width the proof selected
-  (`i8` or `i16`), and the lane count is width-aware (register bytes ÷ element bytes). Bit-identical
-  to the scalar oracle across every backend, mode, and both search types (`ScoreEnd` recovers the
-  winner's ends with one scalar re-alignment; in-vector end tracking stays `i8`-only for now).
-  Measured on a 64-target × 2000-read `i16` `SW` scan: ~15× (SSE4.1) and ~26× (AVX2) over scalar.
+  (`i8` or `i16`), and the lane count is width-aware (register bytes ÷ element bytes). Both search
+  types run in-vector: `ScoreEnd` tracks per-target end positions in-vector at `i16` too (positions
+  share the score width, so no widen/narrow — simpler than the `i8` case), with the same
+  lane-order-independent end tie-break; `scan`'s single best hit recovers its ends with one scalar
+  re-alignment. Bit-identical to the scalar oracle across every backend, mode, and both search
+  types. Measured over scalar: a 64-target × 2000-read `i16` `SW` `Score` scan runs ~15× (SSE4.1) /
+  ~26× (AVX2); the per-target `i16` `HW` `ScoreEnd` `scan_all` runs ~13× / ~22×.
 
 - `Database::scan_all`: the per-target counterpart to `scan`, writing one `BestHit` per database
   sequence (in `db_index` order) into a caller-provided `Vec<BestHit>` (cleared and reused, so no
