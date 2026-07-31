@@ -413,6 +413,43 @@ pub fn align_pair_with(
     })
 }
 
+/// Align a batch of independent `(query, target)` pairs, writing one [`BestHit`] per pair — in input
+/// order, with `db_index == pair index` — into `out` (cleared and reused). Distinct from
+/// [`Database::scan`](crate::Database::scan) (one query against many targets) and from
+/// [`align_pair`] (a single pair): here every pair has its **own** query and target.
+///
+/// Reuses one internal [`PairScratch`] across the whole batch, so — beyond growing `out` — it
+/// allocates nothing per pair. Each pair's result is exactly what [`align_pair`] would return for it.
+///
+/// # Errors
+///
+/// Returns the first pair's error: [`Error::SymbolOutOfRange`] for an out-of-range symbol, or
+/// [`Error::ScoreRangeTooWide`] if a pair's reachable score could overflow `i32`.
+pub fn align_pairs<Q: AsRef<[u8]>, T: AsRef<[u8]>>(
+    pairs: &[(Q, T)],
+    scoring: &Scoring,
+    mode: Mode,
+    search_type: SearchType,
+    out: &mut Vec<BestHit>,
+) -> Result<()> {
+    out.clear();
+    out.reserve(pairs.len());
+    let mut scratch = PairScratch::new();
+    for (index, (q, t)) in pairs.iter().enumerate() {
+        let mut hit = align_pair_with(
+            &mut scratch,
+            q.as_ref(),
+            t.as_ref(),
+            scoring,
+            mode,
+            search_type,
+        )?;
+        hit.db_index = index;
+        out.push(hit);
+    }
+    Ok(())
+}
+
 /// Align a single query against a single target in **local (Smith-Waterman)** mode and fill `out`
 /// with the *per-target-position maxima*: `out[t]` is the best local alignment score **ending at
 /// target position `t`** (0-based), i.e. `max_i H[i][t]` over the SW DP. Returns the best score and
@@ -915,6 +952,57 @@ mod tests {
             prop_assert_eq!(hit.score, want_best);
             prop_assert!(out.iter().all(|&v| v >= 0));
         }
+    }
+
+    #[test]
+    fn align_pairs_matches_per_pair_and_reuses_out() {
+        // Each batched result equals the independent one-shot `align_pair` for that pair (with
+        // `db_index` = pair index), across modes/search types/widths and varied/empty geometries;
+        // and the `out` buffer is cleared and reused between batches.
+        let s_i8 = Scoring::new(4, matrix(4, 2, -1), 2, 1).unwrap();
+        let s_i16 = Scoring::new(4, matrix(4, 20, -5), 8, 2).unwrap();
+        let mk = |seed: u64, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((seed.wrapping_mul(i as u64 + 1) >> 3) % 4) as u8)
+                .collect()
+        };
+        let lens = [0usize, 1, 4, 9, 20];
+        // A batch that mixes lengths (incl. empties) within one call.
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = lens
+            .iter()
+            .enumerate()
+            .flat_map(|(a, &ql)| {
+                lens.iter()
+                    .enumerate()
+                    .map(move |(b, &tl)| (mk(0x1000 + a as u64, ql), mk(0x2000 + b as u64, tl)))
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for s in [&s_i8, &s_i16] {
+            for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw] {
+                for st in [SearchType::Score, SearchType::ScoreEnd] {
+                    align_pairs(&pairs, s, mode, st, &mut out).unwrap();
+                    assert_eq!(out.len(), pairs.len());
+                    for (i, (q, t)) in pairs.iter().enumerate() {
+                        let mut want = align_pair(q, t, s, mode, st).unwrap();
+                        want.db_index = i;
+                        assert_eq!(out[i], want, "{mode} {st} pair {i}");
+                    }
+                }
+            }
+        }
+
+        // Reused `out`: a shorter second batch leaves no stale entries.
+        align_pairs(&pairs[..3], &s_i8, Mode::Sw, SearchType::Score, &mut out).unwrap();
+        assert_eq!(out.len(), 3);
+
+        // Error propagation: an out-of-range symbol in any pair surfaces.
+        let bad: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0u8, 1], vec![0u8]), (vec![9u8], vec![0u8])];
+        assert!(matches!(
+            align_pairs(&bad, &s_i8, Mode::Nw, SearchType::Score, &mut out),
+            Err(Error::SymbolOutOfRange { .. })
+        ));
     }
 
     #[test]

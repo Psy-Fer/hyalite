@@ -56,7 +56,7 @@ pub use hit::BestHit;
 pub use inter::{Layout, LayoutChoice};
 pub use kernel::{
     PairScratch, align_pair, align_pair_position_max, align_pair_position_max_with,
-    align_pair_with, score2,
+    align_pair_with, align_pairs, score2,
 };
 pub use mode::Mode;
 pub use scoring::Scoring;

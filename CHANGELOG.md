@@ -8,6 +8,11 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- `align_pairs`: align a batch of independent `(query, target)` pairs, writing one `BestHit` per
+  pair (in order, `db_index = pair index`) into a caller-provided `Vec` (cleared and reused). Reuses
+  one internal `PairScratch` across the batch, so beyond growing the output it allocates nothing per
+  pair; each result equals `align_pair` for that pair. Distinct from `Database::scan` (one query
+  against many targets) and `align_pair` (a single pair).
 - Reusable pairwise scratch: `PairScratch` plus `align_pair_with` / `align_pair_position_max_with`
   run the same alignments as `align_pair` / `align_pair_position_max` but reuse caller-owned working
   memory, so a hot loop of pair alignments allocates nothing per call (mirroring the `Database` +
