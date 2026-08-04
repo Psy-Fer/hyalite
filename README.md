@@ -83,10 +83,16 @@ assert_eq!(hit.db_index, 1);       // the perfect-match sequence wins
 - **Layouts.** `Gathered` (general) and `Precomputed` (a cache-resident score table for small
   fixed databases such as an adapter set), auto-selected by size.
 - **Static width proof.** The score integer width (`i8`, `i16`, or `i32`) is proven sufficient at
-  construction rather than detected at runtime, so the hot loop is infallible. SIMD currently
-  accelerates `i8`-width databases with `alphabet_len` at most 16; wider inputs use the scalar path.
-- **`align_pair`.** A single-pair entry point exists from day one, with a striped intra-sequence
-  SIMD `Score` backend (SSE4.1/NEON) for `i8`-width alignments.
+  construction rather than detected at runtime, so the hot loop is infallible. SIMD accelerates
+  `i8`- and `i16`-width databases with `alphabet_len` at most 16; `i32` width and larger alphabets
+  use the scalar path.
+- **`align_pair` and batches.** A single-pair entry point with a striped intra-sequence SIMD
+  `Score` backend (SSE4.1/NEON) at `i8` and `i16` width; a batched `align_pairs`; per-target
+  `Database::scan_all` / `scan_scores`; and bwa-style per-position maxima
+  (`align_pair_position_max` + `score2`) for mate-rescue / mapping-quality use.
+- **Traceback.** `align()` and `Database::scan_aligned` return a full `Alignment` (score,
+  query/target spans, and a CIGAR) via linear-space (checkpoint) Gotoh DP bounded by a caller
+  memory budget, so the result is byte-identical regardless of the budget.
 - **Modes.** `SW` (local), `NW` (global), `HW` (semi-global: full query aligned within the target),
   `SHW` (its transpose: full target aligned within the query), `OV` (overlap).
 - **No `unsafe` outside the SIMD backend modules**, and the core is dependency-free.
@@ -101,7 +107,8 @@ genomes and the CellRanger4 adapter set exercise realistic sequence composition,
 sweeps plus regression tests derived from known Opal bugs probe the edge cases. CI runs on x86-64
 and aarch64.
 
-Run the benchmark (a CellRanger4-style overlap scan) with `cargo bench`.
+Run the benchmarks with `cargo bench`: a CellRanger4-style database scan, plus pairwise and
+traceback microbenchmarks.
 
 ## Attribution
 

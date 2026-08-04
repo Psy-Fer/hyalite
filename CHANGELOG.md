@@ -6,6 +6,8 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-04
+
 ### Added
 
 - `Database::scan_scores`: write each sequence's best **score** (in `db_index` order) into a
@@ -21,9 +23,7 @@ All notable changes to `hyalite` are documented here. The format follows
 - Reusable pairwise scratch: `PairScratch` plus `align_pair_with` / `align_pair_position_max_with`
   run the same alignments as `align_pair` / `align_pair_position_max` but reuse caller-owned working
   memory, so a hot loop of pair alignments allocates nothing per call (mirroring the `Database` +
-  `Scratch` split for the DB-scan path). The one-shot entries are thin wrappers over a throwaway
-  `PairScratch`. The striped kernel's per-call buffers are sized by query length only.
-
+  `Scratch` split for the DB-scan path).
 - Per-position maxima and bwa-compatible `score2`: `align_pair_position_max(query, target, scoring,
   &mut Vec<i32>)` runs a local (SW) alignment and fills the caller's buffer with the best score
   **ending at each target position** (`out[t] = max_i H[i][t]`), returning the best score and its
@@ -83,8 +83,8 @@ All notable changes to `hyalite` are documented here. The format follows
   returns the full `Alignment` of the single best hit (found by the fast score pass, then traced
   back once) as an `AlignedHit { db_index, alignment }`; `Database::scan_all_aligned` writes one
   `Alignment` per sequence into a caller `Vec`. The `max_bytes` budget is proven sufficient for the
-  database's declared maximum problem size at construction, so both scans are infallible. Verified
-  against the per-target `align()` result across every backend, all modes, and 2500 random schemes.
+  database's declared maximum problem size at construction, so both scans are infallible. Results
+  are bit-identical to the per-target `align()` across every backend and mode.
 
 ## [0.1.0] - 2026-07-29
 
