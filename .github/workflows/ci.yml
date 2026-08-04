@@ -29,6 +29,11 @@ jobs:
       # by clippy, so their warnings can't fail the build.
       - name: clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      # Catch broken intra-doc links and other rustdoc warnings before they ship.
+      - name: doc
+        run: cargo doc --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: test (${{ matrix.os }}, backend=${{ matrix.backend }})

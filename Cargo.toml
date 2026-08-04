@@ -24,3 +24,11 @@ criterion = "0.5"
 [[bench]]
 name = "cr4_scan"
 harness = false
+
+[[bench]]
+name = "pairwise"
+harness = false
+
+[[bench]]
+name = "traceback"
+harness = false

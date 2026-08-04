@@ -266,8 +266,8 @@ impl Database {
     /// choosing the best-matching barcode and gating on the margin to the second-best, or any
     /// tie/ambiguity handling. The array is directly sortable; find the best and second-best with a
     /// single pass. Scores are bit-identical across every backend (the same per-target kernel
-    /// [`scan_all`] uses), independent of the database's [`SearchType`] (end positions, if any, are
-    /// not computed here).
+    /// [`scan_all`](Self::scan_all) uses), independent of the database's [`SearchType`] (end
+    /// positions, if any, are not computed here).
     ///
     /// Allocation-free apart from growing `out`. Same caller contract as [`scan`](Self::scan):
     /// `query` is pre-encoded and `<= max_query_len`.
