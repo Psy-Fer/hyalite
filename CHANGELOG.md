@@ -17,9 +17,15 @@ All notable changes to `hyalite` are documented here. The format follows
   bit-identical by construction across every backend and mode. `Database`/`PackedDb` carry the packed
   database at whichever width the proof selected (`i8`, `i16`, or `i32`), with the lane count width-aware
   (register bytes ÷ element bytes). This covers the `Score` search type (single-best `scan`,
-  per-target `scan_all`, and `scan_scores`); `ScoreEnd` end positions still recover via the scalar
-  path for `i32` databases. Measured over scalar for a 64-target × 2000-read `i32` `SW` `Score` scan:
-  ~7× (SSE4.1) / ~12× (AVX2).
+  per-target `scan_all`, and `scan_scores`). Measured over scalar for a 64-target × 2000-read `i32`
+  `SW` `Score` scan: ~7× (SSE4.1) / ~12× (AVX2).
+- In-vector `ScoreEnd` for `i32` `scan_all`: the SIMD backends track per-target end positions in-vector
+  at `i32` width too, so `SearchType::ScoreEnd` scans over an `i32` database return scores *and*
+  query/target ends at SIMD speed instead of recovering them per sequence with the scalar kernel.
+  Positions fit `i16` (inside the `i32` score width), so they are carried in the same lanes as the
+  scores and narrowed to `i16` on store — no separate position register split. Bit-identical to the
+  scalar oracle, including the lane-order-independent end tie-break. Measured over scalar for a
+  64-target × 2000-read `i32` `HW` `ScoreEnd` `scan_all`: ~5.5× (SSE4.1) / ~10× (AVX2).
 
 ## [0.2.0] - 2026-08-04
 

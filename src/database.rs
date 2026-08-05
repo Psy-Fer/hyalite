@@ -183,12 +183,11 @@ impl Database {
                 let (cols, rows) = scratch.simd.ends();
                 // Scores land in the database's resolved width; positions are always `i16`. Read
                 // per index (no allocation) from the matching width's buffer.
-                let i8_width = self.width == ScoreWidth::I8;
                 for index in 0..self.sequences.len() {
-                    let score = if i8_width {
-                        scratch.simd.scores()[index] as i32
-                    } else {
-                        scratch.simd.scores16()[index] as i32
+                    let score = match self.width {
+                        ScoreWidth::I8 => scratch.simd.scores()[index] as i32,
+                        ScoreWidth::I16 => scratch.simd.scores16()[index] as i32,
+                        ScoreWidth::I32 => scratch.simd.scores32()[index],
                     };
                     // Position domain stores DP grid indices; `end = grid - 1`, `None` at grid 0
                     // (nothing aligned), matching the scalar oracle's `checked_sub(1)`.

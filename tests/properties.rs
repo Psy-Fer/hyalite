@@ -372,9 +372,9 @@ proptest! {
     /// (the byte-shuffle Gathered gather is `i8`-specific). At `i32` the SIMD kernel is
     /// arithmetically identical to the scalar oracle (same `i32::MIN/4` sentinel, same plain
     /// non-saturating ops), so this guards that the new `i32` lane backends, the width-aware packing
-    /// stride, and the dispatch/scratch plumbing all line up. `ScoreEnd` here still recovers the
-    /// winner's ends via the scalar re-alignment inside `scan` (in-vector `i32` ends are a follow-up).
-    /// Skipped on CPUs with no SIMD backend.
+    /// stride, and the dispatch/scratch plumbing all line up. Single-best `scan` recovers the
+    /// winner's `ScoreEnd` positions via one scalar re-alignment; the in-vector `i32` end kernel is
+    /// exercised by the `scan_all` test below. Skipped on CPUs with no SIMD backend.
     #[test]
     fn scan_identical_across_simd_backends_i32((s, db_seqs, q) in scheme_db_query_verywide()) {
         let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
@@ -553,7 +553,10 @@ proptest! {
     /// `align_pair`, on every available SIMD backend (Precomputed layout only) and both search
     /// types — plus `scan` equal to the smallest-index best and `scan_scores` equal to the score
     /// array. Exercises the `i32` per-target `fill_scores` path (distinct from the single-best
-    /// `scan` path above) and its `scores32` reduction.
+    /// `scan` path above) and its `scores32` reduction, and — for `ScoreEnd` — the in-vector `i32`
+    /// end kernel (`fill_ends` at `i32`, positions carried as `i32` and narrowed to `i16` on store),
+    /// verified against the per-sequence `align_pair` ends. Proven non-vacuous by sabotaging the
+    /// `i32` `pos_store`.
     #[test]
     fn scan_all_matches_per_sequence_and_scan_i32((s, db_seqs, q) in scheme_db_query_verywide()) {
         let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
