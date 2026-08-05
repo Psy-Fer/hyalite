@@ -168,7 +168,10 @@ impl DpBuffers {
 fn fill_dp(query: &[u8], target: &[u8], scoring: &Scoring, flags: &Flags, buf: &mut DpBuffers) {
     let m = query.len();
     let n = target.len();
-    let (gap_open, gap_ext) = (scoring.gap_open(), scoring.gap_ext());
+    // `E` (query-gap) and `F` (target-gap) are charged independently; the two agree exactly when
+    // the scheme is symmetric.
+    let (q_go, q_ge) = scoring.gaps().query();
+    let (t_go, t_ge) = scoring.gaps().target();
     let cols = n + 1;
     let idx = |i: usize, j: usize| i * cols + j;
 
@@ -179,18 +182,20 @@ fn fill_dp(query: &[u8], target: &[u8], scoring: &Scoring, flags: &Flags, buf: &
     h.resize((m + 1) * cols, 0);
     // Border initialisation. Only H borders, E[i][0], and F[0][j] are ever read by the
     // recurrence; E/F border sentinels are folded in below.
+    // The top row is a run of query-gap (the query is empty there), the left column a run of
+    // target-gap.
     for j in 1..=n {
         h[idx(0, j)] = if flags.top_row_free {
             0
         } else {
-            -gap_penalty(gap_open, gap_ext, j)
+            -gap_penalty(q_go, q_ge, j)
         };
     }
     for i in 1..=m {
         h[idx(i, 0)] = if flags.left_col_free {
             0
         } else {
-            -gap_penalty(gap_open, gap_ext, i)
+            -gap_penalty(t_go, t_ge, i)
         };
     }
 
@@ -203,8 +208,8 @@ fn fill_dp(query: &[u8], target: &[u8], scoring: &Scoring, flags: &Flags, buf: &
         let mut e = NEG; // E[i][0]: no query-gap can end at column 0.
         let qrow = scoring.score_row(query[i - 1] as usize); // bound-check once per row, not per cell
         for j in 1..=n {
-            e = (h[idx(i, j - 1)] - gap_open).max(e - gap_ext);
-            f[j] = (h[idx(i - 1, j)] - gap_open).max(f[j] - gap_ext);
+            e = (h[idx(i, j - 1)] - q_go).max(e - q_ge);
+            f[j] = (h[idx(i - 1, j)] - t_go).max(f[j] - t_ge);
             let sub = qrow[target[j - 1] as usize];
             let diag = h[idx(i - 1, j - 1)] + sub;
             let mut cell = diag.max(e).max(f[j]);
@@ -723,7 +728,8 @@ mod tests {
         let m = query.len();
         let n = target.len();
         let flags = Flags::for_mode(mode);
-        let (gap_open, gap_ext) = (scoring.gap_open(), scoring.gap_ext());
+        let (q_go, q_ge) = scoring.gaps().query();
+        let (t_go, t_ge) = scoring.gaps().target();
         let cols = n + 1;
         let idx = |i: usize, j: usize| i * cols + j;
         let sentinel_floor = (NEG / 2) as i64;
@@ -734,14 +740,14 @@ mod tests {
             h[idx(0, j)] = if flags.top_row_free {
                 0
             } else {
-                -gap_penalty(gap_open, gap_ext, j)
+                -gap_penalty(q_go, q_ge, j)
             };
         }
         for i in 1..=m {
             h[idx(i, 0)] = if flags.left_col_free {
                 0
             } else {
-                -gap_penalty(gap_open, gap_ext, i)
+                -gap_penalty(t_go, t_ge, i)
             };
         }
         for i in 0..=m {
@@ -755,8 +761,8 @@ mod tests {
         for i in 1..=m {
             let mut e = NEG;
             for j in 1..=n {
-                e = (h[idx(i, j - 1)] - gap_open).max(e - gap_ext);
-                f[j] = (h[idx(i - 1, j)] - gap_open).max(f[j] - gap_ext);
+                e = (h[idx(i, j - 1)] - q_go).max(e - q_ge);
+                f[j] = (h[idx(i - 1, j)] - t_go).max(f[j] - t_ge);
                 let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
                 let diag = h[idx(i - 1, j - 1)] + sub;
                 let mut cell = diag.max(e).max(f[j]);
@@ -853,15 +859,16 @@ mod tests {
     /// best. Deliberately a separate implementation from `fill_dp` (Vec-of-Vec, explicit E/F).
     fn naive_sw_colmax(q: &[u8], t: &[u8], s: &Scoring) -> (Vec<i32>, i32) {
         let (m, n) = (q.len(), t.len());
-        let (go, ge) = (s.gap_open(), s.gap_ext());
+        let (q_go, q_ge) = s.gaps().query();
+        let (t_go, t_ge) = s.gaps().target();
         let ninf = i32::MIN / 2;
         let mut h = vec![vec![0i32; n + 1]; m + 1];
         let mut e = vec![vec![ninf; n + 1]; m + 1];
         let mut f = vec![vec![ninf; n + 1]; m + 1];
         for i in 1..=m {
             for j in 1..=n {
-                e[i][j] = (h[i][j - 1] - go).max(e[i][j - 1] - ge);
-                f[i][j] = (h[i - 1][j] - go).max(f[i - 1][j] - ge);
+                e[i][j] = (h[i][j - 1] - q_go).max(e[i][j - 1] - q_ge);
+                f[i][j] = (h[i - 1][j] - t_go).max(f[i - 1][j] - t_ge);
                 let sub = s.score(q[i - 1] as usize, t[j - 1] as usize);
                 h[i][j] = (h[i - 1][j - 1] + sub).max(e[i][j]).max(f[i][j]).max(0);
             }

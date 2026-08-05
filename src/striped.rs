@@ -132,7 +132,10 @@ fn farrar_score<L: StripedLanes>(
     let qlen = query.len();
     let tlen = target.len();
     let seg = qlen.div_ceil(p);
-    let (go_i, ge_i) = (scoring.gap_open(), scoring.gap_ext());
+    // `E` (query-gap, horizontal) and `F` (target-gap, vertical across lanes) are charged
+    // independently; the two sets are equal exactly when the scheme is symmetric.
+    let (q_go, q_ge) = scoring.gaps().query();
+    let (t_go, t_ge) = scoring.gaps().target();
     let al = scoring.alphabet_len();
     let neg = L::NEG;
     let zero_e = L::sat(0);
@@ -174,10 +177,10 @@ fn farrar_score<L: StripedLanes>(
         let border = if flags.left_col_free {
             0
         } else {
-            -gap_penalty(go_i, ge_i, pos + 1)
+            -gap_penalty(t_go, t_ge, pos + 1)
         };
         bufs.h_store[idx(pos)] = L::sat(border);
-        bufs.e[idx(pos)] = L::sat(border - go_i);
+        bufs.e[idx(pos)] = L::sat(border - q_go);
     }
 
     // Non-local threshold mask: `MAX` at padding lanes, `MIN` at valid lanes, so `max(H, pad_hi)`
@@ -202,8 +205,10 @@ fn farrar_score<L: StripedLanes>(
     let mut h_load: &mut [L::Elem] = &mut bufs.h_load;
     let e: &mut [L::Elem] = &mut bufs.e;
 
-    let vgo = L::splat(L::sat(go_i));
-    let vge = L::splat(L::sat(ge_i));
+    let vq_go = L::splat(L::sat(q_go));
+    let vq_ge = L::splat(L::sat(q_ge));
+    let vt_go = L::splat(L::sat(t_go));
+    let vt_ge = L::splat(L::sat(t_ge));
     let zero = L::splat(zero_e);
     let mut vmax = zero; // SW: the answer is the max over all cells
     // HW/OV last row includes the left-border cell `H[m][0]` (`j = 0`), which is exactly the
@@ -218,7 +223,7 @@ fn farrar_score<L: StripedLanes>(
         let seed = if flags.top_row_free {
             zero_e
         } else {
-            L::sat(-gap_penalty(go_i, ge_i, c))
+            L::sat(-gap_penalty(q_go, q_ge, c))
         };
         let mut vh = L::shift_up(L::load(&h_store[(seg - 1) * p..]), seed);
         core::mem::swap(&mut h_store, &mut h_load);
@@ -228,9 +233,9 @@ fn farrar_score<L: StripedLanes>(
         let top_next = if flags.top_row_free {
             0
         } else {
-            -gap_penalty(go_i, ge_i, c + 1)
+            -gap_penalty(q_go, q_ge, c + 1)
         };
-        let mut vf = L::shift_up(L::splat(neg), L::sat(top_next - go_i));
+        let mut vf = L::shift_up(L::splat(neg), L::sat(top_next - t_go));
 
         for v in 0..seg {
             vh = L::adds(vh, L::load(&prof[v * p..])); // H[i-1][j-1] + score
@@ -241,7 +246,7 @@ fn farrar_score<L: StripedLanes>(
                 vmax = L::max(vmax, vh);
             }
             L::store(vh, &mut h_store[v * p..]);
-            vf = L::max(L::subs(vf, vge), L::subs(vh, vgo)); // F for the next row
+            vf = L::max(L::subs(vf, vt_ge), L::subs(vh, vt_go)); // F for the next row
             vh = L::load(&h_load[v * p..]); // next stripe's diagonal
         }
 
@@ -258,7 +263,7 @@ fn farrar_score<L: StripedLanes>(
                     let vh = L::max(L::load(&h_store[v * p..]), vf);
                     L::store(vh, &mut h_store[v * p..]);
                     vmax = L::max(vmax, vh);
-                    vf = L::subs(vf, vge);
+                    vf = L::subs(vf, vt_ge);
                 }
                 if !L::any_gt(vf, zero) {
                     break;
@@ -280,7 +285,7 @@ fn farrar_score<L: StripedLanes>(
                 for v in 0..seg {
                     let vh = L::max(L::load(&h_store[v * p..]), vf);
                     L::store(vh, &mut h_store[v * p..]);
-                    vf = L::subs(vf, vge);
+                    vf = L::subs(vf, vt_ge);
                 }
                 if L::hmax(vf) <= hmin {
                     break;
@@ -305,7 +310,7 @@ fn farrar_score<L: StripedLanes>(
         // H[i][j] exactly as the scalar oracle does.
         for v in 0..seg {
             let h = L::load(&h_store[v * p..]);
-            let en = L::max(L::subs(h, vgo), L::subs(L::load(&e[v * p..]), vge));
+            let en = L::max(L::subs(h, vq_go), L::subs(L::load(&e[v * p..]), vq_ge));
             L::store(en, &mut e[v * p..]);
         }
 
@@ -328,7 +333,7 @@ fn farrar_score<L: StripedLanes>(
         let top = if flags.top_row_free {
             0
         } else {
-            L::to_i32(L::sat(-gap_penalty(go_i, ge_i, tlen)))
+            L::to_i32(L::sat(-gap_penalty(q_go, q_ge, tlen)))
         };
         best = best.max(top);
         for pos in 0..qlen {
@@ -1131,15 +1136,16 @@ mod tests {
     /// oracle for `farrar_position_max`.
     fn naive_sw_colmax(q: &[u8], t: &[u8], s: &Scoring) -> Vec<i32> {
         let (m, n) = (q.len(), t.len());
-        let (go, ge) = (s.gap_open(), s.gap_ext());
+        let (q_go, q_ge) = s.gaps().query();
+        let (t_go, t_ge) = s.gaps().target();
         let ninf = i32::MIN / 2;
         let mut h = vec![vec![0i32; n + 1]; m + 1];
         let mut e = vec![vec![ninf; n + 1]; m + 1];
         let mut f = vec![vec![ninf; n + 1]; m + 1];
         for i in 1..=m {
             for j in 1..=n {
-                e[i][j] = (h[i][j - 1] - go).max(e[i][j - 1] - ge);
-                f[i][j] = (h[i - 1][j] - go).max(f[i - 1][j] - ge);
+                e[i][j] = (h[i][j - 1] - q_go).max(e[i][j - 1] - q_ge);
+                f[i][j] = (h[i - 1][j] - t_go).max(f[i - 1][j] - t_ge);
                 let sub = s.score(q[i - 1] as usize, t[j - 1] as usize);
                 h[i][j] = (h[i - 1][j - 1] + sub).max(e[i][j]).max(f[i][j]).max(0);
             }
@@ -1368,7 +1374,8 @@ mod tests {
     /// (which also allocates its striped buffers per call) is apples-to-apples.
     fn scalar_colmax_baseline(q: &[u8], t: &[u8], s: &Scoring, out: &mut Vec<i32>) {
         let (m, n) = (q.len(), t.len());
-        let (go, ge) = (s.gap_open(), s.gap_ext());
+        let (q_go, q_ge) = s.gaps().query();
+        let (t_go, t_ge) = s.gaps().target();
         let cols = n + 1;
         let idx = |i: usize, j: usize| i * cols + j;
         let ninf = i32::MIN / 4;
@@ -1377,8 +1384,8 @@ mod tests {
         for i in 1..=m {
             let mut e = ninf;
             for j in 1..=n {
-                e = (h[idx(i, j - 1)] - go).max(e - ge);
-                f[j] = (h[idx(i - 1, j)] - go).max(f[j] - ge);
+                e = (h[idx(i, j - 1)] - q_go).max(e - q_ge);
+                f[j] = (h[idx(i - 1, j)] - t_go).max(f[j] - t_ge);
                 let sub = s.score(q[i - 1] as usize, t[j - 1] as usize);
                 h[idx(i, j)] = (h[idx(i - 1, j - 1)] + sub).max(e).max(f[j]).max(0);
             }

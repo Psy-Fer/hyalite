@@ -95,6 +95,10 @@ assert_eq!(hit.db_index, 1);       // the perfect-match sequence wins
   memory budget, so the result is byte-identical regardless of the budget.
 - **Modes.** `SW` (local), `NW` (global), `HW` (semi-global: full query aligned within the target),
   `SHW` (its transpose: full target aligned within the query), `OV` (overlap).
+- **Gap penalties, per direction.** `Scoring::new` charges both gap directions alike;
+  `Scoring::new_asymmetric` prices a gap in the query (a deletion) and a gap in the target (an
+  insertion) separately, as bwa's `-O o_del,o_ins -E e_del,e_ins` does. Every backend, mode, and
+  search type supports it at full speed — the split is in the input, not in a slow path.
 - **No `unsafe` outside the SIMD backend modules**, and the core is dependency-free.
 
 ## Testing

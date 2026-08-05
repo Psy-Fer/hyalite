@@ -18,8 +18,8 @@ implemented against a fixed spec rather than retrofitted to one.
 ## Scope and preconditions
 
 "Identical inputs" means all of: the encoded query and target sequences (pre-encoded alphabet
-indices, not ASCII), `alphabet_len`, the substitution matrix, `gap_open`, `gap_ext`, the
-[`Mode`], and the [`SearchType`]. The caller owns encoding; in particular **`N` is not
+indices, not ASCII), `alphabet_len`, the substitution matrix, all four gap penalties (see the
+gap-direction note in §1), the [`Mode`], and the [`SearchType`]. The caller owns encoding; in particular **`N` is not
 special-cased** by the library — the substitution matrix defines every symbol's scores, including
 `N`, and two runs are only "identical inputs" if they use the same matrix.
 
@@ -57,6 +57,15 @@ The gap-penalty convention is fixed: a gap of length `n` costs `gap_open + (n - 
 (Opal's convention). `gap_open >= gap_ext >= 0` is enforced at construction (Opal issue #28), so
 the kernel may assume it.
 
+Gaps come in two **directions**, and `Scoring::new_asymmetric` charges them independently: a gap
+in the query (the `E` matrix; consumes target only — a deletion when the query is a read) and a
+gap in the target (`F`; consumes query only — an insertion). `Scoring::new` charges both alike,
+which is the case every Opal-derived test vector assumes. The direction split is part of the
+input, not of the backend: every backend reads the same four magnitudes, so the promise above
+holds unchanged for an asymmetric scheme. Concretely, `E` and the top-row border are charged with
+the query-gap pair and `F` and the left-column border with the target-gap pair, in the scalar,
+striped, and inter-sequence kernels alike.
+
 ## 2. The score-width proof bounds *every cell*, not just the final score
 
 `required_width` picks the narrowest `W` whose range provably holds all scores. The subtle,
@@ -81,6 +90,12 @@ of an optimal *partial* alignment (ending, for `E`/`F`, in a gap), so it is subj
   - `NW` / `HW` / `SHW` (a penalised border): a path can accumulate a full mismatch run *and* a
     full-span gap → `(m + n) · max(0, −min_entry) + gap_open + (m + n − 1) · gap_ext` (over-counts;
     safe). `SHW` is the transpose of `HW`, with the same bound.
+
+Under an asymmetric scheme `gap_open` and `gap_ext` above are read as the **larger** of the two
+directions. That is exact when the scheme is symmetric and a safe over-estimate otherwise: no gap
+is charged more per base than the worse direction, so the bound still covers every cell. It can
+select a wider integer than strictly necessary for a scheme whose two directions differ a lot,
+which costs performance and never correctness (the same trade the bound already documents).
 
 Getting these bounds *tight* matters: too loose and a workload over-provisions to a wider integer
 and loses SIMD (e.g. the CR4 overlap scan would fall back to scalar under a global-style bound);

@@ -165,8 +165,7 @@ impl Database {
                 self.backend,
                 &group.packed,
                 self.mode,
-                self.scoring.gap_open(),
-                self.scoring.gap_ext(),
+                self.scoring.gaps(),
                 query,
                 &mut scratch.simd,
             );
@@ -226,7 +225,7 @@ impl Database {
         out.clear();
         out.resize(self.sequences.len(), placeholder);
 
-        let (go, ge) = (self.scoring.gap_open(), self.scoring.gap_ext());
+        let gaps = self.scoring.gaps();
         let tracks_end = self.search_type.tracks_end();
         let ends_fit_i16 =
             self.max_query_len <= i16::MAX as usize && self.max_target_len <= i16::MAX as usize;
@@ -242,8 +241,7 @@ impl Database {
                     self.backend,
                     &group.packed,
                     self.mode,
-                    go,
-                    ge,
+                    gaps,
                     query,
                     &mut scratch.simd,
                 );
@@ -281,8 +279,7 @@ impl Database {
                     self.backend,
                     &group.packed,
                     self.mode,
-                    go,
-                    ge,
+                    gaps,
                     query,
                     &mut scratch.simd,
                 );
@@ -311,14 +308,13 @@ impl Database {
     ) {
         out.clear();
         out.resize(self.sequences.len(), 0);
-        let (go, ge) = (self.scoring.gap_open(), self.scoring.gap_ext());
+        let gaps = self.scoring.gaps();
         for group in &groups.groups {
             inter::fill_scores(
                 self.backend,
                 &group.packed,
                 self.mode,
-                go,
-                ge,
+                gaps,
                 query,
                 &mut scratch.simd,
             );
@@ -378,8 +374,7 @@ impl Database {
                     self.backend,
                     packed,
                     self.mode,
-                    self.scoring.gap_open(),
-                    self.scoring.gap_ext(),
+                    self.scoring.gaps(),
                     query,
                     &mut scratch.simd,
                 );
@@ -418,8 +413,7 @@ impl Database {
                 self.backend,
                 packed,
                 self.mode,
-                self.scoring.gap_open(),
-                self.scoring.gap_ext(),
+                self.scoring.gaps(),
                 query,
                 &mut scratch.simd,
             );
@@ -496,8 +490,7 @@ impl Database {
                 self.backend,
                 packed,
                 self.mode,
-                self.scoring.gap_open(),
-                self.scoring.gap_ext(),
+                self.scoring.gaps(),
                 query,
                 &mut scratch.simd,
             );

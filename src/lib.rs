@@ -22,6 +22,10 @@
 //!
 //! # Status
 //!
+//! Gap penalties may be symmetric ([`Scoring::new`]) or charged per direction
+//! ([`Scoring::new_asymmetric`], bwa's `-O o_del,o_ins -E e_del,e_ins`); every backend supports
+//! both at the same speed.
+//!
 //! Scalar and SIMD (SSE4.1/AVX2/NEON) backends across all four alignment [`Mode`]s; `Score`,
 //! `ScoreEnd`, and full `Alignment` [search types](SearchType); per-target [`Database::scan_all`]
 //! and [`Database::scan_aligned`]; and traceback via [`align`] (full-matrix, with an automatic

@@ -13,22 +13,92 @@
 //! Following Opal lets test vectors be lifted directly from Opal and STAR's `ClipMate`.
 //!
 //! Penalties are supplied as **non-negative magnitudes** that are subtracted during alignment.
+//!
+//! # Gap direction
+//!
+//! A gap runs in one of two directions, and [`Scoring::new_asymmetric`] can charge them
+//! differently:
+//!
+//! | Direction | DP matrix | Consumes | Meaning when the query is a read and the target a reference |
+//! |---|---|---|---|
+//! | **query-gap** | `E` | target only | a deletion from the read |
+//! | **target-gap** | `F` | query only | an insertion into the read |
+//!
+//! [`Scoring::new`] charges both directions the same, which is what every scheme lifted from
+//! Opal assumes.
 
 use crate::error::{Error, Result};
 use crate::mode::Mode;
 use crate::width::{self, ScoreWidth};
 
+/// The four affine-gap penalty magnitudes, split by [gap direction](self#gap-direction).
+///
+/// Threaded through every kernel in place of a single `(gap_open, gap_ext)` pair so that the
+/// scalar, striped, and inter-sequence DPs all read the same four values, and a symmetric
+/// scheme is exactly the case where both halves agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gaps {
+    /// Open/extend for a gap in the query (`E`; consumes target only).
+    pub(crate) query_open: i32,
+    pub(crate) query_ext: i32,
+    /// Open/extend for a gap in the target (`F`; consumes query only).
+    pub(crate) target_open: i32,
+    pub(crate) target_ext: i32,
+}
+
+impl Gaps {
+    /// Both directions charged alike.
+    pub(crate) fn symmetric(open: i32, ext: i32) -> Self {
+        Gaps {
+            query_open: open,
+            query_ext: ext,
+            target_open: open,
+            target_ext: ext,
+        }
+    }
+
+    /// `(open, ext)` for a gap in the query (`E`).
+    #[inline]
+    pub(crate) fn query(self) -> (i32, i32) {
+        (self.query_open, self.query_ext)
+    }
+
+    /// `(open, ext)` for a gap in the target (`F`).
+    #[inline]
+    pub(crate) fn target(self) -> (i32, i32) {
+        (self.target_open, self.target_ext)
+    }
+
+    /// Whether both directions are charged alike.
+    #[inline]
+    pub(crate) fn is_symmetric(self) -> bool {
+        self.query() == self.target()
+    }
+
+    /// The larger open and the larger extend across both directions. The width proof bounds the
+    /// reachable score magnitude with these, which is exact for a symmetric scheme and a safe
+    /// over-estimate otherwise (a path's gaps are charged at most this much per base).
+    #[inline]
+    pub(crate) fn worst(self) -> (i32, i32) {
+        (
+            self.query_open.max(self.target_open),
+            self.query_ext.max(self.target_ext),
+        )
+    }
+}
+
 /// A validated substitution-matrix-plus-affine-gap scoring scheme.
 ///
-/// Construct with [`Scoring::new`], which enforces every invariant the kernel relies on:
-/// non-empty alphabet, correctly shaped matrix, non-negative penalties, and `gap_open >=
-/// gap_ext` (Opal issue #28). Once built, a `Scoring` is guaranteed valid.
+/// Construct with [`Scoring::new`] (one penalty pair for both gap directions) or
+/// [`Scoring::new_asymmetric`] (a pair per direction). Either enforces every invariant the
+/// kernel relies on: non-empty alphabet, correctly shaped matrix, non-negative penalties, and
+/// `gap_open >= gap_ext` per direction (Opal issue #28). Once built, a `Scoring` is guaranteed
+/// valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scoring {
     alphabet_len: usize,
     matrix: Vec<i32>,
-    gap_open: i32,
-    gap_ext: i32,
+    gaps: Gaps,
     min_entry: i32,
     max_entry: i32,
 }
@@ -49,6 +119,56 @@ impl Scoring {
     /// - [`Error::NegativeGapPenalty`] if either penalty is negative.
     /// - [`Error::GapOpenLessThanExtend`] if `gap_open < gap_ext`.
     pub fn new(alphabet_len: usize, matrix: Vec<i32>, gap_open: i32, gap_ext: i32) -> Result<Self> {
+        Self::build(alphabet_len, matrix, Gaps::symmetric(gap_open, gap_ext))
+    }
+
+    /// Build a scoring scheme that charges the two [gap directions](self#gap-direction)
+    /// differently.
+    ///
+    /// `query_gap_*` penalise a gap in the query (the `E` matrix; consumes target only, a
+    /// *deletion* when the query is a read) and `target_gap_*` a gap in the target (the `F`
+    /// matrix; consumes query only, an *insertion*). Each direction is validated exactly as in
+    /// [`Scoring::new`], and passing the same pair twice is equivalent to calling it.
+    ///
+    /// # Translating from bwa
+    ///
+    /// bwa's `-O o_del,o_ins -E e_del,e_ins` uses the ksw2 convention (`open + n * ext` for a
+    /// gap of length `n`) and orders the pair deletion-first, so
+    ///
+    /// ```text
+    /// Scoring::new_asymmetric(al, matrix, o_del + e_del, e_del, o_ins + e_ins, e_ins)
+    /// ```
+    ///
+    /// reproduces `bwa mem -O o_del,o_ins -E e_del,e_ins` under Opal's convention. For the
+    /// defaults `-O 6,7 -E 1,2` that is `(7, 1, 9, 2)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Scoring::new`], with each penalty pair checked in turn: the query-gap pair first,
+    /// then the target-gap pair. The reported [`Error::NegativeGapPenalty`] /
+    /// [`Error::GapOpenLessThanExtend`] carries the offending direction's pair.
+    pub fn new_asymmetric(
+        alphabet_len: usize,
+        matrix: Vec<i32>,
+        query_gap_open: i32,
+        query_gap_ext: i32,
+        target_gap_open: i32,
+        target_gap_ext: i32,
+    ) -> Result<Self> {
+        Self::build(
+            alphabet_len,
+            matrix,
+            Gaps {
+                query_open: query_gap_open,
+                query_ext: query_gap_ext,
+                target_open: target_gap_open,
+                target_ext: target_gap_ext,
+            },
+        )
+    }
+
+    /// The shared constructor behind [`Scoring::new`] and [`Scoring::new_asymmetric`].
+    fn build(alphabet_len: usize, matrix: Vec<i32>, gaps: Gaps) -> Result<Self> {
         if alphabet_len == 0 {
             return Err(Error::EmptyAlphabet);
         }
@@ -64,11 +184,15 @@ impl Scoring {
             });
         }
 
-        if gap_open < 0 || gap_ext < 0 {
-            return Err(Error::NegativeGapPenalty { gap_open, gap_ext });
-        }
-        if gap_open < gap_ext {
-            return Err(Error::GapOpenLessThanExtend { gap_open, gap_ext });
+        // Each direction is checked on its own, so an asymmetric scheme cannot smuggle an
+        // invalid pair past the guard that a symmetric one would trip.
+        for (gap_open, gap_ext) in [gaps.query(), gaps.target()] {
+            if gap_open < 0 || gap_ext < 0 {
+                return Err(Error::NegativeGapPenalty { gap_open, gap_ext });
+            }
+            if gap_open < gap_ext {
+                return Err(Error::GapOpenLessThanExtend { gap_open, gap_ext });
+            }
         }
 
         // Safe: alphabet_len >= 1 implies the matrix is non-empty.
@@ -78,8 +202,7 @@ impl Scoring {
         Ok(Self {
             alphabet_len,
             matrix,
-            gap_open,
-            gap_ext,
+            gaps,
             min_entry,
             max_entry,
         })
@@ -92,15 +215,70 @@ impl Scoring {
     }
 
     /// The gap-open penalty magnitude.
+    ///
+    /// Under an asymmetric scheme there is no single such value, and this returns the
+    /// **query-gap** one; use [`Scoring::query_gap_open`] / [`Scoring::target_gap_open`] to say
+    /// which you mean.
     #[must_use]
+    #[deprecated(
+        since = "0.3.0",
+        note = "ambiguous under asymmetric gaps: use query_gap_open() or target_gap_open()"
+    )]
     pub fn gap_open(&self) -> i32 {
-        self.gap_open
+        self.gaps.query_open
     }
 
     /// The gap-extend penalty magnitude.
+    ///
+    /// Under an asymmetric scheme there is no single such value, and this returns the
+    /// **query-gap** one; use [`Scoring::query_gap_ext`] / [`Scoring::target_gap_ext`] to say
+    /// which you mean.
     #[must_use]
+    #[deprecated(
+        since = "0.3.0",
+        note = "ambiguous under asymmetric gaps: use query_gap_ext() or target_gap_ext()"
+    )]
     pub fn gap_ext(&self) -> i32 {
-        self.gap_ext
+        self.gaps.query_ext
+    }
+
+    /// The open penalty for a gap in the **query** (the `E` matrix; consumes target only, a
+    /// deletion when the query is a read).
+    #[must_use]
+    pub fn query_gap_open(&self) -> i32 {
+        self.gaps.query_open
+    }
+
+    /// The extend penalty for a gap in the **query**. See [`Scoring::query_gap_open`].
+    #[must_use]
+    pub fn query_gap_ext(&self) -> i32 {
+        self.gaps.query_ext
+    }
+
+    /// The open penalty for a gap in the **target** (the `F` matrix; consumes query only, an
+    /// insertion when the query is a read).
+    #[must_use]
+    pub fn target_gap_open(&self) -> i32 {
+        self.gaps.target_open
+    }
+
+    /// The extend penalty for a gap in the **target**. See [`Scoring::target_gap_open`].
+    #[must_use]
+    pub fn target_gap_ext(&self) -> i32 {
+        self.gaps.target_ext
+    }
+
+    /// Whether both [gap directions](self#gap-direction) are charged alike, i.e. whether this
+    /// scheme is one [`Scoring::new`] could have built.
+    #[must_use]
+    pub fn has_symmetric_gaps(&self) -> bool {
+        self.gaps.is_symmetric()
+    }
+
+    /// The four penalties as one value, for threading through the kernels.
+    #[inline]
+    pub(crate) fn gaps(&self) -> Gaps {
+        self.gaps
     }
 
     /// The most negative and most positive substitution-matrix entries, respectively.
@@ -157,8 +335,7 @@ impl Scoring {
             mode,
             self.min_entry,
             self.max_entry,
-            self.gap_open,
-            self.gap_ext,
+            self.gaps,
             max_query_len,
             max_target_len,
         )
@@ -182,8 +359,11 @@ mod tests {
     fn valid_scheme_round_trips_all_accessors() {
         let s = Scoring::new(4, match_mismatch(4, 2, -1), 3, 1).unwrap();
         assert_eq!(s.alphabet_len(), 4);
-        assert_eq!(s.gap_open(), 3);
-        assert_eq!(s.gap_ext(), 1);
+        assert_eq!(s.query_gap_open(), 3);
+        assert_eq!(s.query_gap_ext(), 1);
+        assert_eq!(s.target_gap_open(), 3);
+        assert_eq!(s.target_gap_ext(), 1);
+        assert!(s.has_symmetric_gaps());
         assert_eq!(s.entry_bounds(), (-1, 2));
         assert_eq!(s.score(0, 0), 2);
         assert_eq!(s.score(0, 1), -1);
