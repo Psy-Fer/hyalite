@@ -26,6 +26,14 @@ All notable changes to `hyalite` are documented here. The format follows
   scores and narrowed to `i16` on store — no separate position register split. Bit-identical to the
   scalar oracle, including the lane-order-independent end tie-break. Measured over scalar for a
   64-target × 2000-read `i32` `HW` `ScoreEnd` `scan_all`: ~5.5× (SSE4.1) / ~10× (AVX2).
+- Striped (Farrar) SIMD `align_pair` at `i32` width: a `Score` alignment (and the SW per-position
+  maxima behind `align_pair_position_max` / bwa `score2`) whose score proof selects `i32` now runs
+  the intra-sequence striped kernel on SSE4.1 (4 lanes) / NEON (4 lanes), so long or large-magnitude
+  pairs that exceed `i16` are SIMD too rather than scalar. `i32` uses plain (non-saturating)
+  arithmetic with an `i32::MIN/4` `-∞` sentinel — the scalar oracle's own model, since x86 has no
+  saturating 32-bit add/sub and the width proof already bounds every cell — so it is bit-identical to
+  the scalar oracle at every mode and lane count. Measured over scalar for a 2000×2000 `i32` `SW`
+  pair: ~4.5×. (`ScoreEnd` / `Alignment` still use the scalar path.)
 
 ## [0.2.0] - 2026-08-04
 

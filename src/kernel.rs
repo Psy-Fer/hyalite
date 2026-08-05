@@ -288,7 +288,9 @@ pub struct PairScratch {
     s8: crate::striped::StripedBufs<i8>,
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     s16: crate::striped::StripedBufs<i16>,
-    /// Scalar DP buffers (fallback path, and the `ScoreEnd`/`Alignment`/`i32` cases).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    s32: crate::striped::StripedBufs<i32>,
+    /// Scalar DP buffers (fallback path, and the `ScoreEnd`/`Alignment` cases).
     buf: DpBuffers,
 }
 
@@ -302,6 +304,8 @@ impl PairScratch {
             s8: crate::striped::StripedBufs::new(),
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             s16: crate::striped::StripedBufs::new(),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            s32: crate::striped::StripedBufs::new(),
             buf: DpBuffers::new(),
         }
     }
@@ -368,15 +372,11 @@ pub fn align_pair_with(
     // Prove i32 suffices for these lengths before running the DP.
     let width = scoring.required_width(mode, query.len(), target.len())?;
 
-    // Fast path: striped (Farrar) SIMD for a score-only search that provably fits `i8`/`i16`.
-    // Bit-identical to the scalar kernel below (it is the same DP in a saturating narrow width), so
-    // this only affects speed. `ScoreEnd`/`Alignment` and `i32` width use the scalar path.
+    // Fast path: striped (Farrar) SIMD for a score-only search, at whichever of `i8`/`i16`/`i32` the
+    // width proof selected. Bit-identical to the scalar kernel below (the same DP, narrower lanes),
+    // so this only affects speed. `ScoreEnd`/`Alignment` use the scalar path.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if search_type == SearchType::Score
-        && matches!(width, crate::ScoreWidth::I8 | crate::ScoreWidth::I16)
-        && !query.is_empty()
-        && !target.is_empty()
-    {
+    if search_type == SearchType::Score && !query.is_empty() && !target.is_empty() {
         if let Some(score) = crate::striped::farrar_score_simd(
             query,
             target,
@@ -385,6 +385,7 @@ pub fn align_pair_with(
             width,
             &mut scratch.s8,
             &mut scratch.s16,
+            &mut scratch.s32,
         ) {
             return Ok(BestHit {
                 score,
@@ -510,14 +511,14 @@ pub fn align_pair_position_max_with(
     out.clear();
     out.reserve(target.len()); // one entry per target column; avoids growth reallocs on either path
 
-    // Fill `out` with the per-target-position maxima. The striped SIMD kernel does it at `i8`/`i16`
-    // width; otherwise the scalar full-matrix DP. Both produce the identical array (width proof),
-    // and the score / target end are derived from it below, so the result is backend-independent.
+    // Fill `out` with the per-target-position maxima. The striped SIMD kernel does it at whichever
+    // of `i8`/`i16`/`i32` the width proof selected; otherwise the scalar full-matrix DP. Both produce
+    // the identical array (width proof), and the score / target end are derived from it below, so the
+    // result is backend-independent.
     let filled = {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            matches!(width, crate::ScoreWidth::I8 | crate::ScoreWidth::I16)
-                && !query.is_empty()
+            !query.is_empty()
                 && !target.is_empty()
                 && crate::striped::farrar_position_max_simd(
                     query,
@@ -527,6 +528,7 @@ pub fn align_pair_position_max_with(
                     out,
                     &mut scratch.s8,
                     &mut scratch.s16,
+                    &mut scratch.s32,
                 )
                 .is_some()
         }

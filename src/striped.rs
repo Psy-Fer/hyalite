@@ -35,11 +35,12 @@ fn sat_i16(v: i32) -> i16 {
     v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// The lane operations the striped kernel needs, generic over the element width (`i8` or `i16`).
-/// Implemented by SSE4.1 / NEON with intrinsics and, under test, by a scalar array stand-in. The
-/// arithmetic model is identical at every width — signed saturating, `Elem::MIN` as the `-∞`
-/// sentinel — so a kernel run at one width is bit-identical to the scalar oracle for inputs the
-/// width proof admits.
+/// The lane operations the striped kernel needs, generic over the element width (`i8`, `i16`, or
+/// `i32`). Implemented by SSE4.1 / NEON with intrinsics and, under test, by a scalar array stand-in.
+/// At `i8`/`i16` the model is signed *saturating* with `Elem::MIN` as the `-∞` sentinel; at `i32`
+/// there is no saturating 32-bit SIMD add/sub, so `adds`/`subs` are plain and the sentinel is
+/// `i32::MIN / 4` with proof-guaranteed headroom (the scalar oracle's own model). Either way a kernel
+/// run at one width is bit-identical to the scalar oracle for inputs the width proof admits.
 trait StripedLanes {
     /// Number of lanes processed in parallel.
     const LANES: usize;
@@ -373,6 +374,7 @@ fn farrar_position_max<L: StripedLanes>(
 /// Striped score for `mode` on the fastest available SIMD backend for this build, or `None` when
 /// none is available (so the caller falls back to the scalar kernel). Callers pass non-empty
 /// sequences.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn farrar_score_simd(
     query: &[u8],
     target: &[u8],
@@ -381,20 +383,22 @@ pub(crate) fn farrar_score_simd(
     width: crate::width::ScoreWidth,
     s8: &mut StripedBufs<i8>,
     s16: &mut StripedBufs<i16>,
+    s32: &mut StripedBufs<i32>,
 ) -> Option<i32> {
     #[cfg(target_arch = "x86_64")]
     {
-        x86::score(query, target, scoring, mode, width, s8, s16)
+        x86::score(query, target, scoring, mode, width, s8, s16, s32)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        arm::score(query, target, scoring, mode, width, s8, s16)
+        arm::score(query, target, scoring, mode, width, s8, s16, s32)
     }
 }
 
 /// Fill `out` (cleared by the caller) with the per-target-position maxima for a local (`SW`)
 /// alignment on the fastest available SIMD backend, or `None` when none applies (so the caller
 /// fills `out` with the scalar path). Callers pass non-empty sequences at `i8`/`i16` width.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn farrar_position_max_simd(
     query: &[u8],
     target: &[u8],
@@ -403,14 +407,15 @@ pub(crate) fn farrar_position_max_simd(
     out: &mut Vec<i32>,
     s8: &mut StripedBufs<i8>,
     s16: &mut StripedBufs<i16>,
+    s32: &mut StripedBufs<i32>,
 ) -> Option<()> {
     #[cfg(target_arch = "x86_64")]
     {
-        x86::position_max(query, target, scoring, width, out, s8, s16)
+        x86::position_max(query, target, scoring, width, out, s8, s16, s32)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        arm::position_max(query, target, scoring, width, out, s8, s16)
+        arm::position_max(query, target, scoring, width, out, s8, s16, s32)
     }
 }
 
@@ -571,6 +576,80 @@ mod x86 {
         }
     }
 
+    /// SSE4.1 backend at `i32`: 4 lanes per `__m128i`. Unlike `i8`/`i16`, there is no saturating
+    /// 32-bit add/sub on x86, so `adds`/`subs` are plain `_mm_add/sub_epi32` and the `-∞` sentinel is
+    /// `i32::MIN / 4` (not `i32::MIN`). The width proof bounds every cell inside `i32` and the
+    /// sentinel keeps headroom, so plain arithmetic never overflows — the same model the scalar
+    /// oracle uses, hence bit-identical to it.
+    #[derive(Clone, Copy)]
+    pub(super) struct Striped128I32;
+
+    impl StripedLanes for Striped128I32 {
+        const LANES: usize = 4;
+        type Elem = i32;
+        type V = __m128i;
+        const NEG: i32 = i32::MIN / 4;
+
+        #[inline(always)]
+        fn sat(v: i32) -> i32 {
+            v
+        }
+        #[inline(always)]
+        fn to_i32(e: i32) -> i32 {
+            e
+        }
+        #[inline(always)]
+        fn splat(v: i32) -> __m128i {
+            unsafe { _mm_set1_epi32(v) }
+        }
+        #[inline(always)]
+        fn adds(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_add_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn subs(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_sub_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_max_epi32(a, b) } // SSE4.1
+        }
+        #[inline(always)]
+        fn shift_up(v: __m128i, insert: i32) -> __m128i {
+            unsafe { _mm_insert_epi32::<0>(_mm_slli_si128::<4>(v), insert) }
+        }
+        #[inline(always)]
+        fn hmax(v: __m128i) -> i32 {
+            unsafe {
+                let v = _mm_max_epi32(v, _mm_srli_si128::<8>(v));
+                let v = _mm_max_epi32(v, _mm_srli_si128::<4>(v));
+                _mm_extract_epi32::<0>(v)
+            }
+        }
+        #[inline(always)]
+        fn hmin(v: __m128i) -> i32 {
+            unsafe {
+                let v = _mm_min_epi32(v, _mm_srli_si128::<8>(v));
+                let v = _mm_min_epi32(v, _mm_srli_si128::<4>(v));
+                _mm_extract_epi32::<0>(v)
+            }
+        }
+        #[inline(always)]
+        fn any_gt(a: __m128i, b: __m128i) -> bool {
+            unsafe { _mm_movemask_epi8(_mm_cmpgt_epi32(a, b)) != 0 }
+        }
+        #[inline(always)]
+        fn load(src: &[i32]) -> __m128i {
+            debug_assert!(src.len() >= 4);
+            unsafe { _mm_loadu_si128(src.as_ptr().cast()) }
+        }
+        #[inline(always)]
+        fn store(v: __m128i, dst: &mut [i32]) {
+            debug_assert!(dst.len() >= 4);
+            unsafe { _mm_storeu_si128(dst.as_mut_ptr().cast(), v) }
+        }
+    }
+
     #[target_feature(enable = "sse4.1")]
     unsafe fn run_i8(
         query: &[u8],
@@ -593,6 +672,18 @@ mod x86 {
         farrar_mode::<Striped128I16>(query, target, scoring, mode, bufs)
     }
 
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run_i32(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        mode: Mode,
+        bufs: &mut StripedBufs<i32>,
+    ) -> i32 {
+        farrar_mode::<Striped128I32>(query, target, scoring, mode, bufs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn score(
         query: &[u8],
         target: &[u8],
@@ -601,6 +692,7 @@ mod x86 {
         width: ScoreWidth,
         s8: &mut StripedBufs<i8>,
         s16: &mut StripedBufs<i16>,
+        s32: &mut StripedBufs<i32>,
     ) -> Option<i32> {
         if !std::is_x86_feature_detected!("sse4.1") {
             return None;
@@ -608,7 +700,7 @@ mod x86 {
         match width {
             ScoreWidth::I8 => Some(unsafe { run_i8(query, target, scoring, mode, s8) }),
             ScoreWidth::I16 => Some(unsafe { run_i16(query, target, scoring, mode, s16) }),
-            ScoreWidth::I32 => None,
+            ScoreWidth::I32 => Some(unsafe { run_i32(query, target, scoring, mode, s32) }),
         }
     }
 
@@ -634,6 +726,18 @@ mod x86 {
         farrar_position_max::<Striped128I16>(query, target, scoring, out, bufs)
     }
 
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn run_i32_pos(
+        query: &[u8],
+        target: &[u8],
+        scoring: &Scoring,
+        out: &mut Vec<i32>,
+        bufs: &mut StripedBufs<i32>,
+    ) {
+        farrar_position_max::<Striped128I32>(query, target, scoring, out, bufs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn position_max(
         query: &[u8],
         target: &[u8],
@@ -642,6 +746,7 @@ mod x86 {
         out: &mut Vec<i32>,
         s8: &mut StripedBufs<i8>,
         s16: &mut StripedBufs<i16>,
+        s32: &mut StripedBufs<i32>,
     ) -> Option<()> {
         if !std::is_x86_feature_detected!("sse4.1") {
             return None;
@@ -649,7 +754,7 @@ mod x86 {
         match width {
             ScoreWidth::I8 => unsafe { run_i8_pos(query, target, scoring, out, s8) },
             ScoreWidth::I16 => unsafe { run_i16_pos(query, target, scoring, out, s16) },
-            ScoreWidth::I32 => return None,
+            ScoreWidth::I32 => unsafe { run_i32_pos(query, target, scoring, out, s32) },
         }
         Some(())
     }
@@ -791,6 +896,71 @@ mod arm {
         }
     }
 
+    /// NEON backend at `i32`: 4 lanes per `int32x4_t`. Plain (non-saturating) arithmetic with an
+    /// `i32::MIN / 4` sentinel — the scalar oracle's model (see [`super::x86::Striped128I32`]).
+    #[derive(Clone, Copy)]
+    pub(super) struct StripedNeonI32;
+
+    impl StripedLanes for StripedNeonI32 {
+        const LANES: usize = 4;
+        type Elem = i32;
+        type V = int32x4_t;
+        const NEG: i32 = i32::MIN / 4;
+
+        #[inline(always)]
+        fn sat(v: i32) -> i32 {
+            v
+        }
+        #[inline(always)]
+        fn to_i32(e: i32) -> i32 {
+            e
+        }
+        #[inline(always)]
+        fn splat(v: i32) -> int32x4_t {
+            unsafe { vdupq_n_s32(v) }
+        }
+        #[inline(always)]
+        fn adds(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vaddq_s32(a, b) }
+        }
+        #[inline(always)]
+        fn subs(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vsubq_s32(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vmaxq_s32(a, b) }
+        }
+        #[inline(always)]
+        fn shift_up(v: int32x4_t, insert: i32) -> int32x4_t {
+            // out = [insert, v0, v1, v2]
+            unsafe { vextq_s32::<3>(vdupq_n_s32(insert), v) }
+        }
+        #[inline(always)]
+        fn hmax(v: int32x4_t) -> i32 {
+            unsafe { vmaxvq_s32(v) }
+        }
+        #[inline(always)]
+        fn hmin(v: int32x4_t) -> i32 {
+            unsafe { vminvq_s32(v) }
+        }
+        #[inline(always)]
+        fn any_gt(a: int32x4_t, b: int32x4_t) -> bool {
+            unsafe { vmaxvq_u32(vcgtq_s32(a, b)) != 0 }
+        }
+        #[inline(always)]
+        fn load(src: &[i32]) -> int32x4_t {
+            debug_assert!(src.len() >= 4);
+            unsafe { vld1q_s32(src.as_ptr()) }
+        }
+        #[inline(always)]
+        fn store(v: int32x4_t, dst: &mut [i32]) {
+            debug_assert!(dst.len() >= 4);
+            unsafe { vst1q_s32(dst.as_mut_ptr(), v) }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn score(
         query: &[u8],
         target: &[u8],
@@ -799,16 +969,20 @@ mod arm {
         width: ScoreWidth,
         s8: &mut StripedBufs<i8>,
         s16: &mut StripedBufs<i16>,
+        s32: &mut StripedBufs<i32>,
     ) -> Option<i32> {
         match width {
             ScoreWidth::I8 => Some(farrar_mode::<StripedNeon>(query, target, scoring, mode, s8)),
             ScoreWidth::I16 => Some(farrar_mode::<StripedNeonI16>(
                 query, target, scoring, mode, s16,
             )),
-            ScoreWidth::I32 => None,
+            ScoreWidth::I32 => Some(farrar_mode::<StripedNeonI32>(
+                query, target, scoring, mode, s32,
+            )),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn position_max(
         query: &[u8],
         target: &[u8],
@@ -817,13 +991,16 @@ mod arm {
         out: &mut Vec<i32>,
         s8: &mut StripedBufs<i8>,
         s16: &mut StripedBufs<i16>,
+        s32: &mut StripedBufs<i32>,
     ) -> Option<()> {
         match width {
             ScoreWidth::I8 => farrar_position_max::<StripedNeon>(query, target, scoring, out, s8),
             ScoreWidth::I16 => {
                 farrar_position_max::<StripedNeonI16>(query, target, scoring, out, s16)
             }
-            ScoreWidth::I32 => return None,
+            ScoreWidth::I32 => {
+                farrar_position_max::<StripedNeonI32>(query, target, scoring, out, s32)
+            }
         }
         Some(())
     }
@@ -873,6 +1050,24 @@ mod tests {
         }
         fn ssub(self, o: i16) -> i16 {
             self.saturating_sub(o)
+        }
+    }
+    // The `i32` stand-in mirrors the hardware `i32` backend's model, NOT the `i8`/`i16` one: the
+    // sentinel is `i32::MIN / 4` (via `MIN`) and `sadd`/`ssub` are plain wrapping (no saturating
+    // 32-bit SIMD op exists), the width proof guaranteeing the headroom that keeps it exact.
+    impl SElem for i32 {
+        const MIN: i32 = i32::MIN / 4;
+        fn sat(v: i32) -> i32 {
+            v
+        }
+        fn to_i32(self) -> i32 {
+            self
+        }
+        fn sadd(self, o: i32) -> i32 {
+            self.wrapping_add(o)
+        }
+        fn ssub(self, o: i32) -> i32 {
+            self.wrapping_sub(o)
         }
     }
 
@@ -970,17 +1165,14 @@ mod tests {
 
     const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
 
-    /// The striped kernel realises the DP in the proven width; it matches the oracle exactly where
-    /// the width proof says `i8` or `i16` suffices — precisely where `align_pair` uses it. Returns
-    /// that width for an in-scope (non-empty, `i8`/`i16`) case, else `None`.
+    /// The striped kernel realises the DP in the proven width; it matches the oracle exactly at every
+    /// width the proof can select — precisely where `align_pair` uses it. Returns that width for an
+    /// in-scope (non-empty) case, else `None` (the empty cases go to the scalar path).
     fn scope_width(q: &[u8], t: &[u8], s: &Scoring, mode: Mode) -> Option<crate::ScoreWidth> {
         if q.is_empty() || t.is_empty() {
             return None;
         }
-        match s.required_width(mode, q.len(), t.len()) {
-            Ok(w @ (crate::ScoreWidth::I8 | crate::ScoreWidth::I16)) => Some(w),
-            _ => None,
-        }
+        s.required_width(mode, q.len(), t.len()).ok()
     }
 
     /// Every lane count (scalar stand-in, at the proven width) and, where available, the hardware
@@ -1037,7 +1229,33 @@ mod tests {
                         assert_eq!(got, want, "i16 {mode} q={q:?} t={t:?}");
                     }
                 }
-                crate::ScoreWidth::I32 => {}
+                crate::ScoreWidth::I32 => {
+                    for got in [
+                        farrar_mode::<ScalarStriped<i32, 1>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
+                        farrar_mode::<ScalarStriped<i32, 3>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
+                        farrar_mode::<ScalarStriped<i32, 4>>(
+                            q,
+                            t,
+                            s,
+                            mode,
+                            &mut StripedBufs::new(),
+                        ),
+                    ] {
+                        assert_eq!(got, want, "i32 {mode} q={q:?} t={t:?}");
+                    }
+                }
             }
             if let Some(got) = farrar_score_simd(
                 q,
@@ -1045,6 +1263,7 @@ mod tests {
                 s,
                 mode,
                 width,
+                &mut StripedBufs::new(),
                 &mut StripedBufs::new(),
                 &mut StripedBufs::new(),
             ) {
@@ -1074,7 +1293,11 @@ mod tests {
                         chk!(ScalarStriped<i16, 3>);
                         chk!(ScalarStriped<i16, 8>);
                     }
-                    crate::ScoreWidth::I32 => {}
+                    crate::ScoreWidth::I32 => {
+                        chk!(ScalarStriped<i32, 1>);
+                        chk!(ScalarStriped<i32, 3>);
+                        chk!(ScalarStriped<i32, 4>);
+                    }
                 }
                 let mut got = Vec::new();
                 if farrar_position_max_simd(
@@ -1083,6 +1306,7 @@ mod tests {
                     s,
                     width,
                     &mut got,
+                    &mut StripedBufs::new(),
                     &mut StripedBufs::new(),
                     &mut StripedBufs::new(),
                 )
@@ -1120,9 +1344,11 @@ mod tests {
 
                 let mut s8 = StripedBufs::new();
                 let mut s16 = StripedBufs::new();
+                let mut s32 = StripedBufs::new();
                 let start = Instant::now();
                 for _ in 0..reps {
-                    acc ^= farrar_score_simd(&q, &t, s, mode, width, &mut s8, &mut s16).unwrap();
+                    acc ^= farrar_score_simd(&q, &t, s, mode, width, &mut s8, &mut s16, &mut s32)
+                        .unwrap();
                 }
                 let simd = start.elapsed().as_secs_f64();
 
@@ -1196,13 +1422,15 @@ mod tests {
             // Reused striped scratch (the `_with` pattern) — no per-call allocation.
             let mut s8 = StripedBufs::new();
             let mut s16 = StripedBufs::new();
+            let mut s32 = StripedBufs::new();
 
             // Correctness guard: the timed paths must agree before we trust the numbers.
             let mut a = Vec::new();
             let mut b = Vec::new();
             scalar_colmax_baseline(&q, &t, s, &mut a);
             assert!(
-                farrar_position_max_simd(&q, &t, s, width, &mut b, &mut s8, &mut s16).is_some(),
+                farrar_position_max_simd(&q, &t, s, width, &mut b, &mut s8, &mut s16, &mut s32)
+                    .is_some(),
                 "{label}: expected a SIMD backend at width {width}"
             );
             assert_eq!(
@@ -1222,7 +1450,7 @@ mod tests {
 
             let start = Instant::now();
             for _ in 0..reps {
-                farrar_position_max_simd(&q, &t, s, width, &mut out, &mut s8, &mut s16);
+                farrar_position_max_simd(&q, &t, s, width, &mut out, &mut s8, &mut s16, &mut s32);
                 acc ^= out[out.len() - 1] as i64;
             }
             let simd = start.elapsed().as_secs_f64();
@@ -1281,6 +1509,43 @@ mod tests {
         // An exact long match (score 25*20 = 500, well past i8).
         let r: Vec<u8> = (0..30u8).map(|i| i % 4).collect();
         assert_matches_oracle(&r, &r, &s);
+    }
+
+    /// Scores that provably exceed `i16`: the `i32` striped backend must match the oracle where the
+    /// `i16` one would saturate. `i32` uses a distinct model (plain arithmetic, `i32::MIN/4`
+    /// sentinel), so this is the guard that the new backends + width dispatch line up with the
+    /// scalar oracle across every mode, lane count (stand-in 1/3/4), and the hardware 4-lane path.
+    #[test]
+    fn i32_width_scores() {
+        // Match `+5000`, mismatch `-3000`: a 25-column alignment reaches 125_000, well past i16.
+        let s = Scoring::new(4, id_matrix(4, 5000, -3000), 600, 100).unwrap();
+        let q: Vec<u8> = (0..25u8).map(|i| i % 4).collect();
+        let t: Vec<u8> = (0..25u8).map(|i| (i * 3) % 4).collect();
+        assert_eq!(
+            s.required_width(Mode::Sw, q.len(), t.len()),
+            Ok(crate::ScoreWidth::I32),
+            "test is only meaningful if it genuinely proves i32"
+        );
+        assert_matches_oracle(&q, &t, &s);
+        // An exact long match (score 30*5000 = 150_000) and length boundaries around the 4-lane
+        // width, plus a big gap to stress lazy-F at i32.
+        for len in [1usize, 4, 5, 8, 9, 30] {
+            let r: Vec<u8> = (0..len).map(|i| (i % 4) as u8).collect();
+            assert_matches_oracle(&r, &r, &s);
+        }
+        assert_matches_oracle(&[0u8; 40], &[1u8; 3], &s);
+        assert_matches_oracle(&[0u8, 1, 2, 3, 0, 1, 2, 3], &[1, 0, 3, 2, 1, 0, 3, 2], &s);
+
+        // The public `align_pair` entry must route this i32-width case through the striped kernel
+        // (not the scalar fallback) and still match the oracle, on every mode.
+        use crate::{SearchType, align_pair};
+        for mode in ALL_MODES {
+            let got = align_pair(&q, &t, &s, mode, SearchType::Score)
+                .unwrap()
+                .score;
+            let want = align_core(&q, &t, &s, mode, &mut DpBuffers::new()).0;
+            assert_eq!(got, want, "align_pair i32 {mode} q={q:?} t={t:?}");
+        }
     }
 
     /// A mismatch below `-127` must clamp, not wrap (the case is in scope for `SW`).
