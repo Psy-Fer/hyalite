@@ -3,9 +3,10 @@
 //! One query is aligned against a whole batch of database sequences at once, with database
 //! sequence `k` occupying SIMD lane `k`. The DP recurrence is identical to the scalar kernel
 //! ([`crate::kernel`]); only the data layout changes — each column step advances all lanes
-//! together. The arithmetic runs at **i8 saturating** width (`DETERMINISM.md` §1), so this path
-//! is used only for databases whose proven [`ScoreWidth`](crate::ScoreWidth) is `I8` and whose
-//! alphabet fits a byte shuffle (`alphabet_len <= 16`); everything else stays on the scalar path.
+//! together. It runs at whichever of **i8/i16/i32** the width proof selected (`DETERMINISM.md` §1).
+//! The byte-shuffle **Gathered** layout needs `alphabet_len <= 16`; the **Precomputed** layout uses
+//! direct loads, so it serves any alphabet (proteins included) at any width. A database only stays
+//! on the scalar path when even the Precomputed table would not fit the cache budget.
 //!
 //! The kernel computes **scores only** — no in-vector position tracking. For `ScoreEnd` the end
 //! positions of the single winning sequence are recovered with one scalar re-alignment
@@ -265,10 +266,14 @@ pub(crate) fn kernel_applies(width: crate::ScoreWidth, alphabet_len: usize) -> b
 }
 
 /// The SIMD plan for a database at its proven width: `Some(layout)` if the inter-sequence kernel
-/// applies, else `None` (use the scalar path). `i8` supports both layouts (Gathered needs
-/// `alphabet_len <= 16`); `i16` uses the Precomputed layout only (the byte-shuffle gather is
-/// `i8`-specific), and only when that table fits the cache budget or is explicitly forced. `i32`
-/// behaves like `i16`: Precomputed-only, budget-gated.
+/// applies, else `None` (use the scalar path).
+///
+/// The byte-shuffle **Gathered** gather is what needs `alphabet_len <= 16` (`PSHUFB` indexes a
+/// 16-entry table) — and it is `i8`-specific. The **Precomputed** layout looks scores up with a
+/// direct load, so it serves *any* alphabet at any width; only the score element width differs. So:
+/// an `i8` database with a small alphabet may use either layout (chosen by size); an `i8` database
+/// with a **large alphabet** (e.g. proteins, 20/25) or any `i16`/`i32` database uses Precomputed
+/// only, gated on the table fitting the cache budget (or forced).
 pub(crate) fn simd_plan(
     width: crate::ScoreWidth,
     alphabet_len: usize,
@@ -277,33 +282,35 @@ pub(crate) fn simd_plan(
     choice: LayoutChoice,
 ) -> Option<Layout> {
     match width {
-        crate::ScoreWidth::I8 => {
-            if alphabet_len > MAX_SHUFFLE_ALPHABET {
-                return None;
-            }
+        // Small alphabet at `i8`: the byte-shuffle Gathered gather applies; pick by size.
+        crate::ScoreWidth::I8 if alphabet_len <= MAX_SHUFFLE_ALPHABET => {
             Some(choose_layout(sequences, lanes, alphabet_len, choice))
         }
-        crate::ScoreWidth::I16 => match choice {
-            LayoutChoice::Force(Layout::Gathered) => None,
-            LayoutChoice::Force(Layout::Precomputed) => Some(Layout::Precomputed),
-            LayoutChoice::Auto => {
-                // `precomputed_table_bytes` counts elements; `i16` is two bytes each.
-                let bytes =
-                    precomputed_table_bytes(sequences, lanes, alphabet_len).saturating_mul(2);
-                (bytes <= PRECOMPUTED_MAX_BYTES).then_some(Layout::Precomputed)
-            }
-        },
-        // `i32` mirrors `i16`: Precomputed only (the byte-shuffle Gathered gather is `i8`-specific),
-        // gated on the table (four bytes per element) fitting the cache budget, or forced.
-        crate::ScoreWidth::I32 => match choice {
-            LayoutChoice::Force(Layout::Gathered) => None,
-            LayoutChoice::Force(Layout::Precomputed) => Some(Layout::Precomputed),
-            LayoutChoice::Auto => {
-                let bytes =
-                    precomputed_table_bytes(sequences, lanes, alphabet_len).saturating_mul(4);
-                (bytes <= PRECOMPUTED_MAX_BYTES).then_some(Layout::Precomputed)
-            }
-        },
+        // Large-alphabet `i8`, or any `i16`/`i32`: Precomputed only, one/two/four bytes per element.
+        crate::ScoreWidth::I8 => precomputed_only_plan(sequences, lanes, alphabet_len, choice, 1),
+        crate::ScoreWidth::I16 => precomputed_only_plan(sequences, lanes, alphabet_len, choice, 2),
+        crate::ScoreWidth::I32 => precomputed_only_plan(sequences, lanes, alphabet_len, choice, 4),
+    }
+}
+
+/// The Precomputed-only plan shared by large-alphabet `i8` and all `i16`/`i32` databases: honour a
+/// forced layout, else auto-select Precomputed when its table (`element_bytes` per entry) fits the
+/// cache budget. Never Gathered — its byte-shuffle gather does not apply here.
+fn precomputed_only_plan(
+    sequences: &[Vec<u8>],
+    lanes: usize,
+    alphabet_len: usize,
+    choice: LayoutChoice,
+    element_bytes: usize,
+) -> Option<Layout> {
+    match choice {
+        LayoutChoice::Force(Layout::Gathered) => None,
+        LayoutChoice::Force(Layout::Precomputed) => Some(Layout::Precomputed),
+        LayoutChoice::Auto => {
+            let bytes = precomputed_table_bytes(sequences, lanes, alphabet_len)
+                .saturating_mul(element_bytes);
+            (bytes <= PRECOMPUTED_MAX_BYTES).then_some(Layout::Precomputed)
+        }
     }
 }
 
@@ -991,9 +998,10 @@ fn scan_batch_ends<L: LanesEnds>(
 
 /// Scan `query` against every sequence using the inter-sequence kernel with lane backend `L`.
 ///
-/// Requires an `I8`-width, `alphabet_len <= 16` database (see [`kernel_applies`]); the caller
-/// gates that. Returns the same [`BestHit`] the scalar path would: highest score, smallest
-/// `db_index` on a tie, and — for `ScoreEnd` — the winner's ends via one scalar re-alignment.
+/// Works at any width `L::Elem` and any alphabet the packing supports (the Gathered layout needs
+/// `alphabet_len <= 16`; Precomputed serves any); the caller resolves that via [`simd_plan`].
+/// Returns the same [`BestHit`] the scalar path would: highest score, smallest `db_index` on a tie,
+/// and — for `ScoreEnd` — the winner's ends via one scalar re-alignment.
 ///
 /// `#[inline(always)]` (matching `fill_scores_lanes`/`fill_ends_lanes`) so it folds into the
 /// `#[target_feature]` `run` shim and its `scan_batch` inner loop is generated in the feature

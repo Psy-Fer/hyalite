@@ -235,6 +235,29 @@ fn scheme_mixed_length_db() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<
     })
 }
 
+/// A **large alphabet** (17..=25, e.g. proteins) that the byte-shuffle Gathered gather cannot serve
+/// (`> 16` entries), so the SIMD kernel must use the Precomputed layout. Small entries keep short
+/// sequences inside `i8`, so this exercises the large-alphabet path at every width the proof picks.
+fn scheme_db_query_large_alphabet() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<u8>)> {
+    (17usize..=25)
+        .prop_flat_map(|al| {
+            let mat = prop::collection::vec(-6i32..=6, al * al);
+            let gaps = (0i32..=6).prop_flat_map(|go| (Just(go), 0i32..=go));
+            (Just(al), mat, gaps)
+        })
+        .prop_map(|(al, matrix, (gap_open, gap_ext))| Scheme {
+            al,
+            matrix,
+            gap_open,
+            gap_ext,
+        })
+        .prop_flat_map(|s| {
+            let al = s.al;
+            let db = prop::collection::vec(seq(al, 14), 1..=6);
+            (Just(s), db, seq(al, 14))
+        })
+}
+
 proptest! {
     /// `Database::scan` equals the best `align_pair` over the database with the smallest-index
     /// tie-break, for random databases, queries, modes, and search types.
@@ -665,6 +688,62 @@ proptest! {
                 oracle.scan_scores(&mut os, &q, &mut ws);
                 for &b in &simd {
                     let db = build(b);
+                    let mut gs = Scratch::new(&db);
+                    prop_assert_eq!(db.scan(&mut gs, &q), want, "{} scan {} {}", b, mode, st);
+                    let (mut ga, mut gsc) = (Vec::new(), Vec::new());
+                    db.scan_all(&mut gs, &q, &mut ga);
+                    db.scan_scores(&mut gs, &q, &mut gsc);
+                    prop_assert_eq!(&ga, &wa, "{} scan_all {} {}", b, mode, st);
+                    prop_assert_eq!(&gsc, &ws, "{} scan_scores {} {}", b, mode, st);
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Large-alphabet (protein-scale, 17..=25) databases: the byte-shuffle Gathered gather cannot
+    /// index `> 16` entries, so the SIMD kernel uses the Precomputed layout — which serves any
+    /// alphabet. Every available SIMD backend must agree with the scalar oracle for `scan`,
+    /// `scan_all`, and `scan_scores`, across all modes and both search types. This is the guard that
+    /// opened the protein door (previously these databases fell back to scalar). Skipped on CPUs with
+    /// no SIMD backend.
+    #[test]
+    fn large_alphabet_scan_matches_scalar((s, db_seqs, q) in scheme_db_query_large_alphabet()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
+            return Ok(());
+        }
+        prop_assert!(s.al > 16, "generator must produce a large alphabet");
+        let scoring = s.scoring();
+        for mode in ALL_MODES {
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let build = |b: Backend| {
+                    Database::builder()
+                        .sequences(&db_seqs)
+                        .scoring(scoring.clone())
+                        .mode(mode)
+                        .search_type(st)
+                        .max_query_len(14)
+                        .backend(BackendChoice::Force(b))
+                        .build()
+                        .unwrap()
+                };
+                let oracle = build(Backend::Scalar);
+                let mut os = Scratch::new(&oracle);
+                let want = oracle.scan(&mut os, &q);
+                let (mut wa, mut ws) = (Vec::new(), Vec::new());
+                oracle.scan_all(&mut os, &q, &mut wa);
+                oracle.scan_scores(&mut os, &q, &mut ws);
+                for &b in &simd {
+                    let db = build(b);
+                    // Large alphabet ⇒ Precomputed (never Gathered).
+                    prop_assert_eq!(db.layout(), Some(Layout::Precomputed), "{} {} {}", b, mode, st);
                     let mut gs = Scratch::new(&db);
                     prop_assert_eq!(db.scan(&mut gs, &q), want, "{} scan {} {}", b, mode, st);
                     let (mut ga, mut gsc) = (Vec::new(), Vec::new());

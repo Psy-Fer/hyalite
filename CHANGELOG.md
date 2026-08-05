@@ -8,6 +8,15 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- SIMD acceleration for **large alphabets** (`alphabet_len > 16`, e.g. proteins): the byte-shuffle
+  Gathered gather can only index a 16-entry table, but the Precomputed layout looks scores up with a
+  direct load and so serves any alphabet at any width. A database whose alphabet exceeds 16 (which
+  previously fell back to the scalar path) now runs on the SIMD kernel via the Precomputed layout —
+  the same layout `i16`/`i32` already used — as long as its score table fits the cache budget.
+  Bit-identical to the scalar oracle across every backend, mode, and search type. (Databases whose
+  Precomputed table would exceed the budget still fall back to scalar; a large-alphabet Gathered path
+  for those is future work.)
+
 - Per-sequence score-width escalation for database scans: a `Score`/`ScoreEnd` `Database` now proves
   each target's integer width from *its own* length and partitions the sequences into width groups,
   so a mixed-length database runs its short sequences at a narrow width (more SIMD lanes) instead of

@@ -1162,22 +1162,25 @@ mod tests {
 
     #[test]
     fn forcing_simd_on_an_ineligible_database_errors() {
-        // A large alphabet (20 > 16) rules out the byte-shuffle Gathered gather, and no other SIMD
-        // layout serves an i8 database with alphabet_len > 16, so no SIMD kernel applies. Forcing
-        // one must fail loudly rather than silently falling back. (Score widths i8/i16/i32 are all
-        // SIMD-eligible now, so width alone no longer makes a database ineligible.)
-        let al = 20usize;
+        // A large alphabet (25 > 16) rules out the byte-shuffle Gathered gather; only the Precomputed
+        // layout could serve it, and here its score table is far too big for the cache budget (one
+        // 200k-long sequence), so no SIMD kernel applies. Forcing one must fail loudly rather than
+        // silently falling back. (Small alphabets, and large alphabets whose Precomputed table fits,
+        // are all SIMD-eligible now — width and alphabet size alone no longer make a database
+        // ineligible.)
+        let al = 25usize;
         let mut matrix = vec![-1i32; al * al];
         for d in 0..al {
-            matrix[d * al + d] = 1; // small entries → proves i8
+            matrix[d * al + d] = 1; // match +1, so short queries keep the score in i8
         }
         let scoring = Scoring::new(al, matrix, 2, 1).unwrap();
-        let seq: Vec<u8> = (0..al as u8).collect();
+        // A very long target: the Precomputed table (alphabet_len × width × lanes) dwarfs the budget.
+        let seq: Vec<u8> = (0..200_000u32).map(|i| (i % al as u32) as u8).collect();
         let result = Database::builder()
             .sequences(&[seq])
             .scoring(scoring)
-            .mode(Mode::Nw)
-            .max_query_len(al)
+            .mode(Mode::Sw)
+            .max_query_len(100) // keeps SW width at i8 (min(100, len) · 1 = 100 < 128)
             .backend(BackendChoice::Force(Backend::Sse41))
             .build();
         // On a CPU without SSE4.1 the resolver rejects it before the eligibility check; either way
