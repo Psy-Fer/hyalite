@@ -28,7 +28,7 @@
 use crate::hit::BestHit;
 use crate::kernel::{self, Flags, gap_penalty};
 use crate::mode::Mode;
-use crate::scoring::Scoring;
+use crate::scoring::{Gaps, Scoring};
 use crate::search::SearchType;
 
 /// The score element a kernel runs in (`i8` or `i16`) — the width the proof selected. One
@@ -678,8 +678,7 @@ fn scan_batch<L: Lanes>(
     letter_profile: &[L::Elem],
     al: usize,
     batch: &PackedBatch<L::Elem>,
-    go: i32,
-    ge: i32,
+    gaps: Gaps,
     flags: &Flags,
     h: &mut [L::Elem],
     f: &mut [L::Elem],
@@ -690,8 +689,14 @@ fn scan_batch<L: Lanes>(
     let w = batch.w;
     let cols = (w + 1) * lanes;
 
-    let go_v = L::splat(L::Elem::sat(go));
-    let ge_v = L::splat(L::Elem::sat(ge));
+    // `E` (query-gap) and `F` (target-gap) carry their own open/extend; the two sets are equal
+    // exactly when the scheme is symmetric.
+    let (q_go, q_ge) = gaps.query();
+    let (t_go, t_ge) = gaps.target();
+    let q_go_v = L::splat(L::Elem::sat(q_go));
+    let q_ge_v = L::splat(L::Elem::sat(q_ge));
+    let t_go_v = L::splat(L::Elem::sat(t_go));
+    let t_ge_v = L::splat(L::Elem::sat(t_ge));
     let zero = L::splat(L::Elem::ZERO);
     let neg = L::splat(L::Elem::NEG);
 
@@ -707,7 +712,7 @@ fn scan_batch<L: Lanes>(
         let border = if flags.top_row_free {
             zero
         } else {
-            L::splat(L::Elem::sat(-gap_penalty(go, ge, j)))
+            L::splat(L::Elem::sat(-gap_penalty(q_go, q_ge, j)))
         };
         L::store(border, &mut prev[j * lanes..]);
         L::store(neg, &mut f[j * lanes..]);
@@ -733,7 +738,7 @@ fn scan_batch<L: Lanes>(
         let border = if flags.left_col_free {
             zero
         } else {
-            L::splat(L::Elem::sat(-gap_penalty(go, ge, i)))
+            L::splat(L::Elem::sat(-gap_penalty(t_go, t_ge, i)))
         };
         L::store(border, &mut cur[0..lanes]);
         let qi = query[i - 1] as usize;
@@ -742,12 +747,12 @@ fn scan_batch<L: Lanes>(
             let col = j * lanes;
             let prevcol = (j - 1) * lanes;
             e = L::max(
-                L::sub_sat(L::load(&cur[prevcol..]), go_v),
-                L::sub_sat(e, ge_v),
+                L::sub_sat(L::load(&cur[prevcol..]), q_go_v),
+                L::sub_sat(e, q_ge_v),
             );
             let f_j = L::max(
-                L::sub_sat(L::load(&prev[col..]), go_v),
-                L::sub_sat(L::load(&f[col..]), ge_v),
+                L::sub_sat(L::load(&prev[col..]), t_go_v),
+                L::sub_sat(L::load(&f[col..]), t_ge_v),
             );
             L::store(f_j, &mut f[col..]);
             // Substitution vector = score(query[i], target_k[j]) per lane, from the chosen layout.
@@ -834,8 +839,7 @@ fn scan_batch_ends<L: LanesEnds>(
     letter_profile: &[L::Elem],
     al: usize,
     batch: &PackedBatch<L::Elem>,
-    go: i32,
-    ge: i32,
+    gaps: Gaps,
     flags: &Flags,
     h: &mut [L::Elem],
     f: &mut [L::Elem],
@@ -848,8 +852,14 @@ fn scan_batch_ends<L: LanesEnds>(
     let w = batch.w;
     let cols = (w + 1) * lanes;
 
-    let go_v = L::splat(L::Elem::sat(go));
-    let ge_v = L::splat(L::Elem::sat(ge));
+    // `E` (query-gap) and `F` (target-gap) carry their own open/extend; the two sets are equal
+    // exactly when the scheme is symmetric.
+    let (q_go, q_ge) = gaps.query();
+    let (t_go, t_ge) = gaps.target();
+    let q_go_v = L::splat(L::Elem::sat(q_go));
+    let q_ge_v = L::splat(L::Elem::sat(q_ge));
+    let t_go_v = L::splat(L::Elem::sat(t_go));
+    let t_ge_v = L::splat(L::Elem::sat(t_ge));
     let zero = L::splat(L::Elem::ZERO);
     let neg = L::splat(L::Elem::NEG);
     let all = L::splat(L::Elem::MASK); // every lane active (all bits set)
@@ -863,7 +873,7 @@ fn scan_batch_ends<L: LanesEnds>(
         let border = if flags.top_row_free {
             zero
         } else {
-            L::splat(L::Elem::sat(-gap_penalty(go, ge, j)))
+            L::splat(L::Elem::sat(-gap_penalty(q_go, q_ge, j)))
         };
         L::store(border, &mut prev[j * lanes..]);
         L::store(neg, &mut f[j * lanes..]);
@@ -897,7 +907,7 @@ fn scan_batch_ends<L: LanesEnds>(
         let border = if flags.left_col_free {
             zero
         } else {
-            L::splat(L::Elem::sat(-gap_penalty(go, ge, i)))
+            L::splat(L::Elem::sat(-gap_penalty(t_go, t_ge, i)))
         };
         L::store(border, &mut cur[0..lanes]);
         let qi = query[i - 1] as usize;
@@ -906,12 +916,12 @@ fn scan_batch_ends<L: LanesEnds>(
             let col = j * lanes;
             let prevcol = (j - 1) * lanes;
             e = L::max(
-                L::sub_sat(L::load(&cur[prevcol..]), go_v),
-                L::sub_sat(e, ge_v),
+                L::sub_sat(L::load(&cur[prevcol..]), q_go_v),
+                L::sub_sat(e, q_ge_v),
             );
             let f_j = L::max(
-                L::sub_sat(L::load(&prev[col..]), go_v),
-                L::sub_sat(L::load(&f[col..]), ge_v),
+                L::sub_sat(L::load(&prev[col..]), t_go_v),
+                L::sub_sat(L::load(&f[col..]), t_ge_v),
             );
             L::store(f_j, &mut f[col..]);
             let sub = match &batch.sub {
@@ -1013,7 +1023,7 @@ pub(crate) fn scan_batched<L: Lanes>(
     dp: &mut kernel::DpBuffers,
 ) -> BestHit {
     let flags = Flags::for_mode(mode);
-    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let gaps = scoring.gaps();
 
     let mut best_score = i32::MIN;
     let mut best_index = 0usize;
@@ -1023,8 +1033,7 @@ pub(crate) fn scan_batched<L: Lanes>(
             &packed.letter_profile,
             packed.alphabet_len,
             batch,
-            go,
-            ge,
+            gaps,
             &flags,
             h,
             f,
@@ -1124,8 +1133,7 @@ pub(crate) fn scan_dispatch(
 fn fill_scores_lanes<L: Lanes>(
     packed: &PackedDb<L::Elem>,
     query: &[u8],
-    go: i32,
-    ge: i32,
+    gaps: Gaps,
     flags: &Flags,
     h: &mut [L::Elem],
     f: &mut [L::Elem],
@@ -1139,8 +1147,7 @@ fn fill_scores_lanes<L: Lanes>(
             &packed.letter_profile,
             packed.alphabet_len,
             batch,
-            go,
-            ge,
+            gaps,
             flags,
             h,
             f,
@@ -1154,44 +1161,34 @@ pub(crate) fn fill_scores(
     backend: crate::Backend,
     packed: &Packed,
     mode: Mode,
-    gap_open: i32,
-    gap_ext: i32,
+    gaps: Gaps,
     query: &[u8],
     sc: &mut SimdScratch,
 ) {
     let flags = Flags::for_mode(mode);
-    let (go, ge) = (gap_open, gap_ext);
     match (packed, backend) {
         #[cfg(target_arch = "x86_64")]
-        (Packed::I8(p), crate::Backend::Avx2) => avx2::run_scores(p, query, go, ge, &flags, sc),
+        (Packed::I8(p), crate::Backend::Avx2) => avx2::run_scores(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I8(p), crate::Backend::Sse41) => sse41::run_scores(p, query, go, ge, &flags, sc),
+        (Packed::I8(p), crate::Backend::Sse41) => sse41::run_scores(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "aarch64")]
-        (Packed::I8(p), crate::Backend::Neon) => neon::run_scores(p, query, go, ge, &flags, sc),
+        (Packed::I8(p), crate::Backend::Neon) => neon::run_scores(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I16(p), crate::Backend::Avx2) => {
-            avx2::run_scores_i16(p, query, go, ge, &flags, sc)
-        }
+        (Packed::I16(p), crate::Backend::Avx2) => avx2::run_scores_i16(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
         (Packed::I16(p), crate::Backend::Sse41) => {
-            sse41::run_scores_i16(p, query, go, ge, &flags, sc)
+            sse41::run_scores_i16(p, query, gaps, &flags, sc)
         }
         #[cfg(target_arch = "aarch64")]
-        (Packed::I16(p), crate::Backend::Neon) => {
-            neon::run_scores_i16(p, query, go, ge, &flags, sc)
-        }
+        (Packed::I16(p), crate::Backend::Neon) => neon::run_scores_i16(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I32(p), crate::Backend::Avx2) => {
-            avx2::run_scores_i32(p, query, go, ge, &flags, sc)
-        }
+        (Packed::I32(p), crate::Backend::Avx2) => avx2::run_scores_i32(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
         (Packed::I32(p), crate::Backend::Sse41) => {
-            sse41::run_scores_i32(p, query, go, ge, &flags, sc)
+            sse41::run_scores_i32(p, query, gaps, &flags, sc)
         }
         #[cfg(target_arch = "aarch64")]
-        (Packed::I32(p), crate::Backend::Neon) => {
-            neon::run_scores_i32(p, query, go, ge, &flags, sc)
-        }
+        (Packed::I32(p), crate::Backend::Neon) => neon::run_scores_i32(p, query, gaps, &flags, sc),
         (_, other) => unreachable!("no inter-sequence kernel for backend {other}"),
     }
 }
@@ -1219,36 +1216,30 @@ pub(crate) fn fill_ends(
     backend: crate::Backend,
     packed: &Packed,
     mode: Mode,
-    gap_open: i32,
-    gap_ext: i32,
+    gaps: Gaps,
     query: &[u8],
     sc: &mut SimdScratch,
 ) {
     let flags = Flags::for_mode(mode);
-    let (go, ge) = (gap_open, gap_ext);
     match (packed, backend) {
         #[cfg(target_arch = "x86_64")]
-        (Packed::I8(p), crate::Backend::Avx2) => avx2::run_ends(p, query, go, ge, &flags, sc),
+        (Packed::I8(p), crate::Backend::Avx2) => avx2::run_ends(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I8(p), crate::Backend::Sse41) => sse41::run_ends(p, query, go, ge, &flags, sc),
+        (Packed::I8(p), crate::Backend::Sse41) => sse41::run_ends(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "aarch64")]
-        (Packed::I8(p), crate::Backend::Neon) => neon::run_ends(p, query, go, ge, &flags, sc),
+        (Packed::I8(p), crate::Backend::Neon) => neon::run_ends(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I16(p), crate::Backend::Avx2) => avx2::run_ends_i16(p, query, go, ge, &flags, sc),
+        (Packed::I16(p), crate::Backend::Avx2) => avx2::run_ends_i16(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I16(p), crate::Backend::Sse41) => {
-            sse41::run_ends_i16(p, query, go, ge, &flags, sc)
-        }
+        (Packed::I16(p), crate::Backend::Sse41) => sse41::run_ends_i16(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "aarch64")]
-        (Packed::I16(p), crate::Backend::Neon) => neon::run_ends_i16(p, query, go, ge, &flags, sc),
+        (Packed::I16(p), crate::Backend::Neon) => neon::run_ends_i16(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I32(p), crate::Backend::Avx2) => avx2::run_ends_i32(p, query, go, ge, &flags, sc),
+        (Packed::I32(p), crate::Backend::Avx2) => avx2::run_ends_i32(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "x86_64")]
-        (Packed::I32(p), crate::Backend::Sse41) => {
-            sse41::run_ends_i32(p, query, go, ge, &flags, sc)
-        }
+        (Packed::I32(p), crate::Backend::Sse41) => sse41::run_ends_i32(p, query, gaps, &flags, sc),
         #[cfg(target_arch = "aarch64")]
-        (Packed::I32(p), crate::Backend::Neon) => neon::run_ends_i32(p, query, go, ge, &flags, sc),
+        (Packed::I32(p), crate::Backend::Neon) => neon::run_ends_i32(p, query, gaps, &flags, sc),
         (_, other) => unreachable!("no inter-sequence end kernel for backend {other}"),
     }
 }
@@ -1261,8 +1252,7 @@ pub(crate) fn fill_ends(
 fn fill_ends_lanes<L: LanesEnds>(
     packed: &PackedDb<L::Elem>,
     query: &[u8],
-    go: i32,
-    ge: i32,
+    gaps: Gaps,
     flags: &Flags,
     h: &mut [L::Elem],
     f: &mut [L::Elem],
@@ -1278,8 +1268,7 @@ fn fill_ends_lanes<L: LanesEnds>(
             &packed.letter_profile,
             packed.alphabet_len,
             batch,
-            go,
-            ge,
+            gaps,
             flags,
             h,
             f,
@@ -1303,7 +1292,7 @@ pub(crate) mod sse41 {
     use crate::hit::BestHit;
     use crate::kernel::DpBuffers;
     use crate::mode::Mode;
-    use crate::scoring::Scoring;
+    use crate::scoring::{Gaps, Scoring};
     use crate::search::SearchType;
     use core::arch::x86_64::*;
 
@@ -1475,16 +1464,14 @@ pub(crate) mod sse41 {
     unsafe fn scores_ff(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Sse41>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h,
             &mut sc.f,
@@ -1496,29 +1483,26 @@ pub(crate) mod sse41 {
     pub(crate) fn run_scores(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { scores_ff(packed, query, go, ge, flags, sc) }
+        unsafe { scores_ff(packed, query, gaps, flags, sc) }
     }
 
     #[target_feature(enable = "sse4.1")]
     unsafe fn ends_ff(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Sse41>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h,
             &mut sc.f,
@@ -1532,13 +1516,12 @@ pub(crate) mod sse41 {
     pub(crate) fn run_ends(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { ends_ff(packed, query, go, ge, flags, sc) }
+        unsafe { ends_ff(packed, query, gaps, flags, sc) }
     }
 
     /// 8-lane SSE4.1 backend at `i16` (Score only; `i16` databases use the Precomputed layout).
@@ -1676,16 +1659,14 @@ pub(crate) mod sse41 {
     unsafe fn scores_ff_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Sse41I16>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h16,
             &mut sc.f16,
@@ -1697,29 +1678,26 @@ pub(crate) mod sse41 {
     pub(crate) fn run_scores_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { scores_ff_i16(packed, query, go, ge, flags, sc) }
+        unsafe { scores_ff_i16(packed, query, gaps, flags, sc) }
     }
 
     #[target_feature(enable = "sse4.1")]
     unsafe fn ends_ff_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Sse41I16>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h16,
             &mut sc.f16,
@@ -1734,13 +1712,12 @@ pub(crate) mod sse41 {
     pub(crate) fn run_ends_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { ends_ff_i16(packed, query, go, ge, flags, sc) }
+        unsafe { ends_ff_i16(packed, query, gaps, flags, sc) }
     }
 
     /// 4-lane SSE4.1 `i32` backend. Arithmetic is plain (non-saturating) `_mm_add/sub_epi32`: x86 has
@@ -1888,16 +1865,14 @@ pub(crate) mod sse41 {
     unsafe fn scores_ff_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Sse41I32>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h32,
             &mut sc.f32,
@@ -1909,29 +1884,26 @@ pub(crate) mod sse41 {
     pub(crate) fn run_scores_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { scores_ff_i32(packed, query, go, ge, flags, sc) }
+        unsafe { scores_ff_i32(packed, query, gaps, flags, sc) }
     }
 
     #[target_feature(enable = "sse4.1")]
     unsafe fn ends_ff_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Sse41I32>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h32,
             &mut sc.f32,
@@ -1946,13 +1918,12 @@ pub(crate) mod sse41 {
     pub(crate) fn run_ends_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
-        unsafe { ends_ff_i32(packed, query, go, ge, flags, sc) }
+        unsafe { ends_ff_i32(packed, query, gaps, flags, sc) }
     }
 }
 
@@ -1968,7 +1939,7 @@ pub(crate) mod avx2 {
     use crate::hit::BestHit;
     use crate::kernel::DpBuffers;
     use crate::mode::Mode;
-    use crate::scoring::Scoring;
+    use crate::scoring::{Gaps, Scoring};
     use crate::search::SearchType;
     use core::arch::x86_64::*;
 
@@ -2141,16 +2112,14 @@ pub(crate) mod avx2 {
     unsafe fn scores_ff(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Avx2>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h,
             &mut sc.f,
@@ -2162,29 +2131,26 @@ pub(crate) mod avx2 {
     pub(crate) fn run_scores(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { scores_ff(packed, query, go, ge, flags, sc) }
+        unsafe { scores_ff(packed, query, gaps, flags, sc) }
     }
 
     #[target_feature(enable = "avx2")]
     unsafe fn ends_ff(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Avx2>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h,
             &mut sc.f,
@@ -2198,13 +2164,12 @@ pub(crate) mod avx2 {
     pub(crate) fn run_ends(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { ends_ff(packed, query, go, ge, flags, sc) }
+        unsafe { ends_ff(packed, query, gaps, flags, sc) }
     }
 
     /// 16-lane AVX2 backend at `i16` (Score only; Precomputed layout).
@@ -2340,16 +2305,14 @@ pub(crate) mod avx2 {
     unsafe fn scores_ff_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Avx2I16>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h16,
             &mut sc.f16,
@@ -2360,29 +2323,26 @@ pub(crate) mod avx2 {
     pub(crate) fn run_scores_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { scores_ff_i16(packed, query, go, ge, flags, sc) }
+        unsafe { scores_ff_i16(packed, query, gaps, flags, sc) }
     }
 
     #[target_feature(enable = "avx2")]
     unsafe fn ends_ff_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Avx2I16>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h16,
             &mut sc.f16,
@@ -2397,13 +2357,12 @@ pub(crate) mod avx2 {
     pub(crate) fn run_ends_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { ends_ff_i16(packed, query, go, ge, flags, sc) }
+        unsafe { ends_ff_i16(packed, query, gaps, flags, sc) }
     }
 
     /// 8-lane AVX2 `i32` backend. Plain (non-saturating) arithmetic, matching the scalar oracle (see
@@ -2547,16 +2506,14 @@ pub(crate) mod avx2 {
     unsafe fn scores_ff_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Avx2I32>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h32,
             &mut sc.f32,
@@ -2568,29 +2525,26 @@ pub(crate) mod avx2 {
     pub(crate) fn run_scores_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { scores_ff_i32(packed, query, go, ge, flags, sc) }
+        unsafe { scores_ff_i32(packed, query, gaps, flags, sc) }
     }
 
     #[target_feature(enable = "avx2")]
     unsafe fn ends_ff_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Avx2I32>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h32,
             &mut sc.f32,
@@ -2605,13 +2559,12 @@ pub(crate) mod avx2 {
     pub(crate) fn run_ends_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
-        unsafe { ends_ff_i32(packed, query, go, ge, flags, sc) }
+        unsafe { ends_ff_i32(packed, query, gaps, flags, sc) }
     }
 }
 
@@ -2628,7 +2581,7 @@ pub(crate) mod neon {
     use crate::hit::BestHit;
     use crate::kernel::DpBuffers;
     use crate::mode::Mode;
-    use crate::scoring::Scoring;
+    use crate::scoring::{Gaps, Scoring};
     use crate::search::SearchType;
     use core::arch::aarch64::*;
 
@@ -2780,16 +2733,14 @@ pub(crate) mod neon {
     pub(crate) fn run_scores(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<Neon>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h,
             &mut sc.f,
@@ -2801,16 +2752,14 @@ pub(crate) mod neon {
     pub(crate) fn run_ends(
         packed: &PackedDb<i8>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<Neon>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h,
             &mut sc.f,
@@ -2936,16 +2885,14 @@ pub(crate) mod neon {
     pub(crate) fn run_scores_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<NeonI16>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h16,
             &mut sc.f16,
@@ -2957,16 +2904,14 @@ pub(crate) mod neon {
     pub(crate) fn run_ends_i16(
         packed: &PackedDb<i16>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<NeonI16>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h16,
             &mut sc.f16,
@@ -3097,16 +3042,14 @@ pub(crate) mod neon {
     pub(crate) fn run_scores_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_scores_lanes::<NeonI32>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h32,
             &mut sc.f32,
@@ -3117,16 +3060,14 @@ pub(crate) mod neon {
     pub(crate) fn run_ends_i32(
         packed: &PackedDb<i32>,
         query: &[u8],
-        go: i32,
-        ge: i32,
+        gaps: Gaps,
         flags: &Flags,
         sc: &mut SimdScratch,
     ) {
         fill_ends_lanes::<NeonI32>(
             packed,
             query,
-            go,
-            ge,
+            gaps,
             flags,
             &mut sc.h32,
             &mut sc.f32,
@@ -3259,8 +3200,7 @@ mod tests {
         fill_scores_lanes::<ScalarLanes<N>>(
             &packed,
             query,
-            scoring.gap_open(),
-            scoring.gap_ext(),
+            scoring.gaps(),
             &Flags::for_mode(mode),
             &mut sc.h,
             &mut sc.f,
@@ -3319,8 +3259,7 @@ mod tests {
         fill_ends_lanes::<ScalarLanes<N>>(
             &packed,
             query,
-            scoring.gap_open(),
-            scoring.gap_ext(),
+            scoring.gaps(),
             &Flags::for_mode(mode),
             &mut sc.h,
             &mut sc.f,

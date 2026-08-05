@@ -351,7 +351,10 @@ fn walk<C: CellSource>(
     gr: usize,
     gc: usize,
 ) -> (usize, usize, Vec<AlignOp>) {
-    let go = scoring.gap_open();
+    // Closing a gap is recognised by the open penalty of *that* gap's direction: `E` (deletions)
+    // by the query-gap open, `F` (insertions) by the target-gap open.
+    let q_go = scoring.query_gap_open();
+    let t_go = scoring.target_gap_open();
     let mut i = gr;
     let mut j = gc;
     let mut state = State::H;
@@ -401,7 +404,7 @@ fn walk<C: CellSource>(
                 ops_rev.push(AlignOp::Del);
                 let ev = cells.e(i, j);
                 j -= 1;
-                if ev == cells.h(i, j) - go {
+                if ev == cells.h(i, j) - q_go {
                     state = State::H;
                 } // else stays in E (extend)
             }
@@ -409,7 +412,7 @@ fn walk<C: CellSource>(
                 ops_rev.push(AlignOp::Ins);
                 let fv = cells.f(i, j);
                 i -= 1;
-                if fv == cells.h(i, j) - go {
+                if fv == cells.h(i, j) - t_go {
                     state = State::H;
                 } // else stays in F (extend)
             }
@@ -457,21 +460,22 @@ fn fill_row(
     scoring: &Scoring,
     flags: &Flags,
 ) {
-    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let (q_go, q_ge) = scoring.gaps().query();
+    let (t_go, t_ge) = scoring.gaps().target();
     let base = cur * cols;
     let pbase = prev * cols;
     h[base] = if flags.left_col_free {
         0
     } else {
-        -gap_penalty(go, ge, i)
+        -gap_penalty(t_go, t_ge, i)
     };
     e[base] = NEG;
     // Matching the top-row `E` border: set `F[i][0]` so the walk can trace and *close* a penalised
     // left-column gap; leave `NEG` when the column is free (the walk stops there instead).
     f[base] = if flags.left_col_free { NEG } else { h[base] };
     for j in 1..=n {
-        e[base + j] = (h[base + j - 1] - go).max(e[base + j - 1] - ge);
-        f[base + j] = (h[pbase + j] - go).max(f[pbase + j] - ge);
+        e[base + j] = (h[base + j - 1] - q_go).max(e[base + j - 1] - q_ge);
+        f[base + j] = (h[pbase + j] - t_go).max(f[pbase + j] - t_ge);
         let sub = scoring.score(query[i - 1] as usize, target[j - 1] as usize);
         let diag = h[pbase + j - 1] + sub;
         let mut cell = diag.max(e[base + j]).max(f[base + j]);
@@ -488,7 +492,9 @@ fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) ->
     let m = query.len();
     let n = target.len();
     let flags = Flags::for_mode(mode);
-    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    // The top row is a run of query-gap (`E`); the left column, filled by `fill_row`, is a run of
+    // target-gap.
+    let (q_go, q_ge) = scoring.gaps().query();
     let cols = n + 1;
 
     let mut h = vec![0i32; (m + 1) * cols];
@@ -501,7 +507,7 @@ fn traceback_full(query: &[u8], target: &[u8], scoring: &Scoring, mode: Mode) ->
         h[j] = if flags.top_row_free {
             0
         } else {
-            -gap_penalty(go, ge, j)
+            -gap_penalty(q_go, q_ge, j)
         };
         e[j] = if flags.top_row_free { NEG } else { h[j] };
     }
@@ -654,7 +660,7 @@ fn traceback_checkpoint(
     let m = query.len();
     let n = target.len();
     let flags = Flags::for_mode(mode);
-    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let (q_go, q_ge) = scoring.gaps().query();
     let cols = n + 1;
     let num_ckpt = m / k + 1;
 
@@ -670,7 +676,7 @@ fn traceback_checkpoint(
         *cell = if flags.top_row_free {
             0
         } else {
-            -gap_penalty(go, ge, j)
+            -gap_penalty(q_go, q_ge, j)
         };
     }
     let mut best = Best::new();

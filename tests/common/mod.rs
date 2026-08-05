@@ -50,19 +50,69 @@ enum Move {
     Down,  // consume a query base as a gap in the target
 }
 
+/// The four gap penalties in `Scoring::new_asymmetric` order. A `Right` move (a gap in the
+/// query) is charged the query pair, a `Down` move (a gap in the target) the target pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gaps {
+    pub query_open: i32,
+    pub query_ext: i32,
+    pub target_open: i32,
+    pub target_ext: i32,
+}
+
+impl Gaps {
+    /// Both directions charged alike, i.e. what `Scoring::new` builds.
+    pub fn symmetric(go: i32, ge: i32) -> Self {
+        Gaps {
+            query_open: go,
+            query_ext: ge,
+            target_open: go,
+            target_ext: ge,
+        }
+    }
+
+    /// The scheme these penalties describe.
+    pub fn scoring(self, al: usize, matrix: Vec<i32>) -> Scoring {
+        Scoring::new_asymmetric(
+            al,
+            matrix,
+            self.query_open,
+            self.query_ext,
+            self.target_open,
+            self.target_ext,
+        )
+        .unwrap()
+    }
+
+    /// The same penalties with the two directions exchanged — the scheme that must score a
+    /// transposed pair identically.
+    pub fn transposed(self) -> Self {
+        Gaps {
+            query_open: self.target_open,
+            query_ext: self.target_ext,
+            target_open: self.query_open,
+            target_ext: self.query_ext,
+        }
+    }
+}
+
 /// Fixed parameters threaded through the brute-force recursion.
 pub struct Prob<'a> {
     pub q: &'a [u8],
     pub t: &'a [u8],
     pub mat: &'a [i32],
     pub al: usize,
-    pub go: i32,
-    pub ge: i32,
+    pub gaps: Gaps,
 }
 
 /// Exact global (NW) score by enumerating every alignment path, charging affine gap penalties
 /// from maximal same-direction runs. Exponential; only for tiny slices.
 pub fn brute_nw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    brute_nw_asym(q, t, mat, al, Gaps::symmetric(go, ge))
+}
+
+/// [`brute_nw`] with the two gap directions charged independently.
+pub fn brute_nw_asym(q: &[u8], t: &[u8], mat: &[i32], al: usize, gaps: Gaps) -> i32 {
     fn rec(p: &Prob, i: usize, j: usize, last: Move) -> i32 {
         let (m, n) = (p.q.len(), p.t.len());
         if i == m && j == n {
@@ -74,11 +124,19 @@ pub fn brute_nw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
             best = best.max(s.saturating_add(rec(p, i + 1, j + 1, Move::Start)));
         }
         if j < n {
-            let cost = if last == Move::Right { p.ge } else { p.go };
+            let cost = if last == Move::Right {
+                p.gaps.query_ext
+            } else {
+                p.gaps.query_open
+            };
             best = best.max((-cost).saturating_add(rec(p, i, j + 1, Move::Right)));
         }
         if i < m {
-            let cost = if last == Move::Down { p.ge } else { p.go };
+            let cost = if last == Move::Down {
+                p.gaps.target_ext
+            } else {
+                p.gaps.target_open
+            };
             best = best.max((-cost).saturating_add(rec(p, i + 1, j, Move::Down)));
         }
         best
@@ -89,8 +147,7 @@ pub fn brute_nw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
             t,
             mat,
             al,
-            go,
-            ge,
+            gaps,
         },
         0,
         0,
@@ -100,13 +157,18 @@ pub fn brute_nw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
 
 /// Local (SW): best global score over every substring pair, floored at 0.
 pub fn brute_sw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    brute_sw_asym(q, t, mat, al, Gaps::symmetric(go, ge))
+}
+
+/// [`brute_sw`] with the two gap directions charged independently.
+pub fn brute_sw_asym(q: &[u8], t: &[u8], mat: &[i32], al: usize, gaps: Gaps) -> i32 {
     let (m, n) = (q.len(), t.len());
     let mut best = 0;
     for a in 0..=m {
         for b in a..=m {
             for c in 0..=n {
                 for d in c..=n {
-                    best = best.max(brute_nw(&q[a..b], &t[c..d], mat, al, go, ge));
+                    best = best.max(brute_nw_asym(&q[a..b], &t[c..d], mat, al, gaps));
                 }
             }
         }
@@ -116,11 +178,16 @@ pub fn brute_sw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
 
 /// Semi-global (HW): query fully aligned to the best target window.
 pub fn brute_hw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    brute_hw_asym(q, t, mat, al, Gaps::symmetric(go, ge))
+}
+
+/// [`brute_hw`] with the two gap directions charged independently.
+pub fn brute_hw_asym(q: &[u8], t: &[u8], mat: &[i32], al: usize, gaps: Gaps) -> i32 {
     let n = t.len();
     let mut best = i32::MIN;
     for c in 0..=n {
         for d in c..=n {
-            best = best.max(brute_nw(q, &t[c..d], mat, al, go, ge));
+            best = best.max(brute_nw_asym(q, &t[c..d], mat, al, gaps));
         }
     }
     best
@@ -129,11 +196,16 @@ pub fn brute_hw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
 /// Semi-global transpose (SHW): the whole **target** is aligned to the best **query** window (the
 /// mirror image of [`brute_hw`], which windows the target).
 pub fn brute_shw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    brute_shw_asym(q, t, mat, al, Gaps::symmetric(go, ge))
+}
+
+/// [`brute_shw`] with the two gap directions charged independently.
+pub fn brute_shw_asym(q: &[u8], t: &[u8], mat: &[i32], al: usize, gaps: Gaps) -> i32 {
     let m = q.len();
     let mut best = i32::MIN;
     for a in 0..=m {
         for b in a..=m {
-            best = best.max(brute_nw(&q[a..b], t, mat, al, go, ge));
+            best = best.max(brute_nw_asym(&q[a..b], t, mat, al, gaps));
         }
     }
     best
@@ -142,6 +214,11 @@ pub fn brute_shw(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -
 /// Overlap (OV): best global score over substring pairs whose alignment touches a border at both
 /// ends, floored at 0.
 pub fn brute_ov(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    brute_ov_asym(q, t, mat, al, Gaps::symmetric(go, ge))
+}
+
+/// [`brute_ov`] with the two gap directions charged independently.
+pub fn brute_ov_asym(q: &[u8], t: &[u8], mat: &[i32], al: usize, gaps: Gaps) -> i32 {
     let (m, n) = (q.len(), t.len());
     let mut best = 0;
     for a in 0..=m {
@@ -149,7 +226,7 @@ pub fn brute_ov(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
             for c in 0..=n {
                 for d in c..=n {
                     if (a == 0 || c == 0) && (b == m || d == n) {
-                        best = best.max(brute_nw(&q[a..b], &t[c..d], mat, al, go, ge));
+                        best = best.max(brute_nw_asym(&q[a..b], &t[c..d], mat, al, gaps));
                     }
                 }
             }
@@ -160,12 +237,17 @@ pub fn brute_ov(q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) ->
 
 /// Brute-force score for any mode.
 pub fn brute(mode: Mode, q: &[u8], t: &[u8], mat: &[i32], al: usize, go: i32, ge: i32) -> i32 {
+    brute_asym(mode, q, t, mat, al, Gaps::symmetric(go, ge))
+}
+
+/// [`brute`] with the two gap directions charged independently.
+pub fn brute_asym(mode: Mode, q: &[u8], t: &[u8], mat: &[i32], al: usize, gaps: Gaps) -> i32 {
     match mode {
-        Mode::Nw => brute_nw(q, t, mat, al, go, ge),
-        Mode::Sw => brute_sw(q, t, mat, al, go, ge),
-        Mode::Hw => brute_hw(q, t, mat, al, go, ge),
-        Mode::Ov => brute_ov(q, t, mat, al, go, ge),
-        Mode::Shw => brute_shw(q, t, mat, al, go, ge),
+        Mode::Nw => brute_nw_asym(q, t, mat, al, gaps),
+        Mode::Sw => brute_sw_asym(q, t, mat, al, gaps),
+        Mode::Hw => brute_hw_asym(q, t, mat, al, gaps),
+        Mode::Ov => brute_ov_asym(q, t, mat, al, gaps),
+        Mode::Shw => brute_shw_asym(q, t, mat, al, gaps),
         _ => unreachable!("ALL_MODES covers every mode"),
     }
 }

@@ -14,6 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::mode::Mode;
+use crate::scoring::Gaps;
 
 /// The signed integer width a kernel runs in. The most-negative value is reserved as a
 /// saturation sentinel and is not a usable score.
@@ -91,12 +92,15 @@ impl core::fmt::Display for ScoreWidth {
 ///   bound a full worst-case mismatch run `(m + n) * max(0, -min_entry)` *and* a full-span gap
 ///   `gap_open + (m + n - 1) * gap_ext`. This over-counts (a path cannot be all substitutions and
 ///   all gaps at once), so it is a safe over-estimate.
+///
+/// Under an asymmetric scheme the two directions can be charged differently; each bound above
+/// takes the **larger** open and the larger extend across both, which is exact when the scheme
+/// is symmetric and a safe over-estimate otherwise (no gap is charged more than that per base).
 fn magnitude_bound(
     mode: Mode,
     min_entry: i32,
     max_entry: i32,
-    gap_open: i32,
-    gap_ext: i32,
+    gaps: Gaps,
     max_query_len: usize,
     max_target_len: usize,
 ) -> i128 {
@@ -105,6 +109,7 @@ fn magnitude_bound(
     let min_ij = m.min(n);
     let max_pos = (max_entry as i128).max(0); // max(0, max_entry)
     let max_neg = (-(min_entry as i128)).max(0); // max(0, -min_entry) = |min_entry| when negative
+    let (gap_open, gap_ext) = gaps.worst();
     let go = gap_open as i128;
     let ge = gap_ext as i128;
 
@@ -126,15 +131,14 @@ fn magnitude_bound(
 /// Prove the narrowest [`ScoreWidth`] that cannot overflow for these inputs, or return
 /// [`Error::ScoreRangeTooWide`] if even `i32` is insufficient.
 ///
-/// `min_entry` / `max_entry` are the extreme substitution-matrix entries; `gap_open` /
-/// `gap_ext` are non-negative penalty magnitudes; the lengths are the maxima over all sequences
-/// the width must cover.
+/// `min_entry` / `max_entry` are the extreme substitution-matrix entries; `gaps` holds the
+/// non-negative penalty magnitudes for both gap directions; the lengths are the maxima over all
+/// sequences the width must cover.
 pub fn required_width(
     mode: Mode,
     min_entry: i32,
     max_entry: i32,
-    gap_open: i32,
-    gap_ext: i32,
+    gaps: Gaps,
     max_query_len: usize,
     max_target_len: usize,
 ) -> Result<ScoreWidth> {
@@ -142,8 +146,7 @@ pub fn required_width(
         mode,
         min_entry,
         max_entry,
-        gap_open,
-        gap_ext,
+        gaps,
         max_query_len,
         max_target_len,
     );
@@ -160,6 +163,71 @@ mod tests {
     use super::*;
 
     const ALL_MODES: [Mode; 5] = [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw];
+
+    /// Symmetric-scheme shims with the pre-asymmetric signature. These shadow the glob-imported
+    /// items of the same name, so the bound tests below read as they did when there was one
+    /// penalty pair; the asymmetric cases are covered separately.
+    fn required_width(
+        mode: Mode,
+        min_entry: i32,
+        max_entry: i32,
+        gap_open: i32,
+        gap_ext: i32,
+        max_query_len: usize,
+        max_target_len: usize,
+    ) -> Result<ScoreWidth> {
+        super::required_width(
+            mode,
+            min_entry,
+            max_entry,
+            Gaps::symmetric(gap_open, gap_ext),
+            max_query_len,
+            max_target_len,
+        )
+    }
+
+    fn magnitude_bound(
+        mode: Mode,
+        min_entry: i32,
+        max_entry: i32,
+        gap_open: i32,
+        gap_ext: i32,
+        max_query_len: usize,
+        max_target_len: usize,
+    ) -> i128 {
+        super::magnitude_bound(
+            mode,
+            min_entry,
+            max_entry,
+            Gaps::symmetric(gap_open, gap_ext),
+            max_query_len,
+            max_target_len,
+        )
+    }
+
+    #[test]
+    fn asymmetric_gaps_bound_by_the_worse_direction() {
+        // The proof takes max(open) and max(ext) over both directions, so an asymmetric scheme
+        // picks exactly the width its worse half would.
+        for (q, t) in [((200, 1), (2, 1)), ((2, 1), (200, 1))] {
+            let asym = Gaps {
+                query_open: q.0,
+                query_ext: q.1,
+                target_open: t.0,
+                target_ext: t.1,
+            };
+            assert_eq!(
+                super::required_width(Mode::Sw, -1, 1, asym, 30, 30).unwrap(),
+                required_width(Mode::Sw, -1, 1, 200, 1, 30, 30).unwrap(),
+                "SW must widen for the larger gap_open, whichever direction carries it"
+            );
+        }
+        // And a scheme whose halves agree is indistinguishable from the symmetric one.
+        assert_eq!(
+            super::magnitude_bound(Mode::Nw, -2, 1, Gaps::symmetric(5, 3), 91, 33),
+            magnitude_bound(Mode::Nw, -2, 1, 5, 3, 91, 33)
+        );
+    }
 
     #[test]
     fn width_constants_are_sane() {

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc af0aa45990d0020231a2743e7f1f0c3e7056a7d5261eaba1db2f07aa931dd208 # shrinks to (al, mat, gaps, q, t) = (4, [0, 0, 0, 0, 0, 0, 0, 0, 0, -3, -2, 3, -3, 5, 5, -2], Gaps { query_open: 4, query_ext: 0, target_open: 5, target_ext: 2 }, [2, 1, 1, 2], [2, 1, 3, 0, 1])
+cc 0e42f6e9dc3eebc4c8511b0b24a0d694a84cfccd867a963e31a78f3c2549a736 # shrinks to (al, mat, gaps, q, t) = (4, [0, 0, 0, 0, 0, 0, 0, 0, 2, -5, 3, 1, -5, 0, -3, -5], Gaps { query_open: 2, query_ext: 1, target_open: 1, target_ext: 0 }, [0], [0, 0])
+cc e8898e53e0b778ce6aa98fd5c5189c4b2ecff3efa128e7d478b7dc21d6d5a00d # shrinks to (al, mat, gaps, q, t) = (4, [0, 0, 0, -3, -2, 0, 2, 6, 1, 4, -6, -4, -5, 5, -6, -1], Gaps { query_open: 0, query_ext: 0, target_open: 5, target_ext: 4 }, [2, 0, 1], [0, 2])
+cc 27ecf1c30c1440e8fd97025e24d46510a8ae8716c58dbd96c094edd936be7621 # shrinks to (al, mat, gaps, q, t) = (3, [0, 0, 0, 0, 0, 0, 0, 0, 0], Gaps { query_open: 0, query_ext: 0, target_open: 6, target_ext: 2 }, [0, 0], [0])

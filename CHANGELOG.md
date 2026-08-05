@@ -8,6 +8,29 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- **Asymmetric gap penalties.** `Scoring::new_asymmetric(alphabet_len, matrix, query_gap_open,
+  query_gap_ext, target_gap_open, target_gap_ext)` charges the two gap directions independently:
+  a gap in the query (the `E` matrix; consumes target only, a *deletion* when the query is a
+  read) and a gap in the target (`F`; consumes query only, an *insertion*). This is bwa's
+  `-O o_del,o_ins -E e_del,e_ins`; under Opal's convention the translation is
+  `new_asymmetric(al, matrix, o_del + e_del, e_del, o_ins + e_ins, e_ins)`, i.e. `(7, 1, 9, 2)`
+  for bwa's defaults. Accessors `query_gap_open()`, `query_gap_ext()`, `target_gap_open()`,
+  `target_gap_ext()`, and `has_symmetric_gaps()` report the scheme.
+
+  Every kernel supports it at full speed: the scalar DP, the striped (Farrar) `align_pair` path,
+  and the inter-sequence database kernels at `i8`/`i16`/`i32` on every backend, plus traceback
+  (`align`, `Database::scan_aligned`) and the per-position maxima. There is no asymmetric slow
+  path; the four penalties are threaded through in place of the single pair, costing two extra
+  splatted vectors in the SIMD inner loops. `Scoring::new` is unchanged, and a scheme whose two
+  directions agree is bit-identical to it. The width proof takes the worse of the two directions,
+  which is exact for a symmetric scheme and a safe over-estimate otherwise (`DETERMINISM.md` §2).
+
+  Tested by an independent brute-force path-enumeration oracle that charges the two directions
+  from separate counters, a transposition invariant (swapping query/target, the matrix, and the
+  two penalty pairs must preserve the score, the property a direction mix-up breaks and a
+  symmetric test cannot see), traceback re-scoring per gap direction, and cross-backend agreement
+  over forced backends and layouts (`tests/asymmetric_gaps.rs`).
+
 - Per-sequence score-width escalation for database scans: a `Score`/`ScoreEnd` `Database` now proves
   each target's integer width from *its own* length and partitions the sequences into width groups,
   so a mixed-length database runs its short sequences at a narrow width (more SIMD lanes) instead of
@@ -47,6 +70,12 @@ All notable changes to `hyalite` are documented here. The format follows
   saturating 32-bit add/sub and the width proof already bounds every cell — so it is bit-identical to
   the scalar oracle at every mode and lane count. Measured over scalar for a 2000×2000 `i32` `SW`
   pair: ~4.5×. (`ScoreEnd` / `Alignment` still use the scalar path.)
+
+### Deprecated
+
+- `Scoring::gap_open()` / `Scoring::gap_ext()`: ambiguous once the two gap directions can differ.
+  They keep compiling and return the **query-gap** penalties; use `query_gap_open()` /
+  `query_gap_ext()` / `target_gap_open()` / `target_gap_ext()` to say which direction is meant.
 
 ## [0.2.0] - 2026-08-04
 

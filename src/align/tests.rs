@@ -50,6 +50,8 @@ fn rescore(a: &Alignment, q: &[u8], t: &[u8], s: &Scoring) -> i32 {
                 tj += 1;
                 k += 1;
             }
+            // An `Ins` consumes query only: a gap in the *target*. A `Del` consumes target only:
+            // a gap in the *query*. Each run is charged in its own direction.
             AlignOp::Ins => {
                 let mut len = 0;
                 while k < a.ops.len() && matches!(a.ops[k], AlignOp::Ins) {
@@ -57,7 +59,7 @@ fn rescore(a: &Alignment, q: &[u8], t: &[u8], s: &Scoring) -> i32 {
                     qi += 1;
                     k += 1;
                 }
-                total -= gap_penalty(s.gap_open(), s.gap_ext(), len);
+                total -= gap_penalty(s.target_gap_open(), s.target_gap_ext(), len);
             }
             AlignOp::Del => {
                 let mut len = 0;
@@ -66,7 +68,7 @@ fn rescore(a: &Alignment, q: &[u8], t: &[u8], s: &Scoring) -> i32 {
                     tj += 1;
                     k += 1;
                 }
-                total -= gap_penalty(s.gap_open(), s.gap_ext(), len);
+                total -= gap_penalty(s.query_gap_open(), s.query_gap_ext(), len);
             }
         }
     }
@@ -275,7 +277,10 @@ fn empty_query_against_target() {
     // NW: the whole target is a penalised deletion run.
     let nw = align(&[], &t, &s, Mode::Nw, usize::MAX).unwrap();
     assert_eq!(nw.ops, vec![AlignOp::Del; 3]);
-    assert_eq!(nw.score, -gap_penalty(s.gap_open(), s.gap_ext(), 3));
+    assert_eq!(
+        nw.score,
+        -gap_penalty(s.query_gap_open(), s.query_gap_ext(), 3)
+    );
     assert_eq!(nw.cigar(), "3D");
     // SW/HW/OV: nothing needs to align, so the empty alignment scores 0.
     for mode in [Mode::Sw, Mode::Hw, Mode::Ov] {
