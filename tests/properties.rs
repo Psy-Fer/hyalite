@@ -224,6 +224,17 @@ fn scheme_db_query_verywide() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Ve
     })
 }
 
+/// Moderately wide entries and a spread of **sequence lengths** (1..=40) so a database's sequences
+/// often span more than one proven width — exercising per-sequence width escalation (the SIMD
+/// backend partitions into width groups; the scalar reference does not).
+fn scheme_mixed_length_db() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<u8>)> {
+    scheme(4, -40..=70).prop_flat_map(|s| {
+        let al = s.al;
+        let db = prop::collection::vec(seq(al, 40), 2..=8);
+        (Just(s), db, seq(al, 20))
+    })
+}
+
 proptest! {
     /// `Database::scan` equals the best `align_pair` over the database with the smallest-index
     /// tie-break, for random databases, queries, modes, and search types.
@@ -609,6 +620,58 @@ proptest! {
                     db.scan_scores(&mut scratch, &q, &mut scores);
                     let want_scores: Vec<i32> = out.iter().map(|h| h.score).collect();
                     prop_assert_eq!(&scores, &want_scores, "i32 scan_scores {} {} {}", b, mode, st);
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// Per-sequence width escalation: on a database whose sequences span multiple proven widths, a
+    /// SIMD backend partitions into width groups while forced-scalar does not — and the two must
+    /// agree exactly, for `scan`, `scan_all`, and `scan_scores`, in every mode and search type. This
+    /// is the cross-backend guard for the grouped scatter/argmax paths (the exact-width and grouping
+    /// non-vacuity are pinned by the unit tests in `database.rs`).
+    #[test]
+    fn escalated_scan_matches_scalar((s, db_seqs, q) in scheme_mixed_length_db()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
+            return Ok(());
+        }
+        let scoring = s.scoring();
+        for mode in ALL_MODES {
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let build = |b: Backend| {
+                    Database::builder()
+                        .sequences(&db_seqs)
+                        .scoring(scoring.clone())
+                        .mode(mode)
+                        .search_type(st)
+                        .max_query_len(40)
+                        .backend(BackendChoice::Force(b))
+                        .build()
+                        .unwrap()
+                };
+                let oracle = build(Backend::Scalar);
+                let mut os = Scratch::new(&oracle);
+                let want = oracle.scan(&mut os, &q);
+                let (mut wa, mut ws) = (Vec::new(), Vec::new());
+                oracle.scan_all(&mut os, &q, &mut wa);
+                oracle.scan_scores(&mut os, &q, &mut ws);
+                for &b in &simd {
+                    let db = build(b);
+                    let mut gs = Scratch::new(&db);
+                    prop_assert_eq!(db.scan(&mut gs, &q), want, "{} scan {} {}", b, mode, st);
+                    let (mut ga, mut gsc) = (Vec::new(), Vec::new());
+                    db.scan_all(&mut gs, &q, &mut ga);
+                    db.scan_scores(&mut gs, &q, &mut gsc);
+                    prop_assert_eq!(&ga, &wa, "{} scan_all {} {}", b, mode, st);
+                    prop_assert_eq!(&gsc, &ws, "{} scan_scores {} {}", b, mode, st);
                 }
             }
         }

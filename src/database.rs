@@ -34,7 +34,7 @@ use crate::align::{AlignedHit, Alignment};
 use crate::backend::{self, Backend, BackendChoice};
 use crate::error::{Error, Result};
 use crate::hit::BestHit;
-use crate::inter::{self, Layout, LayoutChoice, Packed, SimdScratch};
+use crate::inter::{self, Layout, LayoutChoice, Packed, PackedGroup, PackedGroups, SimdScratch};
 use crate::kernel::{DpBuffers, align_core};
 use crate::mode::Mode;
 use crate::scoring::Scoring;
@@ -53,8 +53,13 @@ pub struct Database {
     max_target_len: usize,
     width: ScoreWidth,
     backend: Backend,
-    /// The database packed for the inter-sequence kernel; `Some` only for a SIMD backend.
+    /// The database packed at one uniform width for the inter-sequence kernel; `Some` only for a
+    /// SIMD backend that is *not* using per-sequence width escalation (see `groups`).
     packed: Option<Packed>,
+    /// Per-sequence-width-escalated packing: `Some` when a SIMD `Score`/`ScoreEnd` database has
+    /// sequences spanning more than one proven width, so short sequences run at a narrow width.
+    /// Mutually exclusive with `packed`.
+    groups: Option<PackedGroups>,
 }
 
 impl Database {
@@ -82,6 +87,12 @@ impl Database {
             query.len(),
             self.max_query_len
         );
+
+        // Per-sequence-width-escalated database: run each width group and take the scalar argmax
+        // over the global database index (smallest index on a tie).
+        if let Some(groups) = &self.groups {
+            return self.scan_grouped(groups, scratch, query);
+        }
 
         // SIMD backends run the inter-sequence kernel over the prebuilt packing, reusing the
         // scratch buffers. The resolver only selects a SIMD backend for an eligible database, so
@@ -132,6 +143,191 @@ impl Database {
         }
     }
 
+    /// The per-target score of group-local sequence `local`, read from the width-matched buffer that
+    /// [`inter::fill_scores`]/[`inter::fill_ends`] just filled for `group`.
+    #[inline]
+    fn group_score(&self, group: &PackedGroup, simd: &SimdScratch, local: usize) -> i32 {
+        match group.packed.width() {
+            ScoreWidth::I8 => simd.scores()[local] as i32,
+            ScoreWidth::I16 => simd.scores16()[local] as i32,
+            ScoreWidth::I32 => simd.scores32()[local],
+        }
+    }
+
+    /// Single-best scan over a per-sequence-width-escalated database. Runs each width group's
+    /// per-target kernel, then a **scalar** argmax over the global `db_index` (smallest index on a
+    /// tie) — never a lane-order-dependent reduction, matching every other path.
+    fn scan_grouped(&self, groups: &PackedGroups, scratch: &mut Scratch, query: &[u8]) -> BestHit {
+        let mut best_score = i32::MIN;
+        let mut best_index = 0usize;
+        for group in &groups.groups {
+            inter::fill_scores(
+                self.backend,
+                &group.packed,
+                self.mode,
+                self.scoring.gap_open(),
+                self.scoring.gap_ext(),
+                query,
+                &mut scratch.simd,
+            );
+            for (local, &global) in group.indices.iter().enumerate() {
+                let s = self.group_score(group, &scratch.simd, local);
+                // Strictly-greater score, or equal score with a smaller global index, wins.
+                if s > best_score || (s == best_score && global < best_index) {
+                    best_score = s;
+                    best_index = global;
+                }
+            }
+        }
+
+        let (query_end, target_end) = if self.search_type.tracks_end() {
+            // Recover the winner's ends with one scalar alignment (bit-identical to the oracle),
+            // exactly as the uniform single-best path does.
+            let (score, qe, te) = align_core(
+                query,
+                &self.sequences[best_index],
+                &self.scoring,
+                self.mode,
+                &mut scratch.buf,
+            );
+            debug_assert_eq!(
+                score, best_score,
+                "grouped scan disagrees with re-alignment"
+            );
+            (qe, te)
+        } else {
+            (None, None)
+        };
+
+        BestHit {
+            score: best_score,
+            db_index: best_index,
+            query_end,
+            target_end,
+        }
+    }
+
+    /// `scan_all` over a per-sequence-width-escalated database: run each width group's per-target
+    /// kernel and **scatter** its results into `out` by global `db_index`. Every sequence belongs to
+    /// exactly one group, so every `out[i]` is written exactly once.
+    fn scan_all_grouped(
+        &self,
+        groups: &PackedGroups,
+        scratch: &mut Scratch,
+        query: &[u8],
+        out: &mut Vec<BestHit>,
+    ) {
+        let placeholder = BestHit {
+            score: i32::MIN,
+            db_index: 0,
+            query_end: None,
+            target_end: None,
+        };
+        out.clear();
+        out.resize(self.sequences.len(), placeholder);
+
+        let (go, ge) = (self.scoring.gap_open(), self.scoring.gap_ext());
+        let tracks_end = self.search_type.tracks_end();
+        let ends_fit_i16 =
+            self.max_query_len <= i16::MAX as usize && self.max_target_len <= i16::MAX as usize;
+
+        for group in &groups.groups {
+            let n = group.indices.len();
+            let simd_ends = tracks_end
+                && inter::backend_tracks_ends(self.backend)
+                && ends_fit_i16
+                && inter::fill_ends_available(&group.packed);
+            if simd_ends {
+                inter::fill_ends(
+                    self.backend,
+                    &group.packed,
+                    self.mode,
+                    go,
+                    ge,
+                    query,
+                    &mut scratch.simd,
+                );
+                for local in 0..n {
+                    let global = group.indices[local];
+                    let score = self.group_score(group, &scratch.simd, local);
+                    let (cols, rows) = scratch.simd.ends();
+                    out[global] = BestHit {
+                        score,
+                        db_index: global,
+                        query_end: (rows[local] as usize).checked_sub(1),
+                        target_end: (cols[local] as usize).checked_sub(1),
+                    };
+                }
+            } else if tracks_end {
+                // No in-vector ends for this group (e.g. positions exceed the `i16` domain): recover
+                // ends with the scalar DP per sequence.
+                for &global in &group.indices {
+                    let (score, qe, te) = align_core(
+                        query,
+                        &self.sequences[global],
+                        &self.scoring,
+                        self.mode,
+                        &mut scratch.buf,
+                    );
+                    out[global] = BestHit {
+                        score,
+                        db_index: global,
+                        query_end: qe,
+                        target_end: te,
+                    };
+                }
+            } else {
+                inter::fill_scores(
+                    self.backend,
+                    &group.packed,
+                    self.mode,
+                    go,
+                    ge,
+                    query,
+                    &mut scratch.simd,
+                );
+                for local in 0..n {
+                    let global = group.indices[local];
+                    let score = self.group_score(group, &scratch.simd, local);
+                    out[global] = BestHit {
+                        score,
+                        db_index: global,
+                        query_end: None,
+                        target_end: None,
+                    };
+                }
+            }
+        }
+    }
+
+    /// `scan_scores` over a per-sequence-width-escalated database: run each group's score kernel and
+    /// scatter the per-sequence scores into `out` by global `db_index`.
+    fn scan_scores_grouped(
+        &self,
+        groups: &PackedGroups,
+        scratch: &mut Scratch,
+        query: &[u8],
+        out: &mut Vec<i32>,
+    ) {
+        out.clear();
+        out.resize(self.sequences.len(), 0);
+        let (go, ge) = (self.scoring.gap_open(), self.scoring.gap_ext());
+        for group in &groups.groups {
+            inter::fill_scores(
+                self.backend,
+                &group.packed,
+                self.mode,
+                go,
+                ge,
+                query,
+                &mut scratch.simd,
+            );
+            for (local, &global) in group.indices.iter().enumerate() {
+                out[global] = self.group_score(group, &scratch.simd, local);
+            }
+        }
+    }
+
     /// Scan `query` against every sequence and write **one [`BestHit`] per database sequence**
     /// into `out`, in database order (`out[i].db_index == i`). `out` is cleared first and reused,
     /// so repeated calls allocate nothing once it has grown.
@@ -158,6 +354,13 @@ impl Database {
 
         out.clear();
         out.reserve(self.sequences.len());
+
+        // Per-sequence-width-escalated database: run each width group and scatter its results into
+        // `out` by global `db_index`.
+        if let Some(groups) = &self.groups {
+            self.scan_all_grouped(groups, scratch, query, out);
+            return;
+        }
 
         // `ScoreEnd` needs per-target end positions. SIMD backends track them in-vector; otherwise
         // (scalar backend, or positions that would not fit the `i16` position domain) we recover
@@ -286,7 +489,9 @@ impl Database {
         out.clear();
         out.reserve(self.sequences.len());
 
-        if let Some(packed) = &self.packed {
+        if let Some(groups) = &self.groups {
+            self.scan_scores_grouped(groups, scratch, query, out);
+        } else if let Some(packed) = &self.packed {
             inter::fill_scores(
                 self.backend,
                 packed,
@@ -398,8 +603,13 @@ impl Database {
         &self.scoring
     }
 
-    /// The integer width proven sufficient for scores in this database. Informational in M0
-    /// (the scalar kernel computes in `i32`); it selects the lane width for SIMD backends later.
+    /// The integer width proven sufficient for scores in this database — the **widest** width used.
+    ///
+    /// A SIMD `Score`/`ScoreEnd` database whose sequences span more than one proven width runs each
+    /// sequence at its *own* narrower width (per-sequence escalation; see `DETERMINISM.md` §4), but
+    /// this reports the widest of them (the width the longest sequence needs). Results are identical
+    /// regardless — every sufficient width yields the same score (§6), so escalation is a performance
+    /// choice only.
     #[must_use]
     pub fn score_width(&self) -> ScoreWidth {
         self.width
@@ -413,9 +623,16 @@ impl Database {
     }
 
     /// The kernel data layout, or `None` for the scalar backend (which does not pack the database).
+    /// For a per-sequence-width-escalated database this reports the layout of its widest-width group
+    /// (all groups share the same layout choice).
     #[must_use]
     pub fn layout(&self) -> Option<Layout> {
-        self.packed.as_ref().map(Packed::layout)
+        self.packed.as_ref().map(Packed::layout).or_else(|| {
+            self.groups
+                .as_ref()
+                .and_then(|g| g.groups.last())
+                .map(|g| g.packed.layout())
+        })
     }
 
     /// The maximum query length this database was built for.
@@ -578,11 +795,37 @@ impl DatabaseBuilder {
         // inter-sequence kernel supports, at a layout that fits). If one was auto-selected but the
         // database is ineligible, fall back to scalar; if it was explicitly forced, that is an error.
         let layout_choice = self.layout_choice.unwrap_or_default();
-        let plan = resolved.simd_lanes(width).and_then(|lanes| {
+        let uniform_plan = resolved.simd_lanes(width).and_then(|lanes| {
             inter::simd_plan(width, alphabet_len, &sequences, lanes, layout_choice)
                 .map(|layout| (lanes, layout))
         });
-        let backend = if resolved == Backend::Scalar || plan.is_some() {
+
+        // Per-sequence width escalation (`Score`/`ScoreEnd`): partition the sequences by their *own*
+        // proven width so a mixed-length database runs its short sequences at a narrow width (more
+        // lanes) instead of the whole database at the single widest width. This is an *alternative*
+        // eligibility path: a mixed database whose one uniform widest-width packing is too big for the
+        // SIMD layout can still be SIMD-eligible when each narrower group's packing fits. `Some` only
+        // for a resolved SIMD backend with sequences spanning >1 width, all groups eligible.
+        // `Alignment` keeps the uniform path (its traceback budget is proven once for the whole box).
+        let groups = if resolved != Backend::Scalar
+            && matches!(search_type, SearchType::Score | SearchType::ScoreEnd)
+        {
+            build_width_groups(
+                &sequences,
+                &scoring,
+                mode,
+                max_query_len,
+                alphabet_len,
+                resolved,
+                layout_choice,
+            )
+        } else {
+            None
+        };
+
+        // A SIMD backend is usable if the uniform packing *or* the grouped packing is eligible. If
+        // one was auto-selected but neither fits, fall back to scalar; if it was forced, that errors.
+        let backend = if resolved == Backend::Scalar || uniform_plan.is_some() || groups.is_some() {
             resolved
         } else {
             match choice {
@@ -592,12 +835,18 @@ impl DatabaseBuilder {
                 BackendChoice::Auto => Backend::Scalar,
             }
         };
-
-        // Pack the database once (query-independent) at the proven width, in the planned layout.
-        let packed = if backend == Backend::Scalar {
+        // Grouping needs a SIMD backend; drop it if we fell back to scalar.
+        let groups = if backend == Backend::Scalar {
             None
         } else {
-            let (lanes, layout) = plan.expect("a SIMD backend implies a SIMD plan");
+            groups
+        };
+
+        // Otherwise pack the database once (query-independent) at the single proven width.
+        let packed = if backend == Backend::Scalar || groups.is_some() {
+            None
+        } else {
+            let (lanes, layout) = uniform_plan.expect("a SIMD backend implies a SIMD plan");
             Some(match width {
                 ScoreWidth::I8 => Packed::I8(inter::PackedDb::<i8>::build(
                     &sequences, lanes, layout, &scoring,
@@ -621,8 +870,79 @@ impl DatabaseBuilder {
             width,
             backend,
             packed,
+            groups,
         })
     }
+}
+
+/// Try to build a per-sequence-width-escalated packing (see [`PackedGroups`]). Returns `Some` only
+/// when the sequences span more than one proven width **and** every resulting group is
+/// SIMD-eligible; otherwise `None`, and the caller uses the uniform-width packing. `backend` must be
+/// a SIMD backend.
+fn build_width_groups(
+    sequences: &[Vec<u8>],
+    scoring: &Scoring,
+    mode: Mode,
+    max_query_len: usize,
+    alphabet_len: usize,
+    backend: Backend,
+    layout_choice: LayoutChoice,
+) -> Option<PackedGroups> {
+    // Each sequence's OWN proven width. `required_width` is monotone in target length, so a
+    // per-sequence width can never exceed the whole-database proof (at `max_target_len`) that already
+    // succeeded — hence this is infallible.
+    let widths: Vec<ScoreWidth> = sequences
+        .iter()
+        .map(|s| {
+            scoring
+                .required_width(mode, max_query_len, s.len())
+                .expect("per-sequence width proof cannot exceed the whole-database proof")
+        })
+        .collect();
+
+    // Only escalate when the sequences genuinely span more than one width.
+    let mut present = widths.clone();
+    present.sort();
+    present.dedup();
+    if present.len() < 2 {
+        return None;
+    }
+
+    let mut groups = Vec::with_capacity(present.len());
+    for w in [ScoreWidth::I8, ScoreWidth::I16, ScoreWidth::I32] {
+        let indices: Vec<usize> = (0..sequences.len()).filter(|&i| widths[i] == w).collect();
+        if indices.is_empty() {
+            continue;
+        }
+        // Group-local order preserves original database order, so `indices` is ascending.
+        let group_seqs: Vec<Vec<u8>> = indices.iter().map(|&i| sequences[i].clone()).collect();
+        let lanes = backend.simd_lanes(w)?;
+        // If any group is SIMD-ineligible (e.g. `i8` with `alphabet_len > 16`), abandon escalation
+        // and let the caller use the uniform packing — never a silent correctness change.
+        let layout = inter::simd_plan(w, alphabet_len, &group_seqs, lanes, layout_choice)?;
+        let packed = match w {
+            ScoreWidth::I8 => Packed::I8(inter::PackedDb::<i8>::build(
+                &group_seqs,
+                lanes,
+                layout,
+                scoring,
+            )),
+            ScoreWidth::I16 => Packed::I16(inter::PackedDb::<i16>::build(
+                &group_seqs,
+                lanes,
+                layout,
+                scoring,
+            )),
+            ScoreWidth::I32 => Packed::I32(inter::PackedDb::<i32>::build(
+                &group_seqs,
+                lanes,
+                layout,
+                scoring,
+            )),
+        };
+        groups.push(PackedGroup { packed, indices });
+    }
+    Some(PackedGroups { groups })
 }
 
 /// Per-thread mutable working memory for [`Database::scan`]. Create one per worker thread and
@@ -641,14 +961,33 @@ impl Scratch {
     /// Allocate scratch pre-sized for `db`, so no scan reallocates.
     #[must_use]
     pub fn new(db: &Database) -> Self {
-        let simd = match db.backend().simd_lanes(db.score_width()) {
-            Some(lanes) => SimdScratch::new(
+        let simd = if let Some(groups) = &db.groups {
+            // Escalated: size working buffers for every width present across the groups.
+            let lanes_for = |w: ScoreWidth| {
+                groups
+                    .groups
+                    .iter()
+                    .any(|g| g.packed.width() == w)
+                    .then(|| db.backend.simd_lanes(w))
+                    .flatten()
+            };
+            SimdScratch::new_grouped(
                 db.sequence_count(),
                 db.max_target_len(),
-                lanes,
-                db.score_width(),
-            ),
-            None => SimdScratch::empty(),
+                lanes_for(ScoreWidth::I8),
+                lanes_for(ScoreWidth::I16),
+                lanes_for(ScoreWidth::I32),
+            )
+        } else {
+            match db.backend().simd_lanes(db.score_width()) {
+                Some(lanes) => SimdScratch::new(
+                    db.sequence_count(),
+                    db.max_target_len(),
+                    lanes,
+                    db.score_width(),
+                ),
+                None => SimdScratch::empty(),
+            }
         };
         Scratch {
             buf: DpBuffers::with_capacity(db.max_query_len(), db.max_target_len()),
@@ -1011,6 +1350,140 @@ mod tests {
                     None => first_repeat = Some(hit),
                     Some(prev) => {
                         assert_eq!(prev, hit, "same query gave different result on reuse")
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Per-sequence width escalation --------------------------------------
+
+    /// A `+20` match makes SW prove `i8` for a ~4 nt target (80), `i16` for ~10 nt (200), and `i32`
+    /// for ~2000 nt (40000) — so a database mixing those lengths spans three widths.
+    fn wide_dna_scoring() -> Scoring {
+        let mut mat = vec![-5i32; 16];
+        for i in 0..4 {
+            mat[i * 4 + i] = 20;
+        }
+        Scoring::new(4, mat, 8, 2).unwrap()
+    }
+
+    /// Two `i8`, two `i16`, one `i32` sequence (by SW width proof at these lengths).
+    fn mixed_width_seqs() -> Vec<Vec<u8>> {
+        let s = |len: usize| -> Vec<u8> { (0..len).map(|i| (i % 4) as u8).collect() };
+        vec![s(4), s(6), s(10), s(24), s(2000)]
+    }
+
+    fn available_simd() -> Vec<Backend> {
+        [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect()
+    }
+
+    #[test]
+    fn escalation_partitions_a_mixed_width_database() {
+        let scoring = wide_dna_scoring();
+        let seqs = mixed_width_seqs();
+        // Sanity: the sequences really do span i8/i16/i32 under SW.
+        let widths: Vec<ScoreWidth> = seqs
+            .iter()
+            .map(|s| scoring.required_width(Mode::Sw, 2000, s.len()).unwrap())
+            .collect();
+        assert_eq!(
+            widths,
+            vec![
+                ScoreWidth::I8,
+                ScoreWidth::I8,
+                ScoreWidth::I16,
+                ScoreWidth::I16,
+                ScoreWidth::I32
+            ]
+        );
+
+        for b in available_simd() {
+            let db = Database::builder()
+                .sequences(&seqs)
+                .scoring(scoring.clone())
+                .mode(Mode::Sw)
+                .search_type(SearchType::Score)
+                .max_query_len(2000)
+                .backend(BackendChoice::Force(b))
+                .build()
+                .unwrap();
+            let groups = db
+                .groups
+                .as_ref()
+                .expect("a mixed-width SIMD database must escalate");
+            assert!(
+                db.packed.is_none(),
+                "grouped and uniform are mutually exclusive"
+            );
+            assert_eq!(groups.groups.len(), 3, "one group per distinct width");
+            // Groups are ascending width; indices ascending and covering every sequence exactly once.
+            let mut seen: Vec<usize> = groups
+                .groups
+                .iter()
+                .flat_map(|g| g.indices.iter().copied())
+                .collect();
+            seen.sort();
+            assert_eq!(seen, (0..seqs.len()).collect::<Vec<_>>());
+            assert_eq!(db.score_width(), ScoreWidth::I32, "widest group reported");
+        }
+    }
+
+    #[test]
+    fn escalated_results_match_the_scalar_oracle() {
+        let scoring = wide_dna_scoring();
+        let seqs = mixed_width_seqs();
+        let simd = available_simd();
+        if simd.is_empty() {
+            return;
+        }
+        // Queries of assorted lengths over the alphabet. Kept short: the width proof (hence the
+        // grouping) is fixed at build time by `max_query_len`, so a long query adds no coverage but
+        // would make the scalar oracle's full-matrix DP against the 2000 nt target very slow.
+        let queries: Vec<Vec<u8>> = [3usize, 8, 30, 50]
+            .into_iter()
+            .map(|len| (0..len).map(|i| ((i * 3 + 1) % 4) as u8).collect())
+            .collect();
+
+        for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw] {
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let build = |b: BackendChoice| {
+                    Database::builder()
+                        .sequences(&seqs)
+                        .scoring(scoring.clone())
+                        .mode(mode)
+                        .search_type(st)
+                        .max_query_len(2000)
+                        .backend(b)
+                        .build()
+                        .unwrap()
+                };
+                let oracle = build(BackendChoice::Force(Backend::Scalar));
+                let mut os = Scratch::new(&oracle);
+                for &b in &simd {
+                    let db = build(BackendChoice::Force(b));
+                    let mut gs = Scratch::new(&db);
+                    for q in &queries {
+                        // single-best
+                        assert_eq!(
+                            db.scan(&mut gs, q),
+                            oracle.scan(&mut os, q),
+                            "{b} scan {mode} {st} len={}",
+                            q.len()
+                        );
+                        // per-target
+                        let (mut ga, mut oa) = (Vec::new(), Vec::new());
+                        db.scan_all(&mut gs, q, &mut ga);
+                        oracle.scan_all(&mut os, q, &mut oa);
+                        assert_eq!(ga, oa, "{b} scan_all {mode} {st} len={}", q.len());
+                        // scores array
+                        let (mut gsc, mut osc) = (Vec::new(), Vec::new());
+                        db.scan_scores(&mut gs, q, &mut gsc);
+                        oracle.scan_scores(&mut os, q, &mut osc);
+                        assert_eq!(gsc, osc, "{b} scan_scores {mode} {st} len={}", q.len());
                     }
                 }
             }

@@ -8,6 +8,19 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- Per-sequence score-width escalation for database scans: a `Score`/`ScoreEnd` `Database` now proves
+  each target's integer width from *its own* length and partitions the sequences into width groups,
+  so a mixed-length database runs its short sequences at a narrow width (more SIMD lanes) instead of
+  forcing the whole database to the single widest width. The partition is **static** (length-based),
+  hence lane-count-independent, and every sufficient width yields the identical score — so a scan is
+  bit-identical to the uniform-width and scalar paths (`DETERMINISM.md` §4). This is also an
+  *alternative* SIMD-eligibility path: a mixed database whose single widest-width packing is too
+  large for the kernel layout can still be SIMD-accelerated when each narrower group's packing fits.
+  `scan`, `scan_all`, and `scan_scores` all use it; `Database::score_width()` reports the widest
+  group; a uniform-length database is a single group (exactly the previous behaviour). Measured on a
+  1000-short + 8-long (`i32`) `SW` `scan_scores` — a database only SIMD-eligible because of grouping —
+  ~8× (SSE4.1) / ~14× (AVX2) over scalar.
+
 - `i32`-width database scan on SIMD: the inter-sequence kernel now runs at `i32` (SSE4.1 → 4 lanes,
   AVX2 → 8 lanes, NEON → 4 lanes) via the Precomputed layout, so databases whose score proof
   exceeds `i16` — long reads, genome/contig-scale global or overlap alignment, and heavily scaled

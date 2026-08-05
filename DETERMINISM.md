@@ -109,18 +109,28 @@ comparisons; a natural "first/last lane wins" reduction is a determinism bug.**
   take a **scalar argmax** over the index — never a horizontal lane-wise max, which a 16-lane and a
   32-lane backend would resolve differently on the same input.
 
-## 4. Uniform score width across a database — no bucketing
+## 4. Per-sequence score width — static, not bucketed
 
-A `Database` resolves **one** width for the whole database (from the longest sequence and declared
-max query length) and uses it for **every** sequence. This is a deliberate determinism decision,
-not a simplification:
+The width proof runs **per sequence**: each target's width is proven from *its own* length (plus the
+declared max query length, mode, and scoring), and the database is partitioned into groups by that
+width — short sequences run at `i8` (more lanes) while a few long ones run at `i16`/`i32`, instead of
+forcing the whole database to the single widest width. `Database::score_width()` reports the widest
+group.
 
-Per-sequence precision *escalation by buckets* (Opal's `OVERFLOW_BUCKETS`) makes which sequence is
-computed at which precision a function of the **lane count**, so it makes performance ISA-dependent
-and widens the surface on which a detection bug becomes an ISA-dependent wrong answer. `hyalite`
-does not do it. If protein-scale escalation (`i8 → i16 → i32`) is added later, it must recompute
-*individual overflowed sequences* at higher precision in a lane-count-independent way, preserving
-this contract.
+This is safe precisely because the decision is **static**: which sequence runs at which width is a
+function of the sequence's *length* alone, never of the lane count or of any runtime saturation
+detection. It is therefore lane-count-independent — a 16-lane and a 32-lane backend partition the
+database identically. And any width the proof accepts is *sufficient* (no real cell saturates; §2,
+§6), so a sequence computed at its own narrow width yields the byte-identical score, index, and ends
+it would at any wider width. A grouped scan is bit-identical to both the uniform-width and scalar
+paths.
+
+This is deliberately **not** Opal's `OVERFLOW_BUCKETS`: bucketed *runtime* escalation makes which
+sequence is recomputed at which precision a function of the lane batching, so it makes performance
+ISA-dependent and turns a detection bug into an ISA-dependent wrong answer. `hyalite` partitions
+statically by the length-based proof, so the width map is fixed before any query is seen. When all
+sequences prove the same width (e.g. a fixed-length adapter set), there is a single group and the
+behaviour is exactly the old uniform-width path.
 
 ## 5. "Bit-identical across backends" is relative to the scalar oracle — not to Opal
 

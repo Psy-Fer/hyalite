@@ -519,6 +519,38 @@ impl Packed {
             Packed::I32(p) => p.layout,
         }
     }
+
+    /// The score width this packing runs at.
+    pub(crate) fn width(&self) -> crate::ScoreWidth {
+        match self {
+            Packed::I8(_) => crate::ScoreWidth::I8,
+            Packed::I16(_) => crate::ScoreWidth::I16,
+            Packed::I32(_) => crate::ScoreWidth::I32,
+        }
+    }
+}
+
+/// A per-sequence-width-escalated packing: the database's sequences partitioned by their **own**
+/// proven [`ScoreWidth`](crate::ScoreWidth) (from each sequence's length, the declared max query
+/// length, mode, and scoring), each partition packed at its narrow width. A mixed-length database
+/// then runs its short sequences at a narrow width (more lanes) instead of the whole database at the
+/// single widest width. The partition is purely static (length-based), so which sequence runs at
+/// which width is **independent of the lane count** — the determinism contract `DETERMINISM.md` §4
+/// requires of any escalation. Every sufficient width yields the identical score (§6), so a grouped
+/// scan is bit-identical to the uniform-width and scalar paths.
+#[derive(Debug, Clone)]
+pub(crate) struct PackedGroups {
+    /// One group per distinct width present, in ascending width order.
+    pub(crate) groups: Vec<PackedGroup>,
+}
+
+/// One width partition of a [`PackedGroups`]: the sequences of a single proven width, packed, plus
+/// the global `db_index` of each (group-local order preserves the original database order, so the
+/// indices are ascending).
+#[derive(Debug, Clone)]
+pub(crate) struct PackedGroup {
+    pub(crate) packed: Packed,
+    pub(crate) indices: Vec<usize>,
 }
 
 /// Reusable, query-independent-sized working memory for the SIMD scan. Held in
@@ -552,24 +584,42 @@ impl SimdScratch {
         lanes: usize,
         width: crate::ScoreWidth,
     ) -> Self {
-        let row = (max_target_len + 1) * lanes;
-        let i8w = width == crate::ScoreWidth::I8;
-        let i16w = width == crate::ScoreWidth::I16;
-        let i32w = width == crate::ScoreWidth::I32;
-        let e = |b: bool, n: usize| if b { n } else { 0 };
+        // One resolved width: only that width's lane count is given.
+        let (l8, l16, l32) = match width {
+            crate::ScoreWidth::I8 => (Some(lanes), None, None),
+            crate::ScoreWidth::I16 => (None, Some(lanes), None),
+            crate::ScoreWidth::I32 => (None, None, Some(lanes)),
+        };
+        Self::new_grouped(sequence_count, max_target_len, l8, l16, l32)
+    }
+
+    /// Working memory sized for a per-sequence-width-escalated database: a set of buffers for each
+    /// width present across the groups (`Some(lanes)`), the others empty. Each width's buffers are
+    /// sized for the whole `sequence_count` (a safe over-estimate: each group is a subset), so any
+    /// group can fill its slice. `cols`/`rows` (positions, always `i16`) cover every sequence.
+    pub(crate) fn new_grouped(
+        sequence_count: usize,
+        max_target_len: usize,
+        lanes8: Option<usize>,
+        lanes16: Option<usize>,
+        lanes32: Option<usize>,
+    ) -> Self {
+        let row = |lanes: Option<usize>| lanes.map_or(0, |l| (max_target_len + 1) * l);
+        let cnt = |lanes: Option<usize>| if lanes.is_some() { sequence_count } else { 0 };
+        let (r8, r16, r32) = (row(lanes8), row(lanes16), row(lanes32));
         SimdScratch {
-            h: vec![0i8; e(i8w, 2 * row)],
-            f: vec![0i8; e(i8w, row)],
-            lane_scores: vec![0i8; e(i8w, lanes)],
-            scores: vec![0i8; e(i8w, sequence_count)],
-            h16: vec![0i16; e(i16w, 2 * row)],
-            f16: vec![0i16; e(i16w, row)],
-            lane_scores16: vec![0i16; e(i16w, lanes)],
-            scores16: vec![0i16; e(i16w, sequence_count)],
-            h32: vec![0i32; e(i32w, 2 * row)],
-            f32: vec![0i32; e(i32w, row)],
-            lane_scores32: vec![0i32; e(i32w, lanes)],
-            scores32: vec![0i32; e(i32w, sequence_count)],
+            h: vec![0i8; 2 * r8],
+            f: vec![0i8; r8],
+            lane_scores: vec![0i8; lanes8.unwrap_or(0)],
+            scores: vec![0i8; cnt(lanes8)],
+            h16: vec![0i16; 2 * r16],
+            f16: vec![0i16; r16],
+            lane_scores16: vec![0i16; lanes16.unwrap_or(0)],
+            scores16: vec![0i16; cnt(lanes16)],
+            h32: vec![0i32; 2 * r32],
+            f32: vec![0i32; r32],
+            lane_scores32: vec![0i32; lanes32.unwrap_or(0)],
+            scores32: vec![0i32; cnt(lanes32)],
             cols: vec![0i16; sequence_count],
             rows: vec![0i16; sequence_count],
         }
