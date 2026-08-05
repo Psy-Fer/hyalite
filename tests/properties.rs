@@ -212,6 +212,18 @@ fn scheme_db_query_wide() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<u8
     })
 }
 
+/// Like [`scheme_db_query_wide`] but with much larger matrix entries, so many schemes prove to
+/// `i32` width and exercise the `i32` inter-sequence kernel. `12`-long perfect matches at up to
+/// `5000`/cell reach `60000`, past the `i16` range; the tests filter to the modes that actually
+/// prove `i32` (`i8`/`i16` are covered above).
+fn scheme_db_query_verywide() -> impl Strategy<Value = (Scheme, Vec<Vec<u8>>, Vec<u8>)> {
+    scheme(4, -5000..=5000).prop_flat_map(|s| {
+        let al = s.al;
+        let db = prop::collection::vec(seq(al, 12), 1..=6);
+        (Just(s), db, seq(al, 12))
+    })
+}
+
 proptest! {
     /// `Database::scan` equals the best `align_pair` over the database with the smallest-index
     /// tie-break, for random databases, queries, modes, and search types.
@@ -351,6 +363,52 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// The determinism contract at `i32` width: for every database whose proof selects `i32`, each
+    /// available SIMD backend (SSE4.1 → 4 lanes, AVX2 → 8 lanes) yields the exact same `BestHit` as
+    /// scalar — across all modes and both search types. Only the Precomputed layout applies at `i32`
+    /// (the byte-shuffle Gathered gather is `i8`-specific). At `i32` the SIMD kernel is
+    /// arithmetically identical to the scalar oracle (same `i32::MIN/4` sentinel, same plain
+    /// non-saturating ops), so this guards that the new `i32` lane backends, the width-aware packing
+    /// stride, and the dispatch/scratch plumbing all line up. `ScoreEnd` here still recovers the
+    /// winner's ends via the scalar re-alignment inside `scan` (in-vector `i32` ends are a follow-up).
+    /// Skipped on CPUs with no SIMD backend.
+    #[test]
+    fn scan_identical_across_simd_backends_i32((s, db_seqs, q) in scheme_db_query_verywide()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
+            return Ok(()); // no SIMD backend on this CPU; nothing to compare
+        }
+        let scoring = s.scoring();
+        let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
+
+        for mode in ALL_MODES {
+            // Target the `i32` kernel specifically; `i8` and `i16` are covered above.
+            if scoring.required_width(mode, 12, max_t).unwrap() != ScoreWidth::I32 {
+                continue;
+            }
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let scalar = scan_forced(
+                    Backend::Scalar, LayoutChoice::Auto, &db_seqs, &scoring, mode, st, &q,
+                );
+                for &b in &simd {
+                    let got = scan_forced(
+                        b, LayoutChoice::Force(Layout::Precomputed), &db_seqs, &scoring, mode, st, &q,
+                    );
+                    prop_assert_eq!(
+                        got, scalar, "i32 {}/Precomputed disagrees with scalar for {} {}", b, mode, st
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-target scan_all
 // ---------------------------------------------------------------------------
@@ -482,6 +540,72 @@ proptest! {
                     db.scan_scores(&mut scratch, &q, &mut scores);
                     let want_scores: Vec<i32> = out.iter().map(|h| h.score).collect();
                     prop_assert_eq!(&scores, &want_scores, "i16 scan_scores {} {} {}", b, mode, st);
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// `scan_all` at `i32` width: one hit per database sequence (in order), each bit-identical to
+    /// `align_pair`, on every available SIMD backend (Precomputed layout only) and both search
+    /// types — plus `scan` equal to the smallest-index best and `scan_scores` equal to the score
+    /// array. Exercises the `i32` per-target `fill_scores` path (distinct from the single-best
+    /// `scan` path above) and its `scores32` reduction.
+    #[test]
+    fn scan_all_matches_per_sequence_and_scan_i32((s, db_seqs, q) in scheme_db_query_verywide()) {
+        let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+            .into_iter()
+            .filter(|b| b.is_available())
+            .collect();
+        if simd.is_empty() {
+            return Ok(());
+        }
+        let scoring = s.scoring();
+        let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
+
+        for mode in ALL_MODES {
+            if scoring.required_width(mode, 12, max_t).unwrap() != ScoreWidth::I32 {
+                continue;
+            }
+            for st in [SearchType::Score, SearchType::ScoreEnd] {
+                let want: Vec<BestHit> = db_seqs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, seq)| BestHit {
+                        db_index: i,
+                        ..align_pair(&q, seq, &scoring, mode, st).unwrap()
+                    })
+                    .collect();
+                let want_best = want
+                    .iter()
+                    .copied()
+                    .reduce(|a, c| if c.score > a.score { c } else { a })
+                    .unwrap();
+
+                for &b in &simd {
+                    let db = Database::builder()
+                        .sequences(&db_seqs)
+                        .scoring(scoring.clone())
+                        .mode(mode)
+                        .search_type(st)
+                        .max_query_len(12)
+                        .backend(BackendChoice::Force(b))
+                        .layout(LayoutChoice::Force(Layout::Precomputed))
+                        .build()
+                        .unwrap();
+                    let mut scratch = Scratch::new(&db);
+                    let mut out = Vec::new();
+                    db.scan_all(&mut scratch, &q, &mut out);
+                    prop_assert_eq!(&out, &want, "i32 scan_all {} {} {}", b, mode, st);
+                    let hit = db.scan(&mut scratch, &q);
+                    prop_assert_eq!(hit, want_best, "i32 scan vs best {} {} {}", b, mode, st);
+                    let mut scores = Vec::new();
+                    db.scan_scores(&mut scratch, &q, &mut scores);
+                    let want_scores: Vec<i32> = out.iter().map(|h| h.score).collect();
+                    prop_assert_eq!(&scores, &want_scores, "i32 scan_scores {} {} {}", b, mode, st);
                 }
             }
         }

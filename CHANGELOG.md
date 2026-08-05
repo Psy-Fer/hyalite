@@ -6,6 +6,21 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `i32`-width database scan on SIMD: the inter-sequence kernel now runs at `i32` (SSE4.1 → 4 lanes,
+  AVX2 → 8 lanes, NEON → 4 lanes) via the Precomputed layout, so databases whose score proof
+  exceeds `i16` — long reads, genome/contig-scale global or overlap alignment, and heavily scaled
+  or log-odds matrices — are SIMD-accelerated instead of falling back to scalar. At `i32` the kernel
+  is arithmetically identical to the scalar oracle (same `i32::MIN/4` `-∞` sentinel, same plain
+  non-saturating add/sub, since the width proof already bounds every cell inside `i32`), so it is
+  bit-identical by construction across every backend and mode. `Database`/`PackedDb` carry the packed
+  database at whichever width the proof selected (`i8`, `i16`, or `i32`), with the lane count width-aware
+  (register bytes ÷ element bytes). This covers the `Score` search type (single-best `scan`,
+  per-target `scan_all`, and `scan_scores`); `ScoreEnd` end positions still recover via the scalar
+  path for `i32` databases. Measured over scalar for a 64-target × 2000-read `i32` `SW` `Score` scan:
+  ~7× (SSE4.1) / ~12× (AVX2).
+
 ## [0.2.0] - 2026-08-04
 
 ### Added

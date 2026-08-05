@@ -236,9 +236,14 @@ impl Database {
                         push(out, index, score as i32);
                     }
                 }
-                _ => {
+                ScoreWidth::I16 => {
                     for (index, &score) in scratch.simd.scores16().iter().enumerate() {
                         push(out, index, score as i32);
+                    }
+                }
+                ScoreWidth::I32 => {
+                    for (index, &score) in scratch.simd.scores32().iter().enumerate() {
+                        push(out, index, score);
                     }
                 }
             }
@@ -292,10 +297,11 @@ impl Database {
                 query,
                 &mut scratch.simd,
             );
-            // Scores land in the width the database resolved to (`i32` width is never packed).
+            // Scores land in the width the database resolved to.
             match self.width {
                 ScoreWidth::I8 => out.extend(scratch.simd.scores().iter().map(|&s| s as i32)),
-                _ => out.extend(scratch.simd.scores16().iter().map(|&s| s as i32)),
+                ScoreWidth::I16 => out.extend(scratch.simd.scores16().iter().map(|&s| s as i32)),
+                ScoreWidth::I32 => out.extend(scratch.simd.scores32().iter().copied()),
             }
         } else {
             for seq in &self.sequences {
@@ -600,7 +606,9 @@ impl DatabaseBuilder {
                 ScoreWidth::I16 => Packed::I16(inter::PackedDb::<i16>::build(
                     &sequences, lanes, layout, &scoring,
                 )),
-                ScoreWidth::I32 => unreachable!("i32 width is never SIMD-eligible"),
+                ScoreWidth::I32 => Packed::I32(inter::PackedDb::<i32>::build(
+                    &sequences, lanes, layout, &scoring,
+                )),
             })
         };
 
@@ -816,15 +824,22 @@ mod tests {
 
     #[test]
     fn forcing_simd_on_an_ineligible_database_errors() {
-        // A wide-score database (long global alignment) needs i16, so no SIMD kernel applies.
-        // Forcing one must fail loudly rather than silently falling back.
-        let scoring = Scoring::new(2, vec![100, -100, -100, 100], 2, 1).unwrap();
-        let long = vec![0u8; 200];
+        // A large alphabet (20 > 16) rules out the byte-shuffle Gathered gather, and no other SIMD
+        // layout serves an i8 database with alphabet_len > 16, so no SIMD kernel applies. Forcing
+        // one must fail loudly rather than silently falling back. (Score widths i8/i16/i32 are all
+        // SIMD-eligible now, so width alone no longer makes a database ineligible.)
+        let al = 20usize;
+        let mut matrix = vec![-1i32; al * al];
+        for d in 0..al {
+            matrix[d * al + d] = 1; // small entries → proves i8
+        }
+        let scoring = Scoring::new(al, matrix, 2, 1).unwrap();
+        let seq: Vec<u8> = (0..al as u8).collect();
         let result = Database::builder()
-            .sequences(&[long])
+            .sequences(&[seq])
             .scoring(scoring)
             .mode(Mode::Nw)
-            .max_query_len(200)
+            .max_query_len(al)
             .backend(BackendChoice::Force(Backend::Sse41))
             .build();
         // On a CPU without SSE4.1 the resolver rejects it before the eligibility check; either way

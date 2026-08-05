@@ -76,6 +76,26 @@ impl Elem for i16 {
     }
 }
 
+impl Elem for i32 {
+    // At `i32` the score element *is* the scalar oracle's width, so the sentinel matches it exactly:
+    // `i32::MIN / 4` (not `i32::MIN`), leaving headroom so a border cell minus a gap penalty never
+    // wraps. There is no saturating 32-bit SIMD add/sub on x86 anyway, and none is needed — the width
+    // proof bounds every reachable cell inside `i32`, so `add_sat`/`sub_sat` are plain wrapping
+    // add/sub for `i32` lanes (see the backend impls). That makes the `i32` kernel arithmetically
+    // identical to `kernel::fill_dp`, hence bit-identical by construction.
+    const NEG: i32 = i32::MIN / 4;
+    const ZERO: i32 = 0;
+    const MASK: i32 = -1;
+    #[inline(always)]
+    fn sat(v: i32) -> i32 {
+        v
+    }
+    #[inline(always)]
+    fn widen(self) -> i32 {
+        self
+    }
+}
+
 /// The maximum alphabet length the byte-shuffle substitution lookup supports.
 pub(crate) const MAX_SHUFFLE_ALPHABET: usize = 16;
 
@@ -248,7 +268,7 @@ pub(crate) fn kernel_applies(width: crate::ScoreWidth, alphabet_len: usize) -> b
 /// applies, else `None` (use the scalar path). `i8` supports both layouts (Gathered needs
 /// `alphabet_len <= 16`); `i16` uses the Precomputed layout only (the byte-shuffle gather is
 /// `i8`-specific), and only when that table fits the cache budget or is explicitly forced. `i32`
-/// stays scalar.
+/// behaves like `i16`: Precomputed-only, budget-gated.
 pub(crate) fn simd_plan(
     width: crate::ScoreWidth,
     alphabet_len: usize,
@@ -273,7 +293,17 @@ pub(crate) fn simd_plan(
                 (bytes <= PRECOMPUTED_MAX_BYTES).then_some(Layout::Precomputed)
             }
         },
-        crate::ScoreWidth::I32 => None,
+        // `i32` mirrors `i16`: Precomputed only (the byte-shuffle Gathered gather is `i8`-specific),
+        // gated on the table (four bytes per element) fitting the cache budget, or forced.
+        crate::ScoreWidth::I32 => match choice {
+            LayoutChoice::Force(Layout::Gathered) => None,
+            LayoutChoice::Force(Layout::Precomputed) => Some(Layout::Precomputed),
+            LayoutChoice::Auto => {
+                let bytes =
+                    precomputed_table_bytes(sequences, lanes, alphabet_len).saturating_mul(4);
+                (bytes <= PRECOMPUTED_MAX_BYTES).then_some(Layout::Precomputed)
+            }
+        },
     }
 }
 
@@ -478,6 +508,7 @@ impl<E: Elem> PackedDb<E> {
 pub(crate) enum Packed {
     I8(PackedDb<i8>),
     I16(PackedDb<i16>),
+    I32(PackedDb<i32>),
 }
 
 impl Packed {
@@ -485,6 +516,7 @@ impl Packed {
         match self {
             Packed::I8(p) => p.layout,
             Packed::I16(p) => p.layout,
+            Packed::I32(p) => p.layout,
         }
     }
 }
@@ -503,6 +535,10 @@ pub(crate) struct SimdScratch {
     f16: Vec<i16>,
     lane_scores16: Vec<i16>,
     scores16: Vec<i16>,
+    h32: Vec<i32>,
+    f32: Vec<i32>,
+    lane_scores32: Vec<i32>,
+    scores32: Vec<i32>,
     /// Per-database-sequence answer columns/rows (`target_end + 1` / `query_end + 1`), filled by
     /// `fill_ends`. Positions are `i16` at every score width.
     cols: Vec<i16>,
@@ -519,6 +555,7 @@ impl SimdScratch {
         let row = (max_target_len + 1) * lanes;
         let i8w = width == crate::ScoreWidth::I8;
         let i16w = width == crate::ScoreWidth::I16;
+        let i32w = width == crate::ScoreWidth::I32;
         let e = |b: bool, n: usize| if b { n } else { 0 };
         SimdScratch {
             h: vec![0i8; e(i8w, 2 * row)],
@@ -529,6 +566,10 @@ impl SimdScratch {
             f16: vec![0i16; e(i16w, row)],
             lane_scores16: vec![0i16; e(i16w, lanes)],
             scores16: vec![0i16; e(i16w, sequence_count)],
+            h32: vec![0i32; e(i32w, 2 * row)],
+            f32: vec![0i32; e(i32w, row)],
+            lane_scores32: vec![0i32; e(i32w, lanes)],
+            scores32: vec![0i32; e(i32w, sequence_count)],
             cols: vec![0i16; sequence_count],
             rows: vec![0i16; sequence_count],
         }
@@ -545,6 +586,10 @@ impl SimdScratch {
             f16: Vec::new(),
             lane_scores16: Vec::new(),
             scores16: Vec::new(),
+            h32: Vec::new(),
+            f32: Vec::new(),
+            lane_scores32: Vec::new(),
+            scores32: Vec::new(),
             cols: Vec::new(),
             rows: Vec::new(),
         }
@@ -558,6 +603,11 @@ impl SimdScratch {
     /// The per-target `i16` scores filled by [`fill_scores`] (for an `i16` database).
     pub(crate) fn scores16(&self) -> &[i16] {
         &self.scores16
+    }
+
+    /// The per-target `i32` scores filled by [`fill_scores`] (for an `i32` database).
+    pub(crate) fn scores32(&self) -> &[i32] {
+        &self.scores32
     }
 
     /// The per-target end positions filled by [`fill_ends`]: `(target_end_col, query_end_row)`
@@ -999,6 +1049,18 @@ pub(crate) fn scan_dispatch(
         (Packed::I16(p), crate::Backend::Neon) => {
             neon::run_i16(p, sequences, scoring, mode, search_type, query, sc, dp)
         }
+        #[cfg(target_arch = "x86_64")]
+        (Packed::I32(p), crate::Backend::Avx2) => {
+            avx2::run_i32(p, sequences, scoring, mode, search_type, query, sc, dp)
+        }
+        #[cfg(target_arch = "x86_64")]
+        (Packed::I32(p), crate::Backend::Sse41) => {
+            sse41::run_i32(p, sequences, scoring, mode, search_type, query, sc, dp)
+        }
+        #[cfg(target_arch = "aarch64")]
+        (Packed::I32(p), crate::Backend::Neon) => {
+            neon::run_i32(p, sequences, scoring, mode, search_type, query, sc, dp)
+        }
         (_, other) => unreachable!("no inter-sequence kernel for backend {other}"),
     }
 }
@@ -1067,6 +1129,18 @@ pub(crate) fn fill_scores(
         #[cfg(target_arch = "aarch64")]
         (Packed::I16(p), crate::Backend::Neon) => {
             neon::run_scores_i16(p, query, go, ge, &flags, sc)
+        }
+        #[cfg(target_arch = "x86_64")]
+        (Packed::I32(p), crate::Backend::Avx2) => {
+            avx2::run_scores_i32(p, query, go, ge, &flags, sc)
+        }
+        #[cfg(target_arch = "x86_64")]
+        (Packed::I32(p), crate::Backend::Sse41) => {
+            sse41::run_scores_i32(p, query, go, ge, &flags, sc)
+        }
+        #[cfg(target_arch = "aarch64")]
+        (Packed::I32(p), crate::Backend::Neon) => {
+            neon::run_scores_i32(p, query, go, ge, &flags, sc)
         }
         (_, other) => unreachable!("no inter-sequence kernel for backend {other}"),
     }
@@ -1610,6 +1684,131 @@ pub(crate) mod sse41 {
         debug_assert!(std::is_x86_feature_detected!("sse4.1"));
         unsafe { ends_ff_i16(packed, query, go, ge, flags, sc) }
     }
+
+    /// 4-lane SSE4.1 `i32` backend. Arithmetic is plain (non-saturating) `_mm_add/sub_epi32`: x86 has
+    /// no saturating 32-bit add/sub, and none is needed — the width proof bounds every cell inside
+    /// `i32` and the `-∞` sentinel (`i32::MIN / 4`) keeps headroom, matching the scalar oracle exactly
+    /// (see `impl Elem for i32`).
+    #[derive(Clone, Copy)]
+    pub(crate) struct Sse41I32;
+
+    impl Lanes for Sse41I32 {
+        const LANES: usize = 4;
+        type Elem = i32;
+        type V = __m128i;
+
+        #[inline(always)]
+        fn splat(v: i32) -> __m128i {
+            unsafe { _mm_set1_epi32(v) }
+        }
+        #[inline(always)]
+        fn add_sat(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_add_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn sub_sat(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_sub_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: __m128i, b: __m128i) -> __m128i {
+            unsafe { _mm_max_epi32(a, b) } // SSE4.1
+        }
+        #[inline(always)]
+        fn select(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+            // Masks are all-ones/all-zero per i32 lane, so per-byte blendv selects correctly.
+            unsafe { _mm_blendv_epi8(b, a, mask) }
+        }
+        #[inline(always)]
+        fn load(src: &[i32]) -> __m128i {
+            debug_assert!(src.len() >= 4);
+            unsafe { _mm_loadu_si128(src.as_ptr().cast()) }
+        }
+        #[inline(always)]
+        fn store(v: __m128i, dst: &mut [i32]) {
+            debug_assert!(dst.len() >= 4);
+            unsafe { _mm_storeu_si128(dst.as_mut_ptr().cast(), v) }
+        }
+        #[inline(always)]
+        fn shuffle_lookup(_table: &[i32], _indices: &[u8]) -> __m128i {
+            unreachable!("i32 uses the Precomputed layout, never the byte-shuffle gather")
+        }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn scan_ff_i32(
+        packed: &PackedDb<i32>,
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
+    ) -> BestHit {
+        scan_batched::<Sse41I32>(
+            packed,
+            sequences,
+            scoring,
+            mode,
+            search_type,
+            query,
+            &mut sc.h32,
+            &mut sc.f32,
+            &mut sc.lane_scores32,
+            dp,
+        )
+    }
+
+    /// Single-best `i32` scan. Same feature precondition as [`run`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_i32(
+        packed: &PackedDb<i32>,
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
+    ) -> BestHit {
+        debug_assert!(std::is_x86_feature_detected!("sse4.1"));
+        unsafe { scan_ff_i32(packed, sequences, scoring, mode, search_type, query, sc, dp) }
+    }
+
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn scores_ff_i32(
+        packed: &PackedDb<i32>,
+        query: &[u8],
+        go: i32,
+        ge: i32,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        fill_scores_lanes::<Sse41I32>(
+            packed,
+            query,
+            go,
+            ge,
+            flags,
+            &mut sc.h32,
+            &mut sc.f32,
+            &mut sc.scores32,
+        );
+    }
+
+    /// Per-target `i32` scores. Same feature precondition as [`run`].
+    pub(crate) fn run_scores_i32(
+        packed: &PackedDb<i32>,
+        query: &[u8],
+        go: i32,
+        ge: i32,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        debug_assert!(std::is_x86_feature_detected!("sse4.1"));
+        unsafe { scores_ff_i32(packed, query, go, ge, flags, sc) }
+    }
 }
 
 /// AVX2 lane backend: 32 `i8` lanes per `__m256i`.
@@ -2061,6 +2260,129 @@ pub(crate) mod avx2 {
         debug_assert!(std::is_x86_feature_detected!("avx2"));
         unsafe { ends_ff_i16(packed, query, go, ge, flags, sc) }
     }
+
+    /// 8-lane AVX2 `i32` backend. Plain (non-saturating) arithmetic, matching the scalar oracle (see
+    /// [`super::sse41::Sse41I32`] and `impl Elem for i32`).
+    #[derive(Clone, Copy)]
+    pub(crate) struct Avx2I32;
+
+    impl Lanes for Avx2I32 {
+        const LANES: usize = 8;
+        type Elem = i32;
+        type V = __m256i;
+
+        #[inline(always)]
+        fn splat(v: i32) -> __m256i {
+            unsafe { _mm256_set1_epi32(v) }
+        }
+        #[inline(always)]
+        fn add_sat(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_add_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn sub_sat(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_sub_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: __m256i, b: __m256i) -> __m256i {
+            unsafe { _mm256_max_epi32(a, b) }
+        }
+        #[inline(always)]
+        fn select(mask: __m256i, a: __m256i, b: __m256i) -> __m256i {
+            // Masks are all-ones/all-zero per i32 lane, so per-byte blendv selects correctly.
+            unsafe { _mm256_blendv_epi8(b, a, mask) }
+        }
+        #[inline(always)]
+        fn load(src: &[i32]) -> __m256i {
+            debug_assert!(src.len() >= 8);
+            unsafe { _mm256_loadu_si256(src.as_ptr().cast()) }
+        }
+        #[inline(always)]
+        fn store(v: __m256i, dst: &mut [i32]) {
+            debug_assert!(dst.len() >= 8);
+            unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast(), v) }
+        }
+        #[inline(always)]
+        fn shuffle_lookup(_table: &[i32], _indices: &[u8]) -> __m256i {
+            unreachable!("i32 uses the Precomputed layout, never the byte-shuffle gather")
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn scan_ff_i32(
+        packed: &PackedDb<i32>,
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
+    ) -> BestHit {
+        scan_batched::<Avx2I32>(
+            packed,
+            sequences,
+            scoring,
+            mode,
+            search_type,
+            query,
+            &mut sc.h32,
+            &mut sc.f32,
+            &mut sc.lane_scores32,
+            dp,
+        )
+    }
+
+    /// Single-best `i32` scan. Same feature precondition as [`run`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_i32(
+        packed: &PackedDb<i32>,
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
+    ) -> BestHit {
+        debug_assert!(std::is_x86_feature_detected!("avx2"));
+        unsafe { scan_ff_i32(packed, sequences, scoring, mode, search_type, query, sc, dp) }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn scores_ff_i32(
+        packed: &PackedDb<i32>,
+        query: &[u8],
+        go: i32,
+        ge: i32,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        fill_scores_lanes::<Avx2I32>(
+            packed,
+            query,
+            go,
+            ge,
+            flags,
+            &mut sc.h32,
+            &mut sc.f32,
+            &mut sc.scores32,
+        );
+    }
+
+    /// Per-target `i32` scores. Same feature precondition as [`run`].
+    pub(crate) fn run_scores_i32(
+        packed: &PackedDb<i32>,
+        query: &[u8],
+        go: i32,
+        ge: i32,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        debug_assert!(std::is_x86_feature_detected!("avx2"));
+        unsafe { scores_ff_i32(packed, query, go, ge, flags, sc) }
+    }
 }
 
 /// NEON lane backend: 16 `i8` lanes per `int8x16_t`. NEON is baseline on aarch64, so there is no
@@ -2421,6 +2743,96 @@ pub(crate) mod neon {
             &mut sc.scores16,
             &mut sc.cols,
             &mut sc.rows,
+        );
+    }
+
+    /// 4-lane NEON `i32` backend. Plain (non-saturating) arithmetic, matching the scalar oracle (see
+    /// `impl Elem for i32`).
+    pub(crate) struct NeonI32;
+
+    impl Lanes for NeonI32 {
+        const LANES: usize = 4;
+        type Elem = i32;
+        type V = int32x4_t;
+
+        #[inline(always)]
+        fn splat(v: i32) -> int32x4_t {
+            unsafe { vdupq_n_s32(v) }
+        }
+        #[inline(always)]
+        fn add_sat(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vaddq_s32(a, b) }
+        }
+        #[inline(always)]
+        fn sub_sat(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vsubq_s32(a, b) }
+        }
+        #[inline(always)]
+        fn max(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vmaxq_s32(a, b) }
+        }
+        #[inline(always)]
+        fn select(mask: int32x4_t, a: int32x4_t, b: int32x4_t) -> int32x4_t {
+            unsafe { vbslq_s32(vreinterpretq_u32_s32(mask), a, b) }
+        }
+        #[inline(always)]
+        fn load(src: &[i32]) -> int32x4_t {
+            debug_assert!(src.len() >= 4);
+            unsafe { vld1q_s32(src.as_ptr()) }
+        }
+        #[inline(always)]
+        fn store(v: int32x4_t, dst: &mut [i32]) {
+            debug_assert!(dst.len() >= 4);
+            unsafe { vst1q_s32(dst.as_mut_ptr(), v) }
+        }
+        #[inline(always)]
+        fn shuffle_lookup(_table: &[i32], _indices: &[u8]) -> int32x4_t {
+            unreachable!("i32 uses the Precomputed layout, never the byte-shuffle gather")
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_i32(
+        packed: &PackedDb<i32>,
+        sequences: &[Vec<u8>],
+        scoring: &Scoring,
+        mode: Mode,
+        search_type: SearchType,
+        query: &[u8],
+        sc: &mut SimdScratch,
+        dp: &mut DpBuffers,
+    ) -> BestHit {
+        scan_batched::<NeonI32>(
+            packed,
+            sequences,
+            scoring,
+            mode,
+            search_type,
+            query,
+            &mut sc.h32,
+            &mut sc.f32,
+            &mut sc.lane_scores32,
+            dp,
+        )
+    }
+
+    pub(crate) fn run_scores_i32(
+        packed: &PackedDb<i32>,
+        query: &[u8],
+        go: i32,
+        ge: i32,
+        flags: &Flags,
+        sc: &mut SimdScratch,
+    ) {
+        fill_scores_lanes::<NeonI32>(
+            packed,
+            query,
+            go,
+            ge,
+            flags,
+            &mut sc.h32,
+            &mut sc.f32,
+            &mut sc.scores32,
         );
     }
 }
