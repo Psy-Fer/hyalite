@@ -18,7 +18,7 @@ SIMD parallelisation of Smith-Waterman. It is not affiliated with or endorsed by
 
 The primary differentiator is **exactness combined with runtime dispatch and reproducibility**:
 
-| Crate | Exact | SIMD | Affine gap | All 4 modes | Pure Rust |
+| Crate | Exact | SIMD | Affine gap | All 5 modes | Pure Rust |
 |---|---|---|---|---|---|
 | `block-aligner` | No (bounded error) | Yes | Yes | Partial | Yes |
 | `rust-bio` | Yes | No | Yes | Partial | Yes |
@@ -83,11 +83,15 @@ assert_eq!(hit.db_index, 1);       // the perfect-match sequence wins
 - **Layouts.** `Gathered` (general) and `Precomputed` (a cache-resident score table for small
   fixed databases such as an adapter set), auto-selected by size.
 - **Static width proof.** The score integer width (`i8`, `i16`, or `i32`) is proven sufficient at
-  construction rather than detected at runtime, so the hot loop is infallible. SIMD accelerates
-  `i8`- and `i16`-width databases with `alphabet_len` at most 16; `i32` width and larger alphabets
-  use the scalar path.
+  construction rather than detected at runtime, so the hot loop is infallible. SIMD accelerates all
+  three widths (the byte-shuffle `Gathered` gather needs `alphabet_len` at most 16, but the
+  `Precomputed` layout serves any alphabet — proteins included — at any width). A mixed-length
+  database is partitioned by each sequence's own proven width (**per-sequence escalation**), so its
+  short sequences run at a narrow width's higher lane count instead of the whole database at the
+  single widest.
 - **`align_pair` and batches.** A single-pair entry point with a striped intra-sequence SIMD
-  `Score` backend (SSE4.1/NEON) at `i8` and `i16` width; a batched `align_pairs`; per-target
+  `Score` backend (SSE4.1/NEON) at `i8`/`i16`/`i32` width; `align_pair_span` for the aligned span
+  (both starts and ends, no CIGAR) via a single forward pass; a batched `align_pairs`; per-target
   `Database::scan_all` / `scan_scores`; and bwa-style per-position maxima
   (`align_pair_position_max` + `score2`) for mate-rescue / mapping-quality use.
 - **Traceback.** `align()` and `Database::scan_aligned` return a full `Alignment` (score,

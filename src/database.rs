@@ -623,8 +623,10 @@ impl Database {
     }
 
     /// The kernel data layout, or `None` for the scalar backend (which does not pack the database).
-    /// For a per-sequence-width-escalated database this reports the layout of its widest-width group
-    /// (all groups share the same layout choice).
+    /// For a per-sequence-width-escalated database this reports the resolved layout of its
+    /// widest-width group; the groups share the same [`LayoutChoice`], but under
+    /// [`LayoutChoice::Auto`] narrower groups can resolve to a different [`Layout`] (e.g. a
+    /// large-alphabet `i8` group falls back to `Gathered` while wider groups use `Precomputed`).
     #[must_use]
     pub fn layout(&self) -> Option<Layout> {
         self.packed.as_ref().map(Packed::layout).or_else(|| {

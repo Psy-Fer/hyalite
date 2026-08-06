@@ -67,6 +67,16 @@ All notable changes to `hyalite` are documented here. The format follows
   the scalar oracle at every mode and lane count. Measured over scalar for a 2000×2000 `i32` `SW`
   pair: ~4.5×. (`ScoreEnd` / `Alignment` still use the scalar path.)
 
+### Fixed
+
+- The `i32` score path is non-saturating (x86 has no saturating 32-bit add/subtract), so its usable
+  score magnitude is bounded by the `-∞` sentinel it reserves (`i32::MIN / 4`) — `|i32::MIN / 4| - 1`,
+  not `i32::MAX`. Inputs whose proven magnitude could reach the sentinel — only pathological gap
+  penalties or matrix entries near `2³¹` — now fail construction with `ScoreRangeTooWide` instead of
+  producing a silently-wrong score (a latent hole in the scalar oracle itself, present since v0.1),
+  and two related `i32` wrap paths were closed: a pre-`max` intermediate (`cell ± penalty`) and the
+  striped lazy-F gap carry. No realistic input is affected.
+
 ## [0.2.0] - 2026-08-04
 
 ### Added

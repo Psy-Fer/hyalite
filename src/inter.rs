@@ -1213,9 +1213,9 @@ pub(crate) fn backend_tracks_ends(backend: crate::Backend) -> bool {
     )
 }
 
-/// Whether [`fill_ends`] can run for this packed database. Both `i8` and `i16` databases track end
-/// positions in-vector (positions share the `i16` domain either way); the caller additionally gates
-/// on the position range fitting `i16`.
+/// Whether [`fill_ends`] can run for this packed database. All widths (`i8`/`i16`/`i32`) track end
+/// positions in-vector — positions live in the `i16` domain regardless of the score width — so the
+/// caller additionally gates on the position range fitting `i16`.
 pub(crate) fn fill_ends_available(packed: &Packed) -> bool {
     matches!(packed, Packed::I8(_) | Packed::I16(_) | Packed::I32(_))
 }

@@ -22,11 +22,14 @@
 //!
 //! # Status
 //!
-//! Scalar and SIMD (SSE4.1/AVX2/NEON) backends across all four alignment [`Mode`]s; `Score`,
-//! `ScoreEnd`, and full `Alignment` [search types](SearchType); per-target [`Database::scan_all`]
-//! and [`Database::scan_aligned`]; and traceback via [`align`] (full-matrix, with an automatic
-//! linear-space path for large pairs). A striped `align_pair` lands in a later milestone — see
-//! `handover.md`.
+//! Scalar and SIMD (SSE4.1/AVX2/NEON) backends across all five alignment [`Mode`]s (`SW`, `NW`,
+//! `HW`, `OV`, `SHW`) at `i8`/`i16`/`i32` score width; `Score`, `ScoreEnd`, and full `Alignment`
+//! [search types](SearchType); per-target [`Database::scan_all`] / [`Database::scan_scores`] and
+//! [`Database::scan_aligned`]; per-sequence width escalation for mixed-length databases; and a
+//! striped (Farrar) intra-sequence SIMD kernel for [`align_pair`] plus [`align_pair_span`] (the
+//! aligned span without the operations) and traceback via [`align`] (full-matrix, with an automatic
+//! linear-space path for large pairs). Substitution alphabets larger than 16 (e.g. proteins) run on
+//! SIMD via the Precomputed layout.
 
 // `deny` rather than `forbid` so the SIMD backend modules (M2b+) can locally `allow(unsafe_code)`
 // for intrinsics; everything else stays unsafe-free.

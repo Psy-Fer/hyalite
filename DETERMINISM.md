@@ -5,9 +5,9 @@ different kernels — and the crate's central promise is that this never changes
 speed. This document is the single specification every backend must implement against. It is the
 authority the code points to; if code and this document disagree, that is a bug in one of them.
 
-Status: as of M1 only the scalar backend exists, so the cross-backend guarantee is not yet
-exercisable. This document is written *before* the SIMD backends (M2) precisely so that they are
-implemented against a fixed spec rather than retrofitted to one.
+Status: the scalar oracle and the SIMD backends (SSE4.1/AVX2 on x86-64, NEON on aarch64) are all
+implemented, at `i8`/`i16`/`i32` score width, so the cross-backend guarantee is actively exercised —
+the differential proptests assert full-struct equality of every backend against the scalar oracle.
 
 ## The promise
 
@@ -23,35 +23,55 @@ indices, not ASCII), `alphabet_len`, the substitution matrix, `gap_open`, `gap_e
 special-cased** by the library — the substitution matrix defines every symbol's scores, including
 `N`, and two runs are only "identical inputs" if they use the same matrix.
 
-The guarantee covers the observable fields of the **current** search types (`Score` and
-`ScoreEnd`): `score`, `db_index`, `query_end`, `target_end`. It presumes the score-width proof
-succeeded; if scores could overflow `i32` the builder fails loudly with `ScoreRangeTooWide` — a
-build error, never a silent divergence.
+The guarantee covers the observable fields of every search type: `Score` and `ScoreEnd` (`score`,
+`db_index`, `query_end`, `target_end`), and `Alignment` (additionally the start positions and the
+operation list). It presumes the score-width proof succeeded; if scores could exceed the usable
+range of even `i32` (§2) the builder fails loudly with `ScoreRangeTooWide` — a build error, never a
+silent divergence.
 
-Out of scope (v0.2): `SearchType::Alignment` will add a start position and a traceback path, which
-have their own tie-break not yet specified here. This contract will be extended when that lands.
+**Start positions.** `SearchType::Alignment` (via [`align`]/`scan_aligned`) and `align_pair_span`
+report where the alignment begins. Each is computed by a single deterministic path (the scalar
+traceback and the scalar forward start-tracking respectively), so each is bit-identical across runs.
+The guaranteed invariant on the reported span is *self-consistency* — a global alignment of the
+aligned substrings recovers the score — which holds even when several optimal alignments tie; the
+two entry points are verified to agree on the exact start wherever that is a theorem (every short
+pair, checked exhaustively).
 
 ## 1. One arithmetic model, defined once
 
 Every backend computes scores as **signed integers of a single width `W`**, where
-`W ∈ {i8, i16, i32}` is chosen once per `Database`/`align_pair` by the width proof (§2). The model
-is:
+`W ∈ {i8, i16, i32}` is chosen once per `Database`/`align_pair` by the width proof (§2). The
+invariant every realization upholds is the same:
 
-- **Saturating arithmetic at width `W`.** Adds and subtracts saturate at `W::MIN` / `W::MAX`
-  rather than wrapping.
-- **The sentinel `W::MIN` means −∞** (an unreachable cell — e.g. a gap that cannot have opened
-  yet at a border). Real scores are provably confined to `[W::MIN + 1, W::MAX]` (§2), so a real
-  score can never collide with the sentinel.
-- **The sentinel never wins.** A max over cell candidates that includes −∞ (or any value that
-  saturated toward `W::MIN`) selects a real value whenever one exists, because every real value is
-  `> W::MIN`. Consequently the *result* depends only on real cell values — and those are exactly
-  the values the proof guarantees no backend saturates.
+- **A reserved `−∞` sentinel that stays below every reachable cell.** Unreachable cells (e.g. a gap
+  that cannot have opened yet at a border) hold the sentinel. The width proof (§2) confines every
+  real cell strictly above it, so **the sentinel never wins a `max`** — the *result* depends only on
+  real cell values, and those are exactly the values the proof guarantees no backend mis-computes.
 
-The **scalar reference kernel realizes this same model** using `i32` with headroom instead of
-saturation: unreachable cells use `NEG = i32::MIN / 4` as −∞ (chosen so repeated gap subtractions
-cannot underflow), and the width proof guarantees no real cell reaches even `i32` saturation. A
-narrow saturating backend and the wide scalar oracle therefore compute the *same maxima over the
-same real values*, which is what makes them bit-identical.
+There are two arithmetic realizations of that invariant, and the width proof reserves the right
+usable range for each:
+
+- **`i8` / `i16` — saturating.** Adds/subtracts saturate at `W::MIN` / `W::MAX`. The sentinel is
+  `W::MIN`; real scores are confined to `[W::MIN + 1, W::MAX]`. A value driven past the range
+  saturates toward `W::MIN` and so still loses every `max` — saturation *is* the mechanism that
+  keeps out-of-range intermediates harmless.
+- **`i32` — plain (non-saturating).** There is no saturating 32-bit SIMD add/subtract, so the `i32`
+  kernels use wrapping arithmetic. Two consequences the proof and kernels must (and do) honour:
+  - The sentinel is **`i32::MIN / 4`**, not `i32::MIN` — chosen low enough to sit below every real
+    cell yet high enough that subtracting a gap penalty from it does not wrap. The usable magnitude
+    is therefore `|i32::MIN / 4| − 1`, **not** `i32::MAX`; the width proof rejects any input whose
+    scores could reach the sentinel (`ScoreRangeTooWide`), because a real cell colliding with the
+    sentinel would let it wrongly win a `max`.
+  - Without saturation, an intermediate that leaves the range *wraps* instead of pinning. The proof
+    reserves one step of headroom so a single `cell ± penalty` / `diag = cell + sub` cannot wrap;
+    and any kernel that subtracts a sentinel **repeatedly without re-anchoring** (the striped
+    lazy-F) explicitly floors the running value at the sentinel each step, restoring the pinning that
+    saturation would otherwise provide.
+
+The **scalar reference kernel** is the `i32` realization (`NEG = i32::MIN / 4`, wrapping arithmetic,
+per-cell re-anchored so it never drifts). A narrow saturating backend, a wide `i32` backend, and the
+scalar oracle therefore compute the *same maxima over the same real values*, which is what makes
+them bit-identical.
 
 The gap-penalty convention is fixed: a gap of length `n` costs `gap_open + (n - 1) * gap_ext`
 (Opal's convention). `gap_open >= gap_ext >= 0` is enforced at construction (Opal issue #28), so
@@ -158,13 +178,15 @@ details, never result details.**
 
 - **Differential vs an independent oracle:** proptest compares the kernel against an exhaustive
   brute-force scorer over all short inputs (`tests/properties.rs`, `tests/alignment.rs`).
-- **Cross-backend agreement hook:** `assert_all_backends_agree` (`tests/properties.rs`) is a single
-  call today; every SIMD backend drops into it at M2 and every property then covers them.
+- **Cross-backend agreement:** the differential proptests force each backend (`Scalar`, `Sse41`,
+  `Avx2`, `Neon`) via `.backend(...)` and assert full-struct equality against the scalar oracle, at
+  each score width (`scan_identical_across_simd_backends*`, the `i16`/`i32`, escalation, and
+  large-alphabet variants in `tests/properties.rs`).
 - **Width proof, final and intermediate:** `width_proof_contains_actual_score` and
   `intermediate_cells_fit_the_proven_width`.
 - **Tie-breaks and the cross-sequence reduction:** covered by the differential `scan`-vs-reference
   tests and dedicated tie-break cases.
 - **Backend override for CI:** `HYALITE_BACKEND` and the builder `.backend()` let CI force each
-  backend in turn; the CI matrix expands to `sse4.1`/`avx2`/`neon` at M2.
+  backend in turn; the CI matrix runs the suite on x86-64 (`sse4.1`/`avx2`) and aarch64 (`neon`).
 - **Real-data composition:** phiX/lambda/CR4 tests (`tests/real_data.rs`) exercise the invariants on
   homopolymers and real adapter overlaps, not just random bytes.
