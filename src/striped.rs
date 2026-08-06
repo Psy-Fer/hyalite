@@ -205,6 +205,13 @@ fn farrar_score<L: StripedLanes>(
     let vgo = L::splat(L::sat(go_i));
     let vge = L::splat(L::sat(ge_i));
     let zero = L::splat(zero_e);
+    // `-∞` splat, used to floor the lazy-F carry at the sentinel. At `i8`/`i16` the saturating
+    // `subs` already pins at `Elem::MIN`, so this `max` is a harmless no-op; at `i32` `subs` is plain
+    // (non-saturating), so an F lane extended across a whole stripe (`seg` subtractions with no
+    // re-anchor) would drift below `i32::MIN` and *wrap* — flooring it here keeps it at the sentinel.
+    // Safe because the width proof keeps every real cell strictly above `NEG` (see `width.rs`), so a
+    // floored lane still loses every `max` against a real cell, matching the scalar oracle.
+    let vneg = L::splat(neg);
     let mut vmax = zero; // SW: the answer is the max over all cells
     // HW/OV last row includes the left-border cell `H[m][0]` (`j = 0`), which is exactly the
     // initial last-row entry before any target column is processed.
@@ -258,7 +265,7 @@ fn farrar_score<L: StripedLanes>(
                     let vh = L::max(L::load(&h_store[v * p..]), vf);
                     L::store(vh, &mut h_store[v * p..]);
                     vmax = L::max(vmax, vh);
-                    vf = L::subs(vf, vge);
+                    vf = L::max(L::subs(vf, vge), vneg); // floor at the sentinel (see `vneg`)
                 }
                 if !L::any_gt(vf, zero) {
                     break;
@@ -280,7 +287,7 @@ fn farrar_score<L: StripedLanes>(
                 for v in 0..seg {
                     let vh = L::max(L::load(&h_store[v * p..]), vf);
                     L::store(vh, &mut h_store[v * p..]);
-                    vf = L::subs(vf, vge);
+                    vf = L::max(L::subs(vf, vge), vneg); // floor at the sentinel (see `vneg`)
                 }
                 if L::hmax(vf) <= hmin {
                     break;
@@ -1546,6 +1553,32 @@ mod tests {
             let want = align_core(&q, &t, &s, mode, &mut DpBuffers::new()).0;
             assert_eq!(got, want, "align_pair i32 {mode} q={q:?} t={t:?}");
         }
+    }
+
+    /// Regression: the striped lazy-F subtracts `gap_ext` once per stripe with **no in-loop
+    /// re-anchor**, up to `seg` times per pass. At `i8`/`i16` the *saturating* `subs` pins an
+    /// over-decremented lane at `Elem::MIN`; at `i32` (plain, non-saturating) it would drift below
+    /// `i32::MIN` and **wrap** for a long query with a moderate `gap_ext` — even though the width
+    /// proof accepts the input. Flooring `vf` at the sentinel fixes it. Here `seg * gap_ext` (~2.5e9
+    /// on the 4-lane hardware path, larger for the 1/3-lane stand-ins) far exceeds the i32 range, so
+    /// an unfloored kernel diverges from the scalar oracle. Proven to bite: reverting the floor makes
+    /// this fail.
+    #[test]
+    fn lazy_f_i32_does_not_wrap_over_a_long_query() {
+        // SW, match +1 / mismatch -1, gap_open = gap_ext = 2e7. SW's proven magnitude is `gap_open`
+        // (2e7 << the i32 sentinel ceiling), so it is a legal i32 input.
+        let s = Scoring::new(4, id_matrix(4, 1, -1), 20_000_000, 20_000_000).unwrap();
+        let q: Vec<u8> = (0..500u32).map(|i| (i % 4) as u8).collect();
+        let t: Vec<u8> = (0..120u32).map(|i| ((i * 3 + 1) % 4) as u8).collect();
+        assert_eq!(
+            s.required_width(Mode::Sw, q.len(), t.len()),
+            Ok(crate::ScoreWidth::I32),
+            "test is only meaningful if it genuinely proves i32"
+        );
+        // `assert_matches_oracle` compares the scalar stand-in (lane counts 1/3/4) AND the hardware
+        // SIMD path against `align_core` — the genuinely independent oracle (per-cell E/F, no lazy-F
+        // drift), which is correct here (all real cells stay above the sentinel).
+        assert_matches_oracle(&q, &t, &s);
     }
 
     /// A mismatch below `-127` must clamp, not wrap (the case is in scope for `SW`).

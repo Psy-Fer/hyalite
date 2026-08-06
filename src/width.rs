@@ -9,8 +9,13 @@
 //! necessary. Over-provisioning costs a little performance; it never costs correctness.
 //! Tightening the bound is future work and cannot change results, only the width selected.
 //!
-//! The most-negative representable value of each width is reserved as a saturation sentinel, so
-//! the usable magnitude is `TYPE::MAX` (e.g. `[-127, 127]` for `i8`).
+//! Each width reserves a `-∞` sentinel below every real cell. For the **saturating** `i8`/`i16`
+//! backends that is `TYPE::MIN`, so the usable magnitude is `TYPE::MAX` (e.g. `[-127, 127]` for
+//! `i8`). The `i32` path is **non-saturating** (x86 has no saturating 32-bit add/sub), so its
+//! sentinel is `i32::MIN / 4` — chosen with headroom so repeated gap subtractions cannot wrap —
+//! and the usable magnitude is correspondingly `|i32::MIN / 4| - 1`, **not** `i32::MAX`. A score
+//! that would push a real cell to or past the sentinel makes it no longer act as `-∞`, so such
+//! inputs are rejected with [`Error::ScoreRangeTooWide`] rather than computed wrongly.
 
 use crate::error::{Error, Result};
 use crate::mode::Mode;
@@ -23,7 +28,8 @@ pub enum ScoreWidth {
     I8,
     /// 16-bit lanes: usable score magnitude `<= 32767`.
     I16,
-    /// 32-bit lanes: usable score magnitude `<= 2_147_483_647`.
+    /// 32-bit lanes (non-saturating): usable score magnitude `<= 536_870_911` (`|i32::MIN / 4| - 1`),
+    /// because the `-∞` sentinel is `i32::MIN / 4`, not `i32::MIN` — see [`ScoreWidth::max_abs`].
     I32,
 }
 
@@ -31,13 +37,20 @@ impl ScoreWidth {
     /// Widths from narrowest to widest — the escalation order.
     const ORDER: [ScoreWidth; 3] = [ScoreWidth::I8, ScoreWidth::I16, ScoreWidth::I32];
 
-    /// The largest score magnitude this width can hold, with the sentinel reserved.
+    /// The largest score magnitude this width can hold, with the `-∞` sentinel reserved below every
+    /// real cell.
+    ///
+    /// For the saturating `i8`/`i16` backends the sentinel is `TYPE::MIN`, so the usable magnitude is
+    /// `TYPE::MAX`. The `i32` path is non-saturating and reserves `i32::MIN / 4` as its sentinel (see
+    /// `kernel::NEG` / `inter::Elem::NEG`, chosen so repeated gap subtractions cannot wrap); its
+    /// usable magnitude therefore stops one below `|i32::MIN / 4|`. A larger score would let a real
+    /// cell reach the sentinel — no longer a valid `-∞` — so the width proof rejects it.
     #[must_use]
     pub const fn max_abs(self) -> i64 {
         match self {
             ScoreWidth::I8 => i8::MAX as i64,
             ScoreWidth::I16 => i16::MAX as i64,
-            ScoreWidth::I32 => i32::MAX as i64,
+            ScoreWidth::I32 => (i32::MIN / 4).unsigned_abs() as i64 - 1,
         }
     }
 
@@ -165,7 +178,9 @@ mod tests {
     fn width_constants_are_sane() {
         assert_eq!(ScoreWidth::I8.max_abs(), 127);
         assert_eq!(ScoreWidth::I16.max_abs(), 32_767);
-        assert_eq!(ScoreWidth::I32.max_abs(), 2_147_483_647);
+        // i32 reserves `i32::MIN / 4` as its non-saturating sentinel, so the usable magnitude is
+        // `|i32::MIN / 4| - 1`, not `i32::MAX`.
+        assert_eq!(ScoreWidth::I32.max_abs(), 536_870_911);
         assert!(ScoreWidth::I8 < ScoreWidth::I16 && ScoreWidth::I16 < ScoreWidth::I32);
         assert_eq!(
             (
@@ -186,12 +201,62 @@ mod tests {
             (128, Some(ScoreWidth::I16)),
             (32_767, Some(ScoreWidth::I16)),
             (32_768, Some(ScoreWidth::I32)),
-            (2_147_483_647, Some(ScoreWidth::I32)),
-            (2_147_483_648, None),
+            (536_870_911, Some(ScoreWidth::I32)), // |i32::MIN / 4| - 1, the i32 sentinel ceiling
+            (536_870_912, None),                  // one past it: no width fits
+            (2_147_483_647, None),
             (i64::MAX, None),
         ] {
             assert_eq!(ScoreWidth::narrowest_for(mag), expect, "magnitude {mag}");
         }
+    }
+
+    #[test]
+    fn i32_rejects_scores_that_reach_the_non_saturating_sentinel() {
+        // The i32 path is non-saturating with a `-∞` sentinel of `i32::MIN / 4`. If a real cell can
+        // reach (or pass) that magnitude the sentinel is no longer below all real cells, so it can
+        // be wrongly selected in a `max` and the plain arithmetic can wrap — the reviewer reproduced
+        // a NW score returning `-536870912` (exactly the sentinel) instead of the true `-600000000`.
+        // So any input whose proven magnitude exceeds `|i32::MIN / 4| - 1 = 536_870_911` must be
+        // rejected with `ScoreRangeTooWide`, not computed. Regression for the reviewed overflow bug.
+        let ceiling = ScoreWidth::I32.max_abs(); // 536_870_911
+        assert_eq!(ceiling, 536_870_911);
+
+        // Reviewer's exact repro: NW 1x1, all-zero matrix, gap_open = 2e9 — the penalised border
+        // reaches -2e9, far past the sentinel.
+        assert_eq!(
+            required_width(Mode::Nw, 0, 0, 2_000_000_000, 1, 1, 1),
+            Err(Error::ScoreRangeTooWide {
+                bound: 2_000_000_001
+            }),
+            "huge gap_open must be rejected, not silently wrapped"
+        );
+        // The striped lazy-F repro: SW with a huge symmetric gap.
+        assert!(matches!(
+            required_width(Mode::Sw, -1, 1, 1_100_000_000, 1_100_000_000, 9, 4),
+            Err(Error::ScoreRangeTooWide { .. })
+        ));
+        // A huge substitution entry likewise (diag = cell + entry reaches the sentinel).
+        assert!(matches!(
+            required_width(Mode::Nw, -2_000_000_000, 1, 1, 1, 2, 2),
+            Err(Error::ScoreRangeTooWide { .. })
+        ));
+
+        // A large-but-safe i32 input is still accepted (the ceiling is not over-eager): a 30k-length
+        // global alignment at match +1 proves i32 with magnitude far below the sentinel.
+        assert_eq!(
+            required_width(Mode::Nw, -1, 1, 2, 1, 30_000, 30_000).unwrap(),
+            ScoreWidth::I32
+        );
+        // And an input landing exactly on the ceiling proves i32; one past it is rejected. SW's
+        // negative bound is `gap_open`, so `gap_open == ceiling` sits right at the limit.
+        assert_eq!(
+            required_width(Mode::Sw, -1, 1, ceiling as i32, 1, 4, 4).unwrap(),
+            ScoreWidth::I32
+        );
+        assert!(matches!(
+            required_width(Mode::Sw, -1, 1, ceiling as i32 + 1, 1, 4, 4),
+            Err(Error::ScoreRangeTooWide { .. })
+        ));
     }
 
     #[test]
