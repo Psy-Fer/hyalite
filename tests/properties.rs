@@ -14,7 +14,7 @@ mod common;
 use common::{ALL_MODES, brute, reference_scan};
 use hyalite::{
     Backend, BackendChoice, BestHit, Database, Layout, LayoutChoice, Mode, ScoreWidth, Scoring,
-    Scratch, SearchType, align_pair,
+    Scratch, SearchType, align, align_pair, align_pair_span,
 };
 use proptest::prelude::*;
 
@@ -752,6 +752,139 @@ proptest! {
                     prop_assert_eq!(&ga, &wa, "{} scan_all {} {}", b, mode, st);
                     prop_assert_eq!(&gsc, &ws, "{} scan_scores {} {}", b, mode, st);
                 }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// `align_pair_span` (starts-only local alignment): its score and half-open ends must equal the
+    /// full traceback's, and its span must be **self-consistent** — a global (`NW`) alignment of the
+    /// reported aligned substrings scores exactly `span.score`. That consistency oracle is what
+    /// guarantees the returned `(start, end)` bound a single genuine optimal local alignment (not two
+    /// halves of different equal-scoring ones). Starts also match the traceback here; on ties the
+    /// contract only promises consistency, so if that ever diverges this asserts the weaker invariant.
+    #[test]
+    fn align_pair_span_is_consistent_and_matches_traceback((s, q, t) in scheme_and_pair(4, -8..=8, 30)) {
+        let scoring = s.scoring();
+        let span = align_pair_span(&q, &t, &scoring).unwrap();
+        let full = align(&q, &t, &scoring, Mode::Sw, usize::MAX).unwrap();
+
+        // Score always matches the traceback (and hence align_pair SW).
+        prop_assert_eq!(span.score, full.score, "score");
+
+        if span.score == 0 {
+            // Empty alignment: start == end on both axes.
+            prop_assert_eq!(span.query_start, span.query_end);
+            prop_assert_eq!(span.target_start, span.target_end);
+            return Ok(());
+        }
+
+        // Ends match the traceback (both half-open).
+        prop_assert_eq!(span.query_end, full.query_end, "query_end");
+        prop_assert_eq!(span.target_end, full.target_end, "target_end");
+
+        // The span bounds a real optimal alignment: NW of the aligned substrings recovers the score.
+        let qsub = &q[span.query_start..span.query_end];
+        let tsub = &t[span.target_start..span.target_end];
+        let nw = align_pair(qsub, tsub, &scoring, Mode::Nw, SearchType::Score)
+            .unwrap()
+            .score;
+        prop_assert_eq!(nw, span.score, "span is not a consistent optimal alignment");
+
+        // Starts agree with the traceback too (see `align_pair_span_equals_traceback_exhaustive`,
+        // which verifies this holds for *every* short pair, not just random ones).
+        prop_assert_eq!(span.query_start, full.query_start, "query_start");
+        prop_assert_eq!(span.target_start, full.target_start, "target_start");
+    }
+}
+
+#[test]
+fn align_pair_span_hand_cases() {
+    // match +2, mismatch -1, gap 2/1 over {A,C,G,T}.
+    let scoring = Scoring::new(4, common::identity_matrix(4, 2, -1), 2, 1).unwrap();
+    // Query aligns to an interior window of the target: target = X X q q q X X.
+    let q = vec![0u8, 1, 2];
+    let t = vec![3u8, 3, 0, 1, 2, 3, 3];
+    let span = align_pair_span(&q, &t, &scoring).unwrap();
+    assert_eq!(span.score, 6, "3 matches at +2");
+    assert_eq!(
+        (span.query_start, span.query_end),
+        (0, 3),
+        "whole query, half-open"
+    );
+    assert_eq!(
+        (span.target_start, span.target_end),
+        (2, 5),
+        "interior window [2, 5)"
+    );
+
+    // Nothing aligns above zero (all-mismatch, steep gaps) ⇒ the empty span.
+    let neg = Scoring::new(4, common::identity_matrix(4, 1, -9), 9, 9).unwrap();
+    let empty = align_pair_span(&[0u8, 0], &[1u8, 1], &neg).unwrap();
+    assert_eq!(empty.score, 0);
+    assert_eq!(empty.query_start, empty.query_end);
+    assert_eq!(empty.target_start, empty.target_end);
+
+    // Empty inputs are always the empty span.
+    assert_eq!(align_pair_span(&[], &t, &scoring).unwrap().score, 0);
+    assert_eq!(align_pair_span(&q, &[], &scoring).unwrap().score, 0);
+}
+
+/// Exhaustive guard for `align_pair_span`: over **every** pair up to length 4 (three-letter
+/// alphabet) and several scorings — including a free-extension (`gap_ext = 0`) scheme — the returned
+/// span equals the full traceback's exactly (score, both ends, both starts) and is self-consistent.
+/// The random property test above widens the length/entry range; this pins the tie-break behaviour
+/// on the full short-input space where equal-scoring alignments are most common.
+#[test]
+fn align_pair_span_equals_traceback_exhaustive() {
+    use common::{all_sequences, identity_matrix};
+    let scorings = [
+        Scoring::new(3, identity_matrix(3, 2, -1), 2, 1).unwrap(),
+        Scoring::new(3, identity_matrix(3, 1, -1), 1, 1).unwrap(),
+        Scoring::new(3, identity_matrix(3, 3, -2), 4, 1).unwrap(),
+        Scoring::new(3, identity_matrix(3, 2, -3), 1, 0).unwrap(), // free gap extension
+    ];
+    let seqs = all_sequences(3, 4);
+    for sc in &scorings {
+        for q in &seqs {
+            for t in &seqs {
+                let span = align_pair_span(q, t, sc).unwrap();
+                let full = align(q, t, sc, Mode::Sw, usize::MAX).unwrap();
+                assert_eq!(span.score, full.score, "score q={q:?} t={t:?}");
+                if span.score == 0 {
+                    assert_eq!(span.query_start, span.query_end);
+                    assert_eq!(span.target_start, span.target_end);
+                    continue;
+                }
+                assert_eq!(
+                    (
+                        span.query_start,
+                        span.query_end,
+                        span.target_start,
+                        span.target_end
+                    ),
+                    (
+                        full.query_start,
+                        full.query_end,
+                        full.target_start,
+                        full.target_end
+                    ),
+                    "span vs traceback q={q:?} t={t:?}"
+                );
+                // Self-consistency: NW of the aligned substrings recovers the score.
+                let nw = align_pair(
+                    &q[span.query_start..span.query_end],
+                    &t[span.target_start..span.target_end],
+                    sc,
+                    Mode::Nw,
+                    SearchType::Score,
+                )
+                .unwrap()
+                .score;
+                assert_eq!(nw, span.score, "inconsistent span q={q:?} t={t:?}");
             }
         }
     }

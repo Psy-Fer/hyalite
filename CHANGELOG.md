@@ -8,6 +8,16 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ### Added
 
+- `align_pair_span`: the local (`SW`) alignment **span** — score plus the half-open aligned region
+  in *both* sequences (`query_start`/`query_end`, `target_start`/`target_end`) — as a new
+  [`LocalSpan`] result, without the alignment operations. It recovers both starts *and* both ends in
+  a single forward Smith-Waterman pass with start tracking, using `O(target)` working memory: no
+  traceback matrix, linear-space checkpointing, or CIGAR. This is the cheap way to get the aligned
+  region's coordinates (e.g. bwa-style mate rescue) when the operations are not needed. The reported
+  span is always self-consistent — a global (`NW`) alignment of the two aligned substrings scores
+  exactly `score` — and matches the full [`align`] traceback's span (verified exhaustively for short
+  pairs and by property tests).
+
 - SIMD acceleration for **large alphabets** (`alphabet_len > 16`, e.g. proteins): the byte-shuffle
   Gathered gather can only index a 16-entry table, but the Precomputed layout looks scores up with a
   direct load and so serves any alphabet at any width. A database whose alphabet exceeds 16 (which

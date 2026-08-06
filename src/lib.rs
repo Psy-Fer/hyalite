@@ -52,11 +52,11 @@ pub use align::{AlignOp, AlignedHit, Alignment, align};
 pub use backend::{BACKEND_ENV_VAR, Backend, BackendChoice};
 pub use database::{Database, DatabaseBuilder, Scratch};
 pub use error::{Error, Result};
-pub use hit::BestHit;
+pub use hit::{BestHit, LocalSpan};
 pub use inter::{Layout, LayoutChoice};
 pub use kernel::{
     PairScratch, align_pair, align_pair_position_max, align_pair_position_max_with,
-    align_pair_with, align_pairs, score2,
+    align_pair_span, align_pair_with, align_pairs, score2,
 };
 pub use mode::Mode;
 pub use scoring::Scoring;

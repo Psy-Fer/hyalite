@@ -29,7 +29,7 @@
 //! so it is independent of any lane order — a load-bearing part of the determinism contract.
 
 use crate::error::{Error, Result};
-use crate::hit::BestHit;
+use crate::hit::{BestHit, LocalSpan};
 use crate::mode::Mode;
 use crate::scoring::Scoring;
 use crate::search::SearchType;
@@ -571,6 +571,140 @@ pub fn align_pair_position_max_with(
         db_index: 0,
         query_end: None,
         target_end,
+    })
+}
+
+/// The local (`SW`) alignment **span** — score plus the half-open aligned region in each sequence —
+/// of `query` against `target`, without the alignment operations (see [`LocalSpan`]).
+///
+/// This is the cheap way to get *both* ends **and** both starts of the optimal local alignment: a
+/// single forward Smith-Waterman pass that tracks, alongside the score, the start coordinate of the
+/// best alignment ending at each cell. It uses `O(target)` working memory — no traceback matrix, no
+/// linear-space checkpointing, and no CIGAR — where [`align`](crate::align) would. The reported span
+/// is always **self-consistent**: `query[query_start..query_end]` aligned globally against
+/// `target[target_start..target_end]` scores exactly `score`. `SW`/local only (starts are only
+/// well-defined for a local alignment; the other modes' start coordinates are fixed by the mode).
+///
+/// The score and end positions equal those of `align_pair(.., Sw, ScoreEnd)`, and the full span
+/// matches what [`align`](crate::align)'s traceback reports (verified exhaustively for all short
+/// pairs and by property tests on larger ones). The *guaranteed* contract on ties is the
+/// self-consistency above (the start belongs to the same optimal alignment as the end); the
+/// tie-break is fixed and deterministic.
+///
+/// # Errors
+///
+/// - [`Error::SymbolOutOfRange`] if any symbol is `>= scoring.alphabet_len()`.
+/// - [`Error::ScoreRangeTooWide`] if the reachable score could overflow `i32` for these lengths.
+pub fn align_pair_span(query: &[u8], target: &[u8], scoring: &Scoring) -> Result<LocalSpan> {
+    let alphabet_len = scoring.alphabet_len();
+    for &sym in query.iter().chain(target.iter()) {
+        if sym as usize >= alphabet_len {
+            return Err(Error::SymbolOutOfRange {
+                symbol: sym as usize,
+                alphabet_len,
+            });
+        }
+    }
+    scoring.required_width(Mode::Sw, query.len(), target.len())?;
+
+    let (m, n) = (query.len(), target.len());
+    if m == 0 || n == 0 {
+        return Ok(LocalSpan::EMPTY);
+    }
+    let (go, ge) = (scoring.gap_open(), scoring.gap_ext());
+    let cols = n + 1;
+
+    // Two ping-ponged H rows plus, in lock-step, the 0-based `(query_start, target_start)` of the
+    // best local alignment ending at each cell. `F` is carried down each column (with its start);
+    // `E` is carried across each row (a scalar). Start values are only ever *read* for cells whose
+    // score is positive — a real alignment — so the `(0, 0)` fill for empty (score-0) cells is inert.
+    let mut h_prev = vec![0i32; cols];
+    let mut h_cur = vec![0i32; cols];
+    let mut hs_prev = vec![(0usize, 0usize); cols];
+    let mut hs_cur = vec![(0usize, 0usize); cols];
+    let mut f = vec![NEG; cols];
+    let mut fs = vec![(0usize, 0usize); cols];
+
+    // Best cell under the SW tie-break: maximise score, then minimise `(target_end, query_end)` —
+    // identical to `reduce_answer`/`BestHit`, so the reported ends match `align_pair(.., ScoreEnd)`.
+    // The floor is `0` (the empty alignment).
+    let mut best_score = 0i32;
+    let mut best_row = 0usize; // grid row = exclusive query end
+    let mut best_col = 0usize; // grid col = exclusive target end
+    let mut best_start = (0usize, 0usize);
+
+    for i in 1..=m {
+        let qrow = scoring.score_row(query[i - 1] as usize);
+        h_cur[0] = 0;
+        hs_cur[0] = (0, 0);
+        let mut e = NEG;
+        let mut es = (0usize, 0usize);
+        for j in 1..=n {
+            // E: gap in the query (horizontal, consumes target). Open from H[i][j-1] or extend E.
+            let e_open = h_cur[j - 1] - go;
+            let e_ext = e - ge;
+            if e_open >= e_ext {
+                e = e_open;
+                es = hs_cur[j - 1];
+            } else {
+                e = e_ext;
+            }
+            // F: gap in the target (vertical, consumes query). Open from H[i-1][j] or extend F.
+            let f_open = h_prev[j] - go;
+            let f_ext = f[j] - ge;
+            if f_open >= f_ext {
+                f[j] = f_open;
+                fs[j] = hs_prev[j];
+            } else {
+                f[j] = f_ext;
+            }
+            // H = max(diag, E, F, 0), with the start of whichever term wins. Priority on ties:
+            // diag > E > F (a fixed, deterministic order); the `0` floor means "empty" (fresh start).
+            let diag = h_prev[j - 1] + qrow[target[j - 1] as usize];
+            let (mut cell, mut start) = (0i32, (i - 1, j - 1)); // 0 => empty; start unused unless > 0
+            if diag > cell {
+                cell = diag;
+                // A diagonal step onto a `0` (empty) predecessor *starts* the alignment at this pair;
+                // otherwise it inherits the predecessor's start.
+                start = if h_prev[j - 1] > 0 {
+                    hs_prev[j - 1]
+                } else {
+                    (i - 1, j - 1)
+                };
+            }
+            if e > cell {
+                cell = e;
+                start = es;
+            }
+            if f[j] > cell {
+                cell = f[j];
+                start = fs[j];
+            }
+            h_cur[j] = cell;
+            hs_cur[j] = start;
+
+            // Global best: same tie-break as `reduce_answer` (max score, then min (col, row)).
+            let better = cell > best_score || (cell == best_score && (j, i) < (best_col, best_row));
+            if cell > 0 && better {
+                best_score = cell;
+                best_row = i;
+                best_col = j;
+                best_start = start;
+            }
+        }
+        std::mem::swap(&mut h_prev, &mut h_cur);
+        std::mem::swap(&mut hs_prev, &mut hs_cur);
+    }
+
+    if best_score == 0 {
+        return Ok(LocalSpan::EMPTY);
+    }
+    Ok(LocalSpan {
+        score: best_score,
+        query_start: best_start.0,
+        query_end: best_row, // grid row is one past the last aligned query symbol
+        target_start: best_start.1,
+        target_end: best_col,
     })
 }
 
