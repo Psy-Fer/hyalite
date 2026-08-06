@@ -28,6 +28,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "traceback"
+path = "fuzz_targets/traceback.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent crate's build: `cargo build`/`cargo test` on stable never descend here,
 # and the core crate stays dependency-free. Fuzzing is run explicitly via `cargo +nightly fuzz`.
 [workspace]
