@@ -443,6 +443,62 @@ proptest! {
     }
 }
 
+/// Deterministic guard that the i32 inter-sequence cross-backend path is genuinely exercised — the
+/// `scheme_db_query_verywide` proptests reach i32 in ~all cases today, but that is a property of the
+/// generator's distribution; if a future tweak stopped reaching i32 they would pass **vacuously**.
+/// This pins a known-i32 small-alphabet database (entries ±5000, length 12 → magnitude 60000 > i16)
+/// and checks every SIMD backend against scalar for `scan`/`scan_all`, both search types, all modes.
+#[test]
+fn i32_inter_cross_backend_is_exercised() {
+    let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+        .into_iter()
+        .filter(|b| b.is_available())
+        .collect();
+    if simd.is_empty() {
+        return;
+    }
+    let scoring = Scoring::new(4, common::identity_matrix(4, 5000, -3000), 600, 100).unwrap();
+    let db_seqs: Vec<Vec<u8>> = (0..6u32)
+        .map(|k| (0..12u32).map(|i| ((i + k) % 4) as u8).collect())
+        .collect();
+    let q: Vec<u8> = (0..12u32).map(|i| ((i * 3 + 1) % 4) as u8).collect();
+
+    for mode in ALL_MODES {
+        // Confirm this really is an i32-width database (non-vacuity).
+        assert_eq!(
+            scoring.required_width(mode, 12, 12),
+            Ok(ScoreWidth::I32),
+            "{mode} must prove i32 for this guard to be meaningful"
+        );
+        for st in [SearchType::Score, SearchType::ScoreEnd] {
+            let build = |b: Backend| {
+                Database::builder()
+                    .sequences(&db_seqs)
+                    .scoring(scoring.clone())
+                    .mode(mode)
+                    .search_type(st)
+                    .max_query_len(12)
+                    .backend(BackendChoice::Force(b))
+                    .build()
+                    .unwrap()
+            };
+            let oracle = build(Backend::Scalar);
+            let mut os = Scratch::new(&oracle);
+            let want = oracle.scan(&mut os, &q);
+            let mut wa = Vec::new();
+            oracle.scan_all(&mut os, &q, &mut wa);
+            for &b in &simd {
+                let db = build(b);
+                let mut gs = Scratch::new(&db);
+                assert_eq!(db.scan(&mut gs, &q), want, "{b} scan {mode} {st}");
+                let mut ga = Vec::new();
+                db.scan_all(&mut gs, &q, &mut ga);
+                assert_eq!(ga, wa, "{b} scan_all {mode} {st}");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-target scan_all
 // ---------------------------------------------------------------------------
@@ -740,10 +796,17 @@ proptest! {
                 let (mut wa, mut ws) = (Vec::new(), Vec::new());
                 oracle.scan_all(&mut os, &q, &mut wa);
                 oracle.scan_scores(&mut os, &q, &mut ws);
+                let max_t = db_seqs.iter().map(Vec::len).max().unwrap_or(0);
                 for &b in &simd {
                     let db = build(b);
-                    // Large alphabet ⇒ Precomputed (never Gathered).
+                    // Large alphabet ⇒ Precomputed (never Gathered), at the proven width (pin the
+                    // width so "large-alphabet at i16" doesn't rest on luck of the random scoring).
                     prop_assert_eq!(db.layout(), Some(Layout::Precomputed), "{} {} {}", b, mode, st);
+                    prop_assert_eq!(
+                        db.score_width(),
+                        scoring.required_width(mode, 14, max_t).unwrap(),
+                        "{} width {} {}", b, mode, st
+                    );
                     let mut gs = Scratch::new(&db);
                     prop_assert_eq!(db.scan(&mut gs, &q), want, "{} scan {} {}", b, mode, st);
                     let (mut ga, mut gsc) = (Vec::new(), Vec::new());
@@ -752,6 +815,69 @@ proptest! {
                     prop_assert_eq!(&ga, &wa, "{} scan_all {} {}", b, mode, st);
                     prop_assert_eq!(&gsc, &ws, "{} scan_scores {} {}", b, mode, st);
                 }
+            }
+        }
+    }
+}
+
+/// Large alphabet (20 symbols) at **i32** width: the audit found the large-alphabet SIMD path was
+/// covered at i8/i16 but never i32. A big diagonal (`+3000`) over 14-long sequences proves i32
+/// (`14·3000 = 42000 > 32767`); the alphabet (> 16) forces Precomputed. Every SIMD backend must
+/// match the scalar oracle for `scan`/`scan_all`/`scan_scores`, both search types, all modes.
+#[test]
+fn large_alphabet_at_i32_matches_scalar() {
+    let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+        .into_iter()
+        .filter(|b| b.is_available())
+        .collect();
+    if simd.is_empty() {
+        return;
+    }
+    let al = 20usize;
+    let mut matrix = vec![-1000i32; al * al];
+    for d in 0..al {
+        matrix[d * al + d] = 3000;
+    }
+    let scoring = Scoring::new(al, matrix, 500, 100).unwrap();
+    // Uniform length 14 → uniform i32 (not escalated), so this exercises the i32 large-alphabet
+    // Precomputed kernel directly.
+    let db_seqs: Vec<Vec<u8>> = (0..5u32)
+        .map(|k| (0..14u32).map(|i| ((i + k) % al as u32) as u8).collect())
+        .collect();
+    let q: Vec<u8> = (0..14u32)
+        .map(|i| ((i * 3 + 1) % al as u32) as u8)
+        .collect();
+
+    for mode in ALL_MODES {
+        for st in [SearchType::Score, SearchType::ScoreEnd] {
+            let build = |b: Backend| {
+                Database::builder()
+                    .sequences(&db_seqs)
+                    .scoring(scoring.clone())
+                    .mode(mode)
+                    .search_type(st)
+                    .max_query_len(14)
+                    .backend(BackendChoice::Force(b))
+                    .build()
+                    .unwrap()
+            };
+            let oracle = build(Backend::Scalar);
+            let mut os = Scratch::new(&oracle);
+            let want = oracle.scan(&mut os, &q);
+            let (mut wa, mut ws) = (Vec::new(), Vec::new());
+            oracle.scan_all(&mut os, &q, &mut wa);
+            oracle.scan_scores(&mut os, &q, &mut ws);
+            for &b in &simd {
+                let db = build(b);
+                assert_eq!(db.score_width(), ScoreWidth::I32, "{b} {mode} {st}");
+                assert_eq!(db.layout(), Some(Layout::Precomputed), "{b} {mode} {st}");
+                let mut gs = Scratch::new(&db);
+                assert_eq!(db.scan(&mut gs, &q), want, "{b} scan {mode} {st}");
+                let (mut ga, mut gsc) = (Vec::new(), Vec::new());
+                db.scan_all(&mut gs, &q, &mut ga);
+                db.scan_scores(&mut gs, &q, &mut gsc);
+                assert_eq!(ga, wa, "{b} scan_all {mode} {st}");
+                assert_eq!(gsc, ws, "{b} scan_scores {mode} {st}");
             }
         }
     }
@@ -786,18 +912,18 @@ proptest! {
         prop_assert_eq!(span.query_end, full.query_end, "query_end");
         prop_assert_eq!(span.target_end, full.target_end, "target_end");
 
-        // The span bounds a real optimal alignment: NW of the aligned substrings recovers the score.
+        // The GUARANTEED contract on the start: the span bounds a real optimal alignment — a global
+        // (NW) alignment of the aligned substrings recovers the score exactly. This is the
+        // independent oracle for `(start, end)` consistency and holds even on ties (where the *exact*
+        // start `align_pair_span` picks may legitimately differ from the traceback's). Exact
+        // start-equality with the traceback is verified separately, and only where it is a theorem —
+        // over *every* short pair — by `align_pair_span_equals_traceback_exhaustive`.
         let qsub = &q[span.query_start..span.query_end];
         let tsub = &t[span.target_start..span.target_end];
         let nw = align_pair(qsub, tsub, &scoring, Mode::Nw, SearchType::Score)
             .unwrap()
             .score;
         prop_assert_eq!(nw, span.score, "span is not a consistent optimal alignment");
-
-        // Starts agree with the traceback too (see `align_pair_span_equals_traceback_exhaustive`,
-        // which verifies this holds for *every* short pair, not just random ones).
-        prop_assert_eq!(span.query_start, full.query_start, "query_start");
-        prop_assert_eq!(span.target_start, full.target_start, "target_start");
     }
 }
 
@@ -831,6 +957,49 @@ fn align_pair_span_hand_cases() {
     // Empty inputs are always the empty span.
     assert_eq!(align_pair_span(&[], &t, &scoring).unwrap().score, 0);
     assert_eq!(align_pair_span(&q, &[], &scoring).unwrap().score, 0);
+
+    // i32-width scores: the span DP computes in i32, so a large-magnitude case must still produce
+    // the correct score and a self-consistent span. match +3000 over a 5-long exact match proves
+    // i32 (5·3000 = 15000... i16; use a longer run). A 20-long exact match reaches 60000 > i16.
+    let big = Scoring::new(4, common::identity_matrix(4, 3000, -1000), 500, 100).unwrap();
+    let r: Vec<u8> = (0..20u8).map(|i| i % 4).collect();
+    assert_eq!(
+        big.required_width(Mode::Sw, r.len(), r.len()),
+        Ok(ScoreWidth::I32)
+    );
+    let span = align_pair_span(&r, &r, &big).unwrap();
+    assert_eq!(span.score, 20 * 3000, "20 matches at +3000");
+    assert_eq!((span.query_start, span.query_end), (0, 20));
+    assert_eq!((span.target_start, span.target_end), (0, 20));
+    // Self-consistency at i32: NW of the aligned substrings recovers the score.
+    let nw = align_pair(
+        &r[span.query_start..span.query_end],
+        &r[span.target_start..span.target_end],
+        &big,
+        Mode::Nw,
+        SearchType::Score,
+    )
+    .unwrap()
+    .score;
+    assert_eq!(nw, span.score);
+    // And it agrees with the full traceback at i32 width.
+    let full = align(&r, &r, &big, Mode::Sw, usize::MAX).unwrap();
+    assert_eq!(
+        (
+            span.score,
+            span.query_start,
+            span.query_end,
+            span.target_start,
+            span.target_end
+        ),
+        (
+            full.score,
+            full.query_start,
+            full.query_end,
+            full.target_start,
+            full.target_end
+        )
+    );
 }
 
 /// Exhaustive guard for `align_pair_span`: over **every** pair up to length 4 (three-letter

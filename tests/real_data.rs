@@ -334,6 +334,9 @@ fn protein_scan_matches_scalar_on_blosum62() {
                 let db = build(b);
                 // 20-symbol alphabet ⇒ the byte-shuffle Gathered gather cannot apply; Precomputed does.
                 assert_eq!(db.layout(), Some(Layout::Precomputed), "{b} {mode} {st}");
+                // Pin the width too: BLOSUM62's max diagonal (11) over 76 aa proves i16, so this is
+                // genuinely the large-alphabet i16 Precomputed path (not luck of the scoring).
+                assert_eq!(db.score_width(), ScoreWidth::I16, "{b} {mode} {st}");
                 let mut gs = Scratch::new(&db);
                 for q in &queries {
                     assert_eq!(

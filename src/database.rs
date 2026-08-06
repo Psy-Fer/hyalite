@@ -1492,4 +1492,91 @@ mod tests {
             }
         }
     }
+
+    use proptest::prelude::*;
+
+    /// Random mixed-width databases: a large match value (`+3000`) makes short and long sequences
+    /// prove different widths (`i16` for the short, `i32` for the long), with randomized sequence
+    /// contents, queries, mismatch, and gaps. This is the coverage the integration proptest cannot
+    /// give: being in-crate it asserts `groups.is_some()` (so grouping is genuinely exercised — the
+    /// HIGH-severity non-vacuity gap the review flagged), including an **i32 group**, and checks every
+    /// grouped scan (`scan`/`scan_all`/`scan_scores`, `Score`+`ScoreEnd`, all modes) against the
+    /// forced-scalar oracle. Complements the single deterministic `escalated_results_match_the_scalar_oracle`.
+    fn escalation_case() -> impl Strategy<Value = (i32, i32, i32, Vec<Vec<u8>>, Vec<u8>)> {
+        let dna = |len: usize| prop::collection::vec(0u8..4, len);
+        // Fixed lengths spanning the i16/i32 boundary at match +3000, mql 16:
+        // len·3000 -> 12000/24000 (i16), 36000/48000 (i32).
+        let seqs = (dna(4), dna(8), dna(12), dna(16)).prop_map(|(a, b, c, d)| vec![a, b, c, d]);
+        let gaps = (0i32..=20).prop_flat_map(|go| (Just(go), 0i32..=go));
+        ((-3000i32..=-500), gaps, seqs, dna_query())
+            .prop_map(|(mism, (go, ge), seqs, q)| (mism, go, ge, seqs, q))
+    }
+
+    fn dna_query() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(0u8..4, 1..=16)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(120))]
+        #[test]
+        fn escalation_groups_and_matches_scalar((mism, go, ge, seqs, q) in escalation_case()) {
+            let simd = available_simd();
+            if simd.is_empty() {
+                return Ok(());
+            }
+            let mut matrix = vec![mism; 16];
+            for d in 0..4 {
+                matrix[d * 4 + d] = 3000;
+            }
+            let scoring = Scoring::new(4, matrix, go, ge).unwrap();
+
+            for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw] {
+                for st in [SearchType::Score, SearchType::ScoreEnd] {
+                    let build = |b: Backend| {
+                        Database::builder()
+                            .sequences(&seqs)
+                            .scoring(scoring.clone())
+                            .mode(mode)
+                            .search_type(st)
+                            .max_query_len(16)
+                            .backend(BackendChoice::Force(b))
+                            .build()
+                            .unwrap()
+                    };
+                    let oracle = build(Backend::Scalar);
+                    let mut os = Scratch::new(&oracle);
+                    let want = oracle.scan(&mut os, &q);
+                    let (mut wa, mut ws) = (Vec::new(), Vec::new());
+                    oracle.scan_all(&mut os, &q, &mut wa);
+                    oracle.scan_scores(&mut os, &q, &mut ws);
+
+                    for &b in &simd {
+                        let db = build(b);
+                        // Non-vacuity: under SW the width is `min(mql,len)·3000`, which spans i16
+                        // (len 4/8) and i32 (len 12/16), so grouping MUST trigger with an i32 group.
+                        if mode == Mode::Sw {
+                            let groups = db
+                                .groups
+                                .as_ref()
+                                .expect("SW mixed-width database must escalate");
+                            prop_assert!(
+                                groups
+                                    .groups
+                                    .iter()
+                                    .any(|g| g.packed.width() == ScoreWidth::I32),
+                                "an i32 group must be present"
+                            );
+                        }
+                        let mut gs = Scratch::new(&db);
+                        prop_assert_eq!(db.scan(&mut gs, &q), want, "{} scan {} {}", b, mode, st);
+                        let (mut ga, mut gsc) = (Vec::new(), Vec::new());
+                        db.scan_all(&mut gs, &q, &mut ga);
+                        db.scan_scores(&mut gs, &q, &mut gsc);
+                        prop_assert_eq!(&ga, &wa, "{} scan_all {} {}", b, mode, st);
+                        prop_assert_eq!(&gsc, &ws, "{} scan_scores {} {}", b, mode, st);
+                    }
+                }
+            }
+        }
+    }
 }

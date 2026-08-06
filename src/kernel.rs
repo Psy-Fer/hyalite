@@ -1097,6 +1097,9 @@ mod tests {
         // and the `out` buffer is cleared and reused between batches.
         let s_i8 = Scoring::new(4, matrix(4, 2, -1), 2, 1).unwrap();
         let s_i16 = Scoring::new(4, matrix(4, 20, -5), 8, 2).unwrap();
+        // match +3000 pushes the longer pairs to i32 (20·3000 = 60000 > i16), so the batch drives
+        // the striped i32 path and the reused `PairScratch::s32` buffers too.
+        let s_i32 = Scoring::new(4, matrix(4, 3000, -1000), 500, 100).unwrap();
         let mk = |seed: u64, len: usize| -> Vec<u8> {
             (0..len)
                 .map(|i| ((seed.wrapping_mul(i as u64 + 1) >> 3) % 4) as u8)
@@ -1115,7 +1118,7 @@ mod tests {
             .collect();
 
         let mut out = Vec::new();
-        for s in [&s_i8, &s_i16] {
+        for s in [&s_i8, &s_i16, &s_i32] {
             for mode in [Mode::Sw, Mode::Nw, Mode::Hw, Mode::Ov, Mode::Shw] {
                 for st in [SearchType::Score, SearchType::ScoreEnd] {
                     align_pairs(&pairs, s, mode, st, &mut out).unwrap();
