@@ -9,8 +9,14 @@
 
 mod common;
 
-use common::{ALL_MODES, cr4_scoring, dna, parse_fasta, reference_scan};
-use hyalite::{Database, Mode, ScoreWidth, Scoring, Scratch, SearchType, align_pair};
+use common::{
+    ALL_MODES, AMINO_ACIDS, BLOSUM62, blosum62, cr4_scoring, dna, encode_protein, parse_fasta,
+    reference_scan,
+};
+use hyalite::{
+    Backend, BackendChoice, Database, Layout, Mode, ScoreWidth, Scoring, Scratch, SearchType,
+    align_pair,
+};
 
 const PHIX_FASTA: &str = include_str!("data/phix174_NC_001422.1.fasta");
 const LAMBDA_FASTA: &str = include_str!("data/lambda_NC_001416.1.fasta");
@@ -219,4 +225,132 @@ fn real_data_exercises_i16_score_width_and_the_proof_holds() {
         scoring.required_width(Mode::Nw, 40_000, 40_000).unwrap(),
         ScoreWidth::I32
     );
+}
+
+// ---------------------------------------------------------------------------
+// Protein / BLOSUM62: the large-alphabet (20-symbol) SIMD path on real data
+// ---------------------------------------------------------------------------
+
+/// Human ubiquitin monomer (76 aa; UniProt P0CG48). A real large-alphabet sequence for the
+/// BLOSUM62 tests; see `tests/data/PROVENANCE.md`.
+const UBIQUITIN: &str =
+    "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG";
+
+/// Return `seq` with the given `(position, amino_acid_index)` point substitutions applied — a cheap
+/// stand-in for protein homologs, so the database holds genuinely related-but-distinct sequences.
+fn mutate(seq: &[u8], subs: &[(usize, u8)]) -> Vec<u8> {
+    let mut out = seq.to_vec();
+    for &(pos, aa) in subs {
+        out[pos] = aa;
+    }
+    out
+}
+
+#[test]
+fn blosum62_matrix_is_symmetric_with_expected_landmarks() {
+    // A transcription slip in a 400-entry matrix must not pass silently. BLOSUM62 is symmetric, and
+    // a handful of well-known values pin the orientation/scale.
+    for i in 0..20 {
+        for j in 0..20 {
+            assert_eq!(
+                BLOSUM62[i * 20 + j],
+                BLOSUM62[j * 20 + i],
+                "BLOSUM62 asymmetric at ({i}, {j})"
+            );
+        }
+    }
+    let idx = |c: u8| AMINO_ACIDS.iter().position(|&a| a == c).unwrap();
+    let s = |a: u8, b: u8| BLOSUM62[idx(a) * 20 + idx(b)];
+    assert_eq!(s(b'W', b'W'), 11, "Trp self-score");
+    assert_eq!(s(b'C', b'C'), 9, "Cys self-score");
+    assert_eq!(s(b'A', b'A'), 4, "Ala self-score");
+    assert_eq!(s(b'L', b'I'), 2, "Leu/Ile (conservative)");
+    assert_eq!(s(b'W', b'A'), -3, "Trp/Ala (dissimilar)");
+    assert_eq!(s(b'P', b'W'), -4, "Pro/Trp");
+}
+
+#[test]
+fn ubiquitin_self_alignment_scores_the_diagonal_sum() {
+    // An independent end-to-end sanity check of protein scoring: a sequence aligned to itself under
+    // any mode scores exactly the sum of its residues' BLOSUM62 self-scores (no gaps, all matches).
+    let ub = encode_protein(UBIQUITIN);
+    assert_eq!(ub.len(), 76);
+    let expected: i32 = ub
+        .iter()
+        .map(|&a| BLOSUM62[a as usize * 20 + a as usize])
+        .sum();
+    let scoring = blosum62();
+    for mode in ALL_MODES {
+        let hit = align_pair(&ub, &ub, &scoring, mode, SearchType::Score).unwrap();
+        assert_eq!(hit.score, expected, "ubiquitin self-alignment, {mode}");
+    }
+}
+
+#[test]
+fn protein_scan_matches_scalar_on_blosum62() {
+    // A realistic large-alphabet workload: a small database of ubiquitin plus derived homologs and a
+    // truncation, scanned with ubiquitin-variant queries under BLOSUM62. The alphabet (20 > 16)
+    // forces the Precomputed SIMD layout; every SIMD backend must match the scalar oracle exactly.
+    let ub = encode_protein(UBIQUITIN);
+    let scoring = blosum62();
+
+    let db_seqs = vec![
+        ub.clone(),
+        mutate(&ub, &[(3, 9), (17, 4), (40, 0), (60, 19)]), // a few point substitutions
+        mutate(&ub, &[(0, 5), (10, 5), (20, 5), (30, 5), (70, 5)]), // more diverged
+        ub[..50].to_vec(),                                  // N-terminal fragment
+        ub[26..].to_vec(),                                  // C-terminal fragment
+    ];
+    let queries = vec![
+        ub.clone(),
+        mutate(&ub, &[(5, 0), (55, 11)]),
+        ub[10..66].to_vec(),
+    ];
+
+    let simd: Vec<Backend> = [Backend::Sse41, Backend::Avx2]
+        .into_iter()
+        .filter(|b| b.is_available())
+        .collect();
+    if simd.is_empty() {
+        return;
+    }
+
+    for mode in ALL_MODES {
+        for st in [SearchType::Score, SearchType::ScoreEnd] {
+            let build = |b: Backend| {
+                Database::builder()
+                    .sequences(&db_seqs)
+                    .scoring(scoring.clone())
+                    .mode(mode)
+                    .search_type(st)
+                    .max_query_len(76)
+                    .backend(BackendChoice::Force(b))
+                    .build()
+                    .unwrap()
+            };
+            let oracle = build(Backend::Scalar);
+            let mut os = Scratch::new(&oracle);
+            for &b in &simd {
+                let db = build(b);
+                // 20-symbol alphabet ⇒ the byte-shuffle Gathered gather cannot apply; Precomputed does.
+                assert_eq!(db.layout(), Some(Layout::Precomputed), "{b} {mode} {st}");
+                let mut gs = Scratch::new(&db);
+                for q in &queries {
+                    assert_eq!(
+                        db.scan(&mut gs, q),
+                        oracle.scan(&mut os, q),
+                        "{b} scan {mode} {st}"
+                    );
+                    let (mut ga, mut oa) = (Vec::new(), Vec::new());
+                    db.scan_all(&mut gs, q, &mut ga);
+                    oracle.scan_all(&mut os, q, &mut oa);
+                    assert_eq!(ga, oa, "{b} scan_all {mode} {st}");
+                    let (mut gsc, mut osc) = (Vec::new(), Vec::new());
+                    db.scan_scores(&mut gs, q, &mut gsc);
+                    oracle.scan_scores(&mut os, q, &mut osc);
+                    assert_eq!(gsc, osc, "{b} scan_scores {mode} {st}");
+                }
+            }
+        }
+    }
 }

@@ -9,6 +9,8 @@ redistributable under this repository's MIT license. Retrieved 2026-07-28.
 | `phix174_NC_001422.1.fasta` | NCBI RefSeq `NC_001422.1` — *Escherichia* phage phiX174, complete genome (5,386 bp), the classic Illumina sequencing control | 5,520 B | NCBI places no restrictions on use or redistribution of these data. phiX174 is a decades-old foundational reference genome with no known IP encumbrance. |
 | `lambda_NC_001416.1.fasta` | NCBI RefSeq `NC_001416.1` — Enterobacteria phage lambda, complete genome (48,502 bp) | 49,254 B | Same as above. |
 | `cr4_adapters.fa` | Hand-authored. The `TSO_10x` sequence is the 10x Genomics template-switch oligo used by STAR's `--clipAdapterType CellRanger4` path (`AAGCAGTGGTATCAACGCAGAGTACATGGG`); the `polyA`/`polyT`/`polyG` entries are synthetic homopolymer decoys. | <300 B | Short factual DNA sequences are not copyrightable. The CR4 scoring/params used alongside this file are transcribed from STAR (MIT, © 2019 Alexander Dobin). |
+| BLOSUM62 matrix (`common::BLOSUM62`) | The standard BLOSUM62 amino-acid substitution matrix (Henikoff & Henikoff 1992), as distributed by NCBI BLAST. Embedded as a `const` in `tests/common/mod.rs`. | — | A published integer log-odds matrix; not copyrightable and freely redistributable (ships in NCBI BLAST and every alignment toolkit). |
+| Ubiquitin sequence (`real_data::UBIQUITIN`) | Human ubiquitin monomer, 76 aa (UniProt `P0CG48`, the poly-ubiquitin `UBC` repeat unit) — used as a real large-alphabet protein for the BLOSUM62 tests, alongside programmatically derived homolog variants. | <100 B | Short factual protein sequence; not copyrightable. UniProt data is CC-BY 4.0. |
 
 ## Sources
 

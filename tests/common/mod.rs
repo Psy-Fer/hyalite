@@ -244,3 +244,61 @@ pub fn reference_scan(
     }
     best.expect("database is non-empty")
 }
+
+// ---------------------------------------------------------------------------
+// Protein / BLOSUM62 (large-alphabet, 20-symbol) helpers
+// ---------------------------------------------------------------------------
+
+/// Amino-acid order for the embedded [`BLOSUM62`] matrix and [`encode_protein`].
+pub const AMINO_ACIDS: &[u8; 20] = b"ARNDCQEGHILKMFPSTWYV";
+
+/// The standard NCBI BLOSUM62 substitution matrix, row-major in [`AMINO_ACIDS`] order. Public
+/// domain (a published log-odds matrix); see `tests/data/PROVENANCE.md`. It is symmetric with a
+/// diagonal of `+4..+11`, exercising the large-alphabet SIMD path at `i16` width. A test asserts
+/// symmetry and a few landmark values so a transcription slip cannot pass silently.
+#[rustfmt::skip]
+pub const BLOSUM62: [i32; 400] = [
+//   A   R   N   D   C   Q   E   G   H   I   L   K   M   F   P   S   T   W   Y   V
+     4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0, // A
+    -1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3, // R
+    -2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -4, -2, -3, // N
+    -2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3, // D
+     0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1, // C
+    -1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2, // Q
+    -1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2, // E
+     0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -2, -3, -3, // G
+    -2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3, // H
+    -1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3, // I
+    -1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1, // L
+    -1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2, // K
+    -1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1, // M
+    -2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1, // F
+    -1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2, // P
+     1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2, // S
+     0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -2, -2,  0, // T
+    -3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1,  1, -4, -3, -2, 11,  2, -3, // W
+    -2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -2, // Y
+     0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -2,  4, // V
+];
+
+/// BLOSUM62 protein scoring over the 20-symbol amino-acid alphabet, with the standard BLASTP affine
+/// gap penalty (`gap_open = 11`, `gap_ext = 1`; our convention charges `11 + (n-1)·1` for a length-`n`
+/// gap). A large alphabet (20 > 16) forces the Precomputed SIMD layout.
+pub fn blosum62() -> Scoring {
+    Scoring::new(20, BLOSUM62.to_vec(), 11, 1).unwrap()
+}
+
+/// Encode an ASCII protein string to `0..20` indices in [`AMINO_ACIDS`] order, skipping whitespace.
+/// Panics on any character outside the 20 standard amino acids.
+pub fn encode_protein(seq: &str) -> Vec<u8> {
+    seq.bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(|b| {
+            let up = b.to_ascii_uppercase();
+            AMINO_ACIDS
+                .iter()
+                .position(|&a| a == up)
+                .unwrap_or_else(|| panic!("unexpected residue {:?}", up as char)) as u8
+        })
+        .collect()
+}
