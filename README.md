@@ -111,6 +111,12 @@ genomes and the CellRanger4 adapter set exercise realistic sequence composition,
 sweeps plus regression tests derived from known Opal bugs probe the edge cases. CI runs on x86-64
 and aarch64.
 
+A coverage-guided differential fuzzer (`fuzz/`, `cargo-fuzz`, nightly) drives the same contract
+harder: it decodes arbitrary bytes into a scoring scheme, database, and query — with magnitude
+regimes that deliberately reach the `i32` sentinel boundary — and asserts every backend is
+bit-identical to the scalar oracle, with `overflow-checks` on so any wrapping arithmetic crashes.
+Run it with `cargo +nightly fuzz run differential`.
+
 Run the benchmarks with `cargo bench`: a CellRanger4-style database scan, plus pairwise and
 traceback microbenchmarks.
 

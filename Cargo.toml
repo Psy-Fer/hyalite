@@ -12,6 +12,8 @@ readme = "README.md"
 authors = ["James Ferguson <j.ferguson@garvan.org.au>"]
 keywords = ["bioinformatics", "alignment", "genomics", "simd", "smith-waterman"]
 categories = ["science", "algorithms"]
+# The `fuzz/` crate is a separate (nightly, cargo-fuzz) workspace kept in-repo but never published.
+exclude = ["fuzz"]
 
 [dependencies]
 

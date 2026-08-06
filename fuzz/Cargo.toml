@@ -1,0 +1,33 @@
+[package]
+name = "hyalite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.hyalite]
+path = ".."
+
+# Overflow checks and debug assertions ON in the fuzzing profile: the i8/i16/i32 arithmetic model
+# forbids wraps, so a wrapping add/subtract is a bug — turn it into a crash the fuzzer can catch,
+# alongside the differential (backend-vs-oracle) assertions in each target.
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "differential"
+path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent crate's build: `cargo build`/`cargo test` on stable never descend here,
+# and the core crate stays dependency-free. Fuzzing is run explicitly via `cargo +nightly fuzz`.
+[workspace]
