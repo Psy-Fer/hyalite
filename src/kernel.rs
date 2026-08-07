@@ -714,7 +714,7 @@ pub fn align_pair_span(query: &[u8], target: &[u8], scoring: &Scoring) -> Result
 /// Returns the highest-scoring secondary *peak* whose target end lies **outside** the exclusion
 /// window `[best_target_end - w, best_target_end + w]`, where `w = ceil(best_score / matrix_max)` —
 /// `w` being a lower bound on the primary alignment's target span, so anything inside the window is
-/// treated as overlapping the best hit. This reproduces bwa's `ksw.c` recipe exactly:
+/// treated as overlapping the best hit. This applies bwa's `ksw.c` `score2` recipe:
 ///
 /// - only columns scoring `>= min_score` are considered (bwa's `minsc` threshold);
 /// - contiguous above-threshold columns are **collapsed into a single peak**, keeping the run's
@@ -726,6 +726,17 @@ pub fn align_pair_span(query: &[u8], target: &[u8], scoring: &Scoring) -> Result
 /// (equivalently bwa's `score2 = 0`). Returns `None` if `matrix_max <= 0` (no positive substitution
 /// score, so the window is undefined). `matrix_max` is the **maximum substitution-matrix entry**
 /// (`scoring.entry_bounds().1`), not the maximum observed score.
+///
+/// # Agreement with bwa's own `score2`
+///
+/// The recipe above is applied to the **true** per-column maxima (as [`align_pair_position_max`]
+/// computes them). bwa's `score2` is *not* — its row max is taken over a query profile that
+/// `ksw_qinit` rounds up to a multiple of the SIMD width and pads with score-0 columns, and those
+/// padding cells carry a diagonal forward, so bwa's row max (and hence its `score2`) can include a
+/// peak that **does not exist anywhere in the real DP matrix**. hyalite intentionally reports the
+/// true column maxima. So the two `score2` values agree only when the bwa side's query length was a
+/// multiple of the SIMD width it used (no padding); on ragged-length queries a difference is bwa's
+/// padding artefact, not a bug in either the recipe or this implementation.
 #[must_use]
 pub fn score2(
     colmax: &[i32],

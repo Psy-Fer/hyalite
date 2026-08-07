@@ -13,6 +13,20 @@
 //! Following Opal lets test vectors be lifted directly from Opal and STAR's `ClipMate`.
 //!
 //! Penalties are supplied as **non-negative magnitudes** that are subtracted during alignment.
+//!
+//! # Single gap pair (no asymmetric penalties)
+//!
+//! A `Scoring` carries **one** gap pair (`gap_open`, `gap_ext`) applied to gaps in either sequence —
+//! deletions (gap in the query) and insertions (gap in the target) are charged identically. This is a
+//! deliberate current-scope decision, not an omission: **asymmetric** schemes — a separate
+//! open/extend per direction, as in bwa's `-O del,ins -E del,ins` (`ksw_extend2`) — are **not
+//! currently supported**. They are researched and deferred, not refused: the recurrence needs only a
+//! per-chain constant swap (the `E` chain uses the deletion pair, `F` the insertion pair) and nothing
+//! about the tie-break or determinism contract changes, so a future `Scoring::new_asymmetric`
+//! constructor can add them without disturbing this API should a concrete workload need it.
+//!
+//! When translating penalties from bwa (which uses ksw's `o + n * e` convention, applied per
+//! direction) into hyalite's Opal `open + (n - 1) * ext`, pass `open = o + e` and `ext = e`.
 
 use crate::error::{Error, Result};
 use crate::mode::Mode;
