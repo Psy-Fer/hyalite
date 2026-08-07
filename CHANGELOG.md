@@ -6,6 +6,8 @@ All notable changes to `hyalite` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-07
+
 ### Added
 
 - `align_pair_span`: the local (`SW`) alignment **span** — score plus the half-open aligned region

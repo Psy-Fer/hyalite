@@ -6,13 +6,24 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://releases.rs/docs/1.85.0/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Exact, SIMD-accelerated pairwise and database sequence alignment in pure Rust.** Smith-Waterman
-(local), Needleman-Wunsch (global), semi-global, and overlap modes with affine gaps, runtime CPU
-dispatch, and a **bit-identical-across-backends** guarantee.
+**Exact, SIMD-accelerated pairwise and database sequence alignment in pure Rust.** Five alignment
+modes — Smith-Waterman (local), Needleman-Wunsch (global), two semi-global variants (`HW`/`SHW`),
+and overlap (`OV`) — with affine gaps, runtime CPU dispatch, and a **bit-identical-across-backends**
+guarantee.
 
 `hyalite` is a Rust reimplementation and improvement of
 [Opal](https://github.com/Martinsos/opal) (Martin Šošić), which implements Rognes's inter-sequence
 SIMD parallelisation of Smith-Waterman. It is not affiliated with or endorsed by the Opal authors.
+
+## Install
+
+```toml
+[dependencies]
+hyalite = "0.3"
+```
+
+or run `cargo add hyalite`. Requires Rust 1.85+ (edition 2024); the core has no required
+dependencies. Runs on x86-64 (SSE4.1/AVX2) and aarch64 (NEON), with a scalar fallback everywhere.
 
 ## Why
 
